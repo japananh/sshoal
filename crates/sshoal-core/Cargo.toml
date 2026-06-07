@@ -1,0 +1,19 @@
+[package]
+name = "sshoal-core"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+serde_yaml = "0.9"
+
+[dev-dependencies]
+# `test-util` gives us paused virtual time so backoff/reconnect tests run instantly.
+tokio = { version = "1", features = ["test-util", "macros", "rt", "time", "sync"] }

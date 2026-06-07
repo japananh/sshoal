@@ -1,0 +1,20 @@
+[package]
+name = "sshoal"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "sshoal"
+path = "src/main.rs"
+
+[dependencies]
+sshoal-core = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+iced = { version = "0.14", features = ["tokio"] }
+tray-icon = "0.24"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
