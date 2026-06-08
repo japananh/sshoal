@@ -267,7 +267,11 @@ fn status_dot(state: TunnelState) -> Element<'static, Message> {
         TunnelState::Reconnecting | TunnelState::Failed => Color::from_rgb(0.90, 0.42, 0.20),
         TunnelState::Idle => Color::from_rgb(0.55, 0.55, 0.60),
     };
-    let glyph = if state == TunnelState::Idle { "○" } else { "●" };
+    let glyph = if state == TunnelState::Idle {
+        "○"
+    } else {
+        "●"
+    };
     text(glyph).size(16).color(color).into()
 }
 

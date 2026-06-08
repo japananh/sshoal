@@ -43,7 +43,11 @@ fn run_export(args: &[String]) -> i32 {
         Err(e) => return fail(format!("loading config: {e}")),
     };
 
-    let passphrase = if encrypt { Some(passphrase(true)) } else { None };
+    let passphrase = if encrypt {
+        Some(passphrase(true))
+    } else {
+        None
+    };
     let blob = match export(&config, passphrase.as_deref()) {
         Ok(b) => b,
         Err(e) => return fail(format!("export: {e}")),

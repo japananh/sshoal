@@ -16,10 +16,10 @@ use std::fmt;
 
 use tracing::field::{Field, Visit};
 use tracing::{Event, Subscriber};
+use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields};
 use tracing_subscriber::registry::LookupSpan;
-use tracing_subscriber::EnvFilter;
 
 /// Installs the global subscriber. Honors `RUST_LOG`; by default shows our own
 /// crates down to `debug` and silences chatty dependencies below `warn`.

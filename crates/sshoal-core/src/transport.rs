@@ -209,7 +209,10 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         // Stand in for a healthy ssh process.
-        let mut child = tokio::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
 
         let result = wait_forward_ready(&mut child, port).await;
 
