@@ -82,20 +82,34 @@ impl Transport for OpenSshTransport {
         let args = build_ssh_args(tunnel);
         let mut child = tokio::process::Command::new("ssh")
             .args(&args)
+            .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()?;
 
         // Don't report success until the local forward actually accepts
         // connections — otherwise the UI would show "Up" the instant ssh is
-        // spawned, before the tunnel is really usable.
+        // spawned, before the tunnel is really usable. On failure, surface ssh's
+        // own stderr (e.g. "connect to host ... Connection refused") as the error.
         if let Err(err) = wait_forward_ready(&mut child, tunnel.local_port).await {
+            let detail = read_stderr_tail(&mut child).await;
             let _ = child.start_kill();
             let _ = child.wait().await;
-            return Err(err);
+            return Err(detail.map_or(err, |d| anyhow::anyhow!(d)));
         }
 
         Ok(Box::new(OpenSshHandle { child: Some(child) }))
     }
+}
+
+/// Read the child's stderr and return its last non-empty line (ssh's error
+/// message), trimmed of the leading `ssh: ` prefix.
+async fn read_stderr_tail(child: &mut Child) -> Option<String> {
+    use tokio::io::AsyncReadExt;
+    let mut stderr = child.stderr.take()?;
+    let mut buf = String::new();
+    let _ = stderr.read_to_string(&mut buf).await;
+    let line = buf.lines().rev().find(|l| !l.trim().is_empty())?;
+    Some(line.trim().trim_start_matches("ssh: ").to_string())
 }
 
 /// Poll `127.0.0.1:<local_port>` until the forward accepts a connection, the

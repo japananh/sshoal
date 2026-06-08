@@ -90,6 +90,7 @@ impl Default for Backoff {
 /// Owns the background task that keeps one tunnel alive.
 pub struct TunnelSupervisor {
     state_rx: watch::Receiver<TunnelState>,
+    error_rx: watch::Receiver<Option<String>>,
     cancel_tx: watch::Sender<bool>,
     task: JoinHandle<()>,
 }
@@ -99,10 +100,14 @@ impl TunnelSupervisor {
     /// Tokio runtime.
     pub fn spawn(transport: Arc<dyn Transport>, tunnel: Tunnel, backoff: Backoff) -> Self {
         let (state_tx, state_rx) = watch::channel(TunnelState::Idle);
+        let (error_tx, error_rx) = watch::channel(None);
         let (cancel_tx, cancel_rx) = watch::channel(false);
-        let task = tokio::spawn(run(transport, tunnel, backoff, state_tx, cancel_rx));
+        let task = tokio::spawn(run(
+            transport, tunnel, backoff, state_tx, error_tx, cancel_rx,
+        ));
         Self {
             state_rx,
+            error_rx,
             cancel_tx,
             task,
         }
@@ -111,6 +116,11 @@ impl TunnelSupervisor {
     /// Current state (cheap, non-blocking).
     pub fn state(&self) -> TunnelState {
         *self.state_rx.borrow()
+    }
+
+    /// The latest failure reason, if the tunnel is currently failing.
+    pub fn last_error(&self) -> Option<String> {
+        self.error_rx.borrow().clone()
     }
 
     /// A receiver to await state transitions on (e.g. to drive the UI).
@@ -137,6 +147,7 @@ async fn run(
     tunnel: Tunnel,
     backoff: Backoff,
     state_tx: watch::Sender<TunnelState>,
+    error_tx: watch::Sender<Option<String>>,
     mut cancel_rx: watch::Receiver<bool>,
 ) {
     let mut attempt: u32 = 0;
@@ -167,6 +178,7 @@ async fn run(
             Ok(mut handle) => {
                 ever_up = true;
                 let _ = state_tx.send(TunnelState::Up);
+                let _ = error_tx.send(None);
                 let started = Instant::now();
 
                 let cancelled = tokio::select! {
@@ -186,6 +198,7 @@ async fn run(
                     attempt += 1;
                     let delay = backoff.delay(attempt);
                     let _ = state_tx.send(TunnelState::Failed);
+                    let _ = error_tx.send(Some("dropped right after connecting".to_string()));
                     tracing::warn!(
                         tunnel = %tunnel.path,
                         attempt,
@@ -208,6 +221,7 @@ async fn run(
                 attempt += 1;
                 let delay = backoff.delay(attempt);
                 let _ = state_tx.send(TunnelState::Failed);
+                let _ = error_tx.send(Some(err.to_string()));
                 tracing::warn!(
                     tunnel = %tunnel.path,
                     attempt,

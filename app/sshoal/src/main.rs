@@ -62,7 +62,6 @@ enum Message {
     SaveEdit,
     CancelEdit,
     DeleteTunnel(usize),
-    DismissNotice,
 }
 
 struct MenuIds {
@@ -76,6 +75,11 @@ struct TunnelRow {
     tunnel: Tunnel,
     supervisor: Option<TunnelSupervisor>,
     status: TunnelState,
+    /// Transient reason shown under the row (failure / conflict), with the time
+    /// it was set so it can auto-dismiss.
+    notice: Option<(String, std::time::Instant)>,
+    /// Last error surfaced from the supervisor, to detect *new* failures.
+    err_seen: Option<String>,
 }
 
 impl TunnelRow {
@@ -110,8 +114,6 @@ struct App {
     rows: Vec<TunnelRow>,
     expanded: HashSet<String>,
     editing: Option<EditForm>,
-    /// Transient banner (e.g. a skipped-due-to-port-conflict warning).
-    notice: Option<String>,
 }
 
 fn boot(runtime: Arc<tokio::runtime::Runtime>) -> (App, Task<Message>) {
@@ -134,6 +136,8 @@ fn boot(runtime: Arc<tokio::runtime::Runtime>) -> (App, Task<Message>) {
             tunnel,
             supervisor: None,
             status: TunnelState::Idle,
+            notice: None,
+            err_seen: None,
         })
         .collect();
     let expanded = all_folder_paths(&rows);
@@ -164,7 +168,6 @@ fn boot(runtime: Arc<tokio::runtime::Runtime>) -> (App, Task<Message>) {
         rows,
         expanded,
         editing: None,
-        notice: None,
     };
     (app, Task::none())
 }
@@ -173,8 +176,24 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
     match message {
         Message::Tick => {
             for row in &mut app.rows {
-                if let Some(sup) = &row.supervisor {
+                let err = if let Some(sup) = &row.supervisor {
                     row.status = sup.state();
+                    sup.last_error()
+                } else {
+                    None
+                };
+                // Surface a *new* failure as a transient reason under the row.
+                if err != row.err_seen {
+                    row.err_seen = err.clone();
+                    if let Some(msg) = err {
+                        row.notice = Some((msg, std::time::Instant::now()));
+                    }
+                }
+                // Auto-dismiss after 3s.
+                if let Some((_, shown)) = &row.notice
+                    && shown.elapsed() > Duration::from_secs(3)
+                {
+                    row.notice = None;
                 }
             }
 
@@ -195,7 +214,6 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                     info!("quitting");
                     return iced::exit();
                 } else if event.id == app.menu.connect_all {
-                    app.notice = None;
                     for i in 0..app.rows.len() {
                         set_enabled(app, i, true);
                     }
@@ -204,13 +222,11 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::ToggleTunnel(i) => {
-            app.notice = None;
             let on = !app.rows.get(i).map(TunnelRow::enabled).unwrap_or(false);
             set_enabled(app, i, on);
             Task::none()
         }
         Message::ToggleFolder(path) => {
-            app.notice = None;
             let indices = descendant_indices(&app.rows, &path);
             // The folder switch shows ON if *any* child is on, so clicking it
             // when any are on should turn the whole folder OFF.
@@ -294,10 +310,6 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             }
             Task::none()
         }
-        Message::DismissNotice => {
-            app.notice = None;
-            Task::none()
-        }
     }
 }
 
@@ -355,6 +367,8 @@ fn save_edit(app: &mut App) {
             tunnel,
             supervisor: None,
             status: TunnelState::Idle,
+            notice: None,
+            err_seen: None,
         }),
     }
 
@@ -385,10 +399,11 @@ fn set_enabled(app: &mut App, i: usize, on: bool) {
         if let Some(j) = (0..app.rows.len())
             .find(|&j| j != i && app.rows[j].enabled() && app.rows[j].local_port() == port)
         {
-            app.notice = Some(format!(
-                "Local port {port} already used by “{}” — skipped “{}”.",
-                app.rows[j].tunnel.path, app.rows[i].tunnel.path
-            ));
+            let msg = format!(
+                "Local port {port} is already in use by “{}”.",
+                app.rows[j].tunnel.path
+            );
+            app.rows[i].notice = Some((msg, std::time::Instant::now()));
             return;
         }
     }
@@ -580,42 +595,9 @@ fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
     }
 
     let body = scrollable(list).height(Length::Fill);
-    let mut root = column![header].spacing(10);
-    if let Some(msg) = &app.notice {
-        root = root.push(notice_banner(msg));
-    }
-    root = root.push(body);
-    container(root).padding(14).into()
-}
-
-fn notice_banner(msg: &str) -> Element<'_, Message> {
-    container(
-        row![
-            text(msg.to_string()).size(12).width(Length::Fill),
-            button(text("✕").size(11))
-                .style(button::text)
-                .padding(0)
-                .on_press(Message::DismissNotice),
-        ]
-        .spacing(8)
-        .align_y(iced::Alignment::Center),
-    )
-    .padding([6, 10])
-    .width(Length::Fill)
-    .style(notice_style)
-    .into()
-}
-
-fn notice_style(_theme: &iced::Theme) -> iced::widget::container::Style {
-    iced::widget::container::Style {
-        background: Some(iced::Background::Color(Color::from_rgb(1.0, 0.94, 0.80))),
-        text_color: Some(Color::from_rgb(0.55, 0.36, 0.02)),
-        border: iced::Border {
-            radius: 8.0.into(),
-            ..Default::default()
-        },
-        ..Default::default()
-    }
+    container(column![header, body].spacing(10))
+        .padding(14)
+        .into()
 }
 
 fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
@@ -688,14 +670,29 @@ fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
     let line = line.align_y(iced::Alignment::Center);
     if is_folder {
         // Highlight folder rows with a subtle background band.
-        container(line)
+        return container(line)
             .width(Length::Fill)
             .padding([5, 6])
             .style(folder_band)
-            .into()
-    } else {
-        container(line).padding([3, 6]).into()
+            .into();
     }
+
+    // Leaf: optionally show a transient reason line underneath.
+    let mut col = column![container(line).padding([3, 6])].spacing(1);
+    if let Some(idx) = d.row_idx
+        && let Some((msg, _)) = &app.rows[idx].notice
+    {
+        col = col.push(
+            row![
+                space().width(Length::Fixed(d.depth as f32 * 16.0 + 26.0)),
+                text(msg.clone())
+                    .size(11)
+                    .color(Color::from_rgb(0.80, 0.40, 0.16)),
+            ]
+            .spacing(4),
+        );
+    }
+    col.into()
 }
 
 /// Wrap a control with a hover tooltip.
