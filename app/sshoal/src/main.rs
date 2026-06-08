@@ -7,7 +7,8 @@
 //!
 //! Tunnels are organized by their slash-separated `path` into a collapsible
 //! tree. Toggling a leaf brings one tunnel up/down; toggling a folder does the
-//! same for everything under it. Each tunnel is supervised independently.
+//! same for everything under it. Tunnels can be added/edited/deleted in-app;
+//! changes are written back to the config file.
 
 mod cli;
 mod logging;
@@ -17,12 +18,24 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use iced::widget::{button, column, container, row, scrollable, space, text};
-use iced::{Color, Element, Length, Subscription, Task, window};
-use sshoal_core::{AppConfig, Backoff, OpenSshTransport, Transport, TunnelState, TunnelSupervisor};
+use iced::widget::{button, column, container, row, scrollable, space, text, text_input};
+use iced::{Color, Element, Length, Size, Subscription, Task, window};
+use sshoal_core::{
+    AppConfig, Backoff, OpenSshTransport, Transport, Tunnel, TunnelState, TunnelSupervisor,
+};
 use tracing::info;
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+
+#[derive(Debug, Clone, Copy)]
+enum Field {
+    Path,
+    Ssh,
+    SshPort,
+    LocalPort,
+    RemoteHost,
+    RemotePort,
+}
 
 #[derive(Debug, Clone)]
 enum Message {
@@ -32,6 +45,12 @@ enum Message {
     ToggleFolder(String),
     ExpandCollapse(String),
     WindowOpened(window::Id),
+    StartAdd,
+    StartEdit(usize),
+    EditField(Field, String),
+    SaveEdit,
+    CancelEdit,
+    DeleteTunnel(usize),
 }
 
 struct MenuIds {
@@ -42,7 +61,7 @@ struct MenuIds {
 
 /// One tunnel plus the supervisor keeping it alive (when enabled).
 struct TunnelRow {
-    tunnel: sshoal_core::Tunnel,
+    tunnel: Tunnel,
     supervisor: Option<TunnelSupervisor>,
     status: TunnelState,
 }
@@ -53,6 +72,19 @@ impl TunnelRow {
     }
 }
 
+/// In-progress add/edit form. Ports are kept as strings while typing.
+#[derive(Default)]
+struct EditForm {
+    target: Option<usize>, // Some(idx) = editing existing, None = adding new
+    path: String,
+    ssh: String,
+    ssh_port: String,
+    local_port: String,
+    remote_host: String,
+    remote_port: String,
+    error: Option<String>,
+}
+
 struct App {
     _tray: TrayIcon,
     menu: MenuIds,
@@ -60,8 +92,8 @@ struct App {
     runtime: Arc<tokio::runtime::Runtime>,
     transport: Arc<dyn Transport>,
     rows: Vec<TunnelRow>,
-    /// Folder paths currently expanded in the tree.
     expanded: HashSet<String>,
+    editing: Option<EditForm>,
 }
 
 fn boot(runtime: Arc<tokio::runtime::Runtime>) -> (App, Task<Message>) {
@@ -82,8 +114,6 @@ fn boot(runtime: Arc<tokio::runtime::Runtime>) -> (App, Task<Message>) {
             status: TunnelState::Idle,
         })
         .collect();
-
-    // Expand every folder by default so the whole tree is visible at first.
     let expanded = all_folder_paths(&rows);
 
     let connect_all = MenuItem::new("Connect all", true, None);
@@ -111,6 +141,7 @@ fn boot(runtime: Arc<tokio::runtime::Runtime>) -> (App, Task<Message>) {
         transport: Arc::new(OpenSshTransport),
         rows,
         expanded,
+        editing: None,
     };
     (app, Task::none())
 }
@@ -128,7 +159,12 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             while let Ok(event) = rx.try_recv() {
                 if event.id == app.menu.open {
                     if app.window.is_none() {
-                        let (id, task) = window::open(window::Settings::default());
+                        let settings = window::Settings {
+                            size: Size::new(480.0, 640.0),
+                            min_size: Some(Size::new(380.0, 420.0)),
+                            ..window::Settings::default()
+                        };
+                        let (id, task) = window::open(settings);
                         app.window = Some(id);
                         return task.map(Message::WindowOpened);
                     }
@@ -149,8 +185,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::ToggleFolder(path) => {
-            let indices: Vec<usize> = descendant_indices(&app.rows, &path);
-            // If everything under the folder is already on, turn it off; else on.
+            let indices = descendant_indices(&app.rows, &path);
             let all_on = indices.iter().all(|&i| app.rows[i].enabled());
             for i in indices {
                 set_enabled(app, i, !all_on);
@@ -163,10 +198,138 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             }
             Task::none()
         }
+        Message::StartAdd => {
+            app.editing = Some(EditForm {
+                ssh: "gemx-dev".to_string(),
+                ..EditForm::default()
+            });
+            Task::none()
+        }
+        Message::StartEdit(i) => {
+            if let Some(row) = app.rows.get(i) {
+                let t = &row.tunnel;
+                app.editing = Some(EditForm {
+                    target: Some(i),
+                    path: t.path.clone(),
+                    ssh: t.ssh.clone(),
+                    ssh_port: t.ssh_port.map(|p| p.to_string()).unwrap_or_default(),
+                    local_port: t.local_port.to_string(),
+                    remote_host: t.remote_host.clone(),
+                    remote_port: t.remote_port.to_string(),
+                    error: None,
+                });
+            }
+            Task::none()
+        }
+        Message::EditField(field, value) => {
+            if let Some(form) = &mut app.editing {
+                match field {
+                    Field::Path => form.path = value,
+                    Field::Ssh => form.ssh = value,
+                    Field::SshPort => form.ssh_port = value,
+                    Field::LocalPort => form.local_port = value,
+                    Field::RemoteHost => form.remote_host = value,
+                    Field::RemotePort => form.remote_port = value,
+                }
+            }
+            Task::none()
+        }
+        Message::CancelEdit => {
+            app.editing = None;
+            Task::none()
+        }
+        Message::SaveEdit => {
+            save_edit(app);
+            Task::none()
+        }
+        Message::DeleteTunnel(i) => {
+            if i < app.rows.len() {
+                let mut row = app.rows.remove(i);
+                if let Some(sup) = row.supervisor.take() {
+                    sup.cancel();
+                }
+                info!(tunnel = %row.tunnel.path, "delete");
+                app.expanded = all_folder_paths(&app.rows);
+                persist(&app.rows);
+            }
+            Task::none()
+        }
         Message::WindowOpened(id) => {
             info!(window = ?id, "window opened");
             Task::none()
         }
+    }
+}
+
+/// Validate the edit form and apply it (replace or append a tunnel), then save.
+fn save_edit(app: &mut App) {
+    let Some(form) = &app.editing else { return };
+
+    let parse_port = |s: &str| s.trim().parse::<u16>().ok();
+    let path = form.path.trim().to_string();
+    let ssh = form.ssh.trim().to_string();
+    let remote_host = form.remote_host.trim().to_string();
+
+    let error = if path.is_empty() {
+        Some("Path is required")
+    } else if ssh.is_empty() {
+        Some("SSH target is required")
+    } else if remote_host.is_empty() {
+        Some("Remote host is required")
+    } else if parse_port(&form.local_port).is_none() {
+        Some("Local port must be 1–65535")
+    } else if parse_port(&form.remote_port).is_none() {
+        Some("Remote port must be 1–65535")
+    } else if !form.ssh_port.trim().is_empty() && parse_port(&form.ssh_port).is_none() {
+        Some("SSH port must be 1–65535")
+    } else {
+        None
+    };
+
+    if let Some(msg) = error {
+        if let Some(form) = &mut app.editing {
+            form.error = Some(msg.to_string());
+        }
+        return;
+    }
+
+    let tunnel = Tunnel {
+        path,
+        ssh,
+        ssh_port: parse_port(&form.ssh_port),
+        local_port: parse_port(&form.local_port).unwrap(),
+        remote_host,
+        remote_port: parse_port(&form.remote_port).unwrap(),
+    };
+
+    match form.target {
+        Some(i) if i < app.rows.len() => {
+            // Editing: drop any live tunnel so it reconnects with new settings.
+            if let Some(sup) = app.rows[i].supervisor.take() {
+                sup.cancel();
+            }
+            app.rows[i].status = TunnelState::Idle;
+            app.rows[i].tunnel = tunnel;
+        }
+        _ => app.rows.push(TunnelRow {
+            tunnel,
+            supervisor: None,
+            status: TunnelState::Idle,
+        }),
+    }
+
+    app.editing = None;
+    app.expanded = all_folder_paths(&app.rows);
+    persist(&app.rows);
+}
+
+/// Write the current tunnels back to the config file.
+fn persist(rows: &[TunnelRow]) {
+    let config = AppConfig {
+        tunnels: rows.iter().map(|r| r.tunnel.clone()).collect(),
+    };
+    if let Err(e) = config.save(config_path()) {
+        tracing::error!(error = %e, "failed to save config");
     }
 }
 
@@ -214,8 +377,7 @@ struct Folder {
 fn build_tree(rows: &[TunnelRow]) -> Folder {
     let mut root = Folder::default();
     for (i, row) in rows.iter().enumerate() {
-        let segments = row.tunnel.segments();
-        insert_leaf(&mut root, &segments, i);
+        insert_leaf(&mut root, &row.tunnel.segments(), i);
     }
     root
 }
@@ -236,7 +398,6 @@ fn all_folder_paths(rows: &[TunnelRow]) -> HashSet<String> {
     let mut set = HashSet::new();
     for row in rows {
         let segments = row.tunnel.segments();
-        // every prefix except the leaf is a folder
         for end in 1..segments.len() {
             set.insert(segments[..end].join("/"));
         }
@@ -248,7 +409,7 @@ struct DisplayRow {
     depth: usize,
     path: String,
     name: String,
-    is_folder: bool,
+    row_idx: Option<usize>, // Some for leaves
     enabled: bool,
     status: TunnelState,
 }
@@ -274,7 +435,7 @@ fn flatten(
             depth,
             path: path.clone(),
             name: name.clone(),
-            is_folder: true,
+            row_idx: None,
             enabled,
             status,
         });
@@ -288,7 +449,7 @@ fn flatten(
             depth,
             path: row.tunnel.path.clone(),
             name: row.tunnel.name().to_string(),
-            is_folder: false,
+            row_idx: Some(idx),
             enabled: row.enabled(),
             status: row.status,
         });
@@ -333,13 +494,21 @@ fn aggregate(states: impl Iterator<Item = TunnelState>) -> TunnelState {
 // ---- view ----
 
 fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
-    let mut list = column![].spacing(4);
+    if let Some(form) = &app.editing {
+        return edit_view(form);
+    }
 
+    let header = row![
+        text("sshoal").size(22).width(Length::Fill),
+        button(text("+ Add").size(13))
+            .padding([4, 10])
+            .on_press(Message::StartAdd),
+    ]
+    .align_y(iced::Alignment::Center);
+
+    let mut list = column![].spacing(2);
     if app.rows.is_empty() {
-        list = list.push(text(format!(
-            "No tunnels yet. Import with `sshoal import-ssh ...` or edit {}.",
-            config_path().display()
-        )));
+        list = list.push(text("No tunnels yet. Click + Add, or run `sshoal import-ssh`.").size(13));
     }
 
     let tree = build_tree(&app.rows);
@@ -347,59 +516,127 @@ fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
     flatten(&tree, "", 0, &app.rows, &app.expanded, &mut display);
 
     for d in &display {
-        let indent = space().width(Length::Fixed(d.depth as f32 * 16.0));
-
-        let lead: Element<Message> = if d.is_folder {
-            let arrow = if app.expanded.contains(&d.path) {
-                "▾"
-            } else {
-                "▸"
-            };
-            button(text(arrow).size(14))
-                .padding(2)
-                .on_press(Message::ExpandCollapse(d.path.clone()))
-                .into()
-        } else {
-            status_dot(d.status)
-        };
-
-        let label = if d.is_folder {
-            text(d.name.clone()).size(15)
-        } else {
-            text(d.name.clone()).size(14)
-        }
-        .width(Length::Fill);
-
-        let action = button(text(if d.enabled { "Disconnect" } else { "Connect" }).size(12))
-            .padding([2, 8])
-            .on_press(if d.is_folder {
-                Message::ToggleFolder(d.path.clone())
-            } else {
-                Message::ToggleTunnel(
-                    app.rows
-                        .iter()
-                        .position(|r| r.tunnel.path == d.path)
-                        .unwrap_or(0),
-                )
-            });
-
-        let folder_dot: Element<Message> = if d.is_folder {
-            status_dot(d.status)
-        } else {
-            space().width(Length::Fixed(0.0)).into()
-        };
-
-        let line = row![indent, lead, label, folder_dot, action]
-            .spacing(8)
-            .align_y(iced::Alignment::Center);
-        list = list.push(line);
+        list = list.push(tree_row(app, d));
     }
 
-    let header = text("sshoal").size(22);
     let body = scrollable(list).height(Length::Fill);
     container(column![header, body].spacing(12))
-        .padding(16)
+        .padding(14)
         .into()
+}
+
+fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
+    let indent = space().width(Length::Fixed(d.depth as f32 * 16.0));
+    let is_folder = d.row_idx.is_none();
+
+    let lead: Element<Message> = if is_folder {
+        let arrow = if app.expanded.contains(&d.path) {
+            "▾"
+        } else {
+            "▸"
+        };
+        button(text(arrow).size(13))
+            .style(button::text)
+            .padding(2)
+            .on_press(Message::ExpandCollapse(d.path.clone()))
+            .into()
+    } else {
+        status_dot(d.status)
+    };
+
+    // Name: folders just show text; leaves are a text-styled button → edit.
+    let name: Element<Message> = if is_folder {
+        text(d.name.clone()).size(14).width(Length::Fill).into()
+    } else {
+        button(text(d.name.clone()).size(13))
+            .style(button::text)
+            .padding(0)
+            .width(Length::Fill)
+            .on_press(Message::StartEdit(d.row_idx.unwrap()))
+            .into()
+    };
+
+    let connect = button(text(if d.enabled { "Disconnect" } else { "Connect" }).size(11))
+        .padding([2, 8])
+        .on_press(if is_folder {
+            Message::ToggleFolder(d.path.clone())
+        } else {
+            Message::ToggleTunnel(d.row_idx.unwrap())
+        });
+
+    let mut line = row![indent, lead, name].spacing(8);
+    if is_folder {
+        line = line.push(status_dot(d.status));
+    }
+    line = line.push(connect);
+    if let Some(idx) = d.row_idx {
+        line = line.push(
+            button(text("✕").size(11))
+                .style(button::danger)
+                .padding([2, 6])
+                .on_press(Message::DeleteTunnel(idx)),
+        );
+    }
+    line.align_y(iced::Alignment::Center).into()
+}
+
+fn edit_view(form: &EditForm) -> Element<'_, Message> {
+    let title = if form.target.is_some() {
+        "Edit tunnel"
+    } else {
+        "New tunnel"
+    };
+
+    let field = |label: &str, value: &str, f: Field, placeholder: &str| -> Element<Message> {
+        row![
+            text(label.to_string()).size(13).width(Length::Fixed(110.0)),
+            text_input(placeholder, value)
+                .size(13)
+                .on_input(move |s| Message::EditField(f, s)),
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center)
+        .into()
+    };
+
+    let mut col = column![
+        text(title).size(18),
+        field("Path", &form.path, Field::Path, "gc/dev/db/app-api"),
+        field("SSH", &form.ssh, Field::Ssh, "gemx-dev or user@host"),
+        field("SSH port", &form.ssh_port, Field::SshPort, "(optional)"),
+        field("Local port", &form.local_port, Field::LocalPort, "54321"),
+        field(
+            "Remote host",
+            &form.remote_host,
+            Field::RemoteHost,
+            "db.internal"
+        ),
+        field("Remote port", &form.remote_port, Field::RemotePort, "5432"),
+    ]
+    .spacing(10);
+
+    if let Some(err) = &form.error {
+        col = col.push(
+            text(err.clone())
+                .size(12)
+                .color(Color::from_rgb(0.9, 0.3, 0.3)),
+        );
+    }
+
+    col = col.push(
+        row![
+            button(text("Save").size(13))
+                .style(button::primary)
+                .padding([4, 14])
+                .on_press(Message::SaveEdit),
+            button(text("Cancel").size(13))
+                .padding([4, 14])
+                .on_press(Message::CancelEdit),
+        ]
+        .spacing(10),
+    );
+
+    container(col).padding(16).into()
 }
 
 fn status_dot(state: TunnelState) -> Element<'static, Message> {
