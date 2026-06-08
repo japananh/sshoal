@@ -94,6 +94,19 @@ impl AppConfig {
         }
     }
 
+    /// Merge servers from `other` into this config. On a name collision,
+    /// `overwrite` decides whether the incoming server replaces the existing one
+    /// (used by import: replace your local copy, or keep it).
+    pub fn merge(&mut self, other: AppConfig, overwrite: bool) {
+        for incoming in other.servers {
+            match self.servers.iter_mut().find(|s| s.name == incoming.name) {
+                Some(existing) if overwrite => *existing = incoming,
+                Some(_) => {}
+                None => self.servers.push(incoming),
+            }
+        }
+    }
+
     /// Save to a file, creating parent directories as needed.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<(), ConfigError> {
         let path = path.as_ref();
@@ -155,5 +168,31 @@ servers:
     fn load_missing_file_yields_empty_config() {
         let cfg = AppConfig::load("/nonexistent/sshoal/servers.yaml").expect("load");
         assert_eq!(cfg, AppConfig::default());
+    }
+
+    #[test]
+    fn merge_adds_new_and_optionally_overwrites() {
+        let mut base = sample(); // one server named "staging db"
+        let mut incoming = sample();
+        incoming.servers[0].host = "changed.example.com".into();
+        incoming.servers.push(ServerConfig {
+            name: "web".into(),
+            host: "web.example.com".into(),
+            port: 22,
+            user: None,
+            group: None,
+            tunnels: vec![],
+        });
+
+        // Without overwrite: new server added, existing one untouched.
+        let mut keep = base.clone();
+        keep.merge(incoming.clone(), false);
+        assert_eq!(keep.servers.len(), 2);
+        assert_eq!(keep.servers[0].host, "staging.example.com");
+
+        // With overwrite: existing server replaced.
+        base.merge(incoming, true);
+        assert_eq!(base.servers.len(), 2);
+        assert_eq!(base.servers[0].host, "changed.example.com");
     }
 }

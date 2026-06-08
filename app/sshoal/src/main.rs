@@ -9,6 +9,7 @@
 //! load config, spawn a [`TunnelSupervisor`] per tunnel on a Tokio runtime, and
 //! render their live state.
 
+mod cli;
 mod logging;
 
 use std::path::{Path, PathBuf};
@@ -275,7 +276,7 @@ fn subscription(_app: &App) -> Subscription<Message> {
 }
 
 /// `~/.config/sshoal/servers.yaml` on both macOS and Linux.
-fn config_path() -> PathBuf {
+pub(crate) fn config_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home).join(".config/sshoal/servers.yaml")
 }
@@ -319,6 +320,10 @@ fn make_icon() -> Icon {
 }
 
 fn main() -> iced::Result {
+    // Handle `export`/`import` subcommands before touching the GUI or logger
+    // (so a blob written to stdout stays clean).
+    cli::maybe_run();
+
     logging::init();
 
     let runtime = Arc::new(

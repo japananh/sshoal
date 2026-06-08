@@ -11,7 +11,7 @@ repository = "https://github.com/japananh/sshoal"
 [workspace.dependencies]
 sshoal-core = { path = "crates/sshoal-core" }
 
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process", "sync", "net"] }
 tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
 anyhow = "1"

@@ -8,9 +8,18 @@
 //! is impossible — can slot in behind the same trait without the supervisor
 //! noticing.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
+use tokio::net::TcpStream;
+use tokio::process::Child;
+use tokio::time::Instant;
 
 use crate::config::{ServerConfig, TunnelSpec};
+
+/// How long to wait for the local forward to start accepting connections before
+/// giving up on a connect attempt.
+const FORWARD_READY_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Opens tunnels. One `Transport` can open many tunnels.
 #[async_trait]
@@ -79,11 +88,39 @@ impl Transport for OpenSshTransport {
         tunnel: &TunnelSpec,
     ) -> anyhow::Result<Box<dyn TunnelHandle>> {
         let args = build_ssh_args(server, tunnel);
-        let child = tokio::process::Command::new("ssh")
+        let mut child = tokio::process::Command::new("ssh")
             .args(&args)
             .kill_on_drop(true)
             .spawn()?;
+
+        // Don't report success until the local forward actually accepts
+        // connections — otherwise the UI would show "Up" the instant ssh is
+        // spawned, before the tunnel is really usable.
+        if let Err(err) = wait_forward_ready(&mut child, tunnel.local_port).await {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(err);
+        }
+
         Ok(Box::new(OpenSshHandle { child: Some(child) }))
+    }
+}
+
+/// Poll `127.0.0.1:<local_port>` until the forward accepts a connection, the
+/// `ssh` process exits, or we time out.
+async fn wait_forward_ready(child: &mut Child, local_port: u16) -> anyhow::Result<()> {
+    let start = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!("ssh exited before the forward was ready ({status})");
+        }
+        if TcpStream::connect(("127.0.0.1", local_port)).await.is_ok() {
+            return Ok(());
+        }
+        if start.elapsed() >= FORWARD_READY_TIMEOUT {
+            anyhow::bail!("forward on 127.0.0.1:{local_port} not ready in time");
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
 
@@ -157,5 +194,37 @@ mod tests {
         let args = build_ssh_args(&server, &tunnel);
 
         assert_eq!(args.last().unwrap(), "web.example.com");
+    }
+
+    /// Grab a port that nothing is listening on (bind then release).
+    async fn a_closed_port() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        port
+    }
+
+    #[tokio::test]
+    async fn forward_ready_succeeds_once_the_port_listens() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Stand in for a healthy ssh process.
+        let mut child = tokio::process::Command::new("sleep").arg("30").spawn().unwrap();
+
+        let result = wait_forward_ready(&mut child, port).await;
+
+        let _ = child.start_kill();
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn forward_ready_fails_when_ssh_exits_early() {
+        let port = a_closed_port().await;
+        // `true` exits immediately — like ssh failing to set up the forward.
+        let mut child = tokio::process::Command::new("true").spawn().unwrap();
+
+        let result = wait_forward_ready(&mut child, port).await;
+
+        assert!(result.is_err());
     }
 }

@@ -18,3 +18,4 @@ iced = { version = "0.14", features = ["tokio"] }
 tray-icon = "0.24"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+rpassword = "7.5.4"
