@@ -159,7 +159,7 @@ fn boot(runtime: Arc<tokio::runtime::Runtime>) -> (App, Task<Message>) {
         .build()
         .expect("build tray icon");
 
-    let app = App {
+    let mut app = App {
         _tray: tray,
         menu,
         window: None,
@@ -169,7 +169,17 @@ fn boot(runtime: Arc<tokio::runtime::Runtime>) -> (App, Task<Message>) {
         expanded,
         editing: None,
     };
-    (app, Task::none())
+
+    // Show the window on launch so opening the app always surfaces it — the
+    // tray icon can be hard to spot, and closing the window keeps us in the tray.
+    let settings = window::Settings {
+        size: Size::new(420.0, 620.0),
+        min_size: Some(Size::new(340.0, 380.0)),
+        ..window::Settings::default()
+    };
+    let (id, task) = window::open(settings);
+    app.window = Some(id);
+    (app, task.map(Message::WindowOpened))
 }
 
 fn update(app: &mut App, message: Message) -> Task<Message> {
