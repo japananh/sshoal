@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use iced::widget::{button, column, container, row, scrollable, space, text, text_input};
-use iced::{Color, Element, Length, Size, Subscription, Task, window};
+use iced::widget::{button, column, container, row, scrollable, space, text, text_input, toggler};
+use iced::{Color, Element, Length, Size, Subscription, Task, Theme, window};
 use sshoal_core::{
     AppConfig, Backoff, OpenSshTransport, Transport, Tunnel, TunnelState, TunnelSupervisor,
 };
@@ -243,6 +243,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::DeleteTunnel(i) => {
+            app.editing = None;
             if i < app.rows.len() {
                 let mut row = app.rows.remove(i);
                 if let Some(sup) = row.supervisor.take() {
@@ -556,40 +557,39 @@ fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
             .into()
     };
 
-    let connect = button(text(if d.enabled { "Disconnect" } else { "Connect" }).size(11))
-        .padding([2, 8])
-        .on_press(if is_folder {
-            Message::ToggleFolder(d.path.clone())
-        } else {
-            Message::ToggleTunnel(d.row_idx.unwrap())
-        });
+    // On/off switch: cleaner than a text button, and doesn't read as up/down.
+    let switch: Element<Message> = if is_folder {
+        let path = d.path.clone();
+        toggler(d.enabled)
+            .size(18)
+            .on_toggle(move |_| Message::ToggleFolder(path.clone()))
+            .into()
+    } else {
+        let idx = d.row_idx.unwrap();
+        toggler(d.enabled)
+            .size(18)
+            .on_toggle(move |_| Message::ToggleTunnel(idx))
+            .into()
+    };
 
-    let mut line = row![indent, lead, name].spacing(8);
+    let mut line = row![indent, lead, name].spacing(10);
     if is_folder {
         line = line.push(status_dot(d.status));
     }
-    line = line.push(connect);
-    if let Some(idx) = d.row_idx {
-        line = line.push(
-            button(text("✕").size(11))
-                .style(button::danger)
-                .padding([2, 6])
-                .on_press(Message::DeleteTunnel(idx)),
-        );
-    }
+    line = line.push(switch);
     // Keep controls clear of the scrollbar on the right.
-    line = line.push(space().width(Length::Fixed(10.0)));
+    line = line.push(space().width(Length::Fixed(8.0)));
 
     let line = line.align_y(iced::Alignment::Center);
     if is_folder {
         // Highlight folder rows with a subtle background band.
         container(line)
             .width(Length::Fill)
-            .padding([3, 4])
+            .padding([5, 6])
             .style(folder_band)
             .into()
     } else {
-        container(line).padding([2, 4]).into()
+        container(line).padding([3, 6]).into()
     }
 }
 
@@ -644,18 +644,26 @@ fn edit_view(form: &EditForm) -> Element<'_, Message> {
         );
     }
 
-    col = col.push(
-        row![
-            button(text("Save").size(13))
-                .style(button::primary)
+    let mut buttons = row![
+        button(text("Save").size(13))
+            .style(button::primary)
+            .padding([4, 14])
+            .on_press(Message::SaveEdit),
+        button(text("Cancel").size(13))
+            .padding([4, 14])
+            .on_press(Message::CancelEdit),
+    ]
+    .spacing(10);
+    if let Some(idx) = form.target {
+        buttons = buttons.push(space().width(Length::Fill));
+        buttons = buttons.push(
+            button(text("Delete").size(13))
+                .style(button::danger)
                 .padding([4, 14])
-                .on_press(Message::SaveEdit),
-            button(text("Cancel").size(13))
-                .padding([4, 14])
-                .on_press(Message::CancelEdit),
-        ]
-        .spacing(10),
-    );
+                .on_press(Message::DeleteTunnel(idx)),
+        );
+    }
+    col = col.push(buttons);
 
     container(col).padding(16).into()
 }
@@ -732,6 +740,7 @@ fn main() -> iced::Result {
     let boot_runtime = runtime.clone();
     iced::daemon(move || boot(boot_runtime.clone()), update, view)
         .subscription(subscription)
+        .theme(|_app: &App, _id| Theme::CatppuccinLatte)
         .title(|_app: &App, _id| String::from("sshoal"))
         .run()
 }
