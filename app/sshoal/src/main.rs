@@ -19,7 +19,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use iced::widget::{
-    button, column, container, row, scrollable, space, text, text_input, toggler, tooltip,
+    button, column, container, pick_list, row, scrollable, space, text, text_input, toggler,
+    tooltip,
 };
 use iced::{Color, Element, Font, Length, Size, Subscription, Task, Theme, window};
 
@@ -64,6 +65,15 @@ enum Message {
     SaveEdit,
     CancelEdit,
     DeleteTunnel(usize),
+    // SSH config management
+    OpenSshConfigs,
+    CloseSshConfigs,
+    StartAddSsh,
+    StartEditSsh(usize),
+    EditSshField(SshField, String),
+    SaveSsh,
+    CancelSsh,
+    DeleteSsh(usize),
 }
 
 struct MenuIds {
@@ -106,6 +116,27 @@ struct EditForm {
     error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum SshField {
+    Name,
+    Host,
+    Port,
+    User,
+    Identity,
+}
+
+/// In-progress add/edit form for an SSH config.
+#[derive(Default)]
+struct SshForm {
+    target: Option<usize>,
+    name: String,
+    host: String,
+    port: String,
+    user: String,
+    identity: String,
+    error: Option<String>,
+}
+
 struct App {
     /// Created lazily on the first tick — on macOS the tray must be created
     /// after the app's event loop is running, not during `boot`.
@@ -121,9 +152,17 @@ struct App {
     rows: Vec<TunnelRow>,
     expanded: HashSet<String>,
     editing: Option<EditForm>,
+    /// Showing the SSH-configs list screen.
+    managing_ssh: bool,
+    /// In-progress add/edit of an SSH config.
+    editing_ssh: Option<SshForm>,
 }
 
 impl App {
+    fn ssh_names(&self) -> Vec<String> {
+        self.ssh_configs.iter().map(|c| c.name.clone()).collect()
+    }
+
     /// Resolve the ssh config a tunnel uses (falling back to a bare alias).
     fn resolve_ssh(&self, tunnel: &Tunnel) -> SshConfig {
         self.ssh_configs
@@ -172,6 +211,8 @@ fn boot(runtime: Arc<tokio::runtime::Runtime>) -> (App, Task<Message>) {
         rows,
         expanded,
         editing: None,
+        managing_ssh: false,
+        editing_ssh: None,
     };
 
     // Show the window on launch so opening the app always surfaces it (the tray
@@ -337,6 +378,66 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 }
                 info!(tunnel = %row.tunnel.path, "delete");
                 app.expanded = all_folder_paths(&app.rows);
+                persist(&app.rows, &app.ssh_configs);
+            }
+            Task::none()
+        }
+        Message::OpenSshConfigs => {
+            app.managing_ssh = true;
+            app.editing = None;
+            Task::none()
+        }
+        Message::CloseSshConfigs => {
+            app.managing_ssh = false;
+            app.editing_ssh = None;
+            Task::none()
+        }
+        Message::StartAddSsh => {
+            app.editing_ssh = Some(SshForm {
+                port: "22".to_string(),
+                ..SshForm::default()
+            });
+            Task::none()
+        }
+        Message::StartEditSsh(i) => {
+            if let Some(c) = app.ssh_configs.get(i) {
+                app.editing_ssh = Some(SshForm {
+                    target: Some(i),
+                    name: c.name.clone(),
+                    host: c.host.clone(),
+                    port: c.port.to_string(),
+                    user: c.user.clone().unwrap_or_default(),
+                    identity: c.identity_file.clone().unwrap_or_default(),
+                    error: None,
+                });
+            }
+            Task::none()
+        }
+        Message::EditSshField(field, value) => {
+            if let Some(form) = &mut app.editing_ssh {
+                match field {
+                    SshField::Name => form.name = value,
+                    SshField::Host => form.host = value,
+                    SshField::Port => form.port = value,
+                    SshField::User => form.user = value,
+                    SshField::Identity => form.identity = value,
+                }
+            }
+            Task::none()
+        }
+        Message::SaveSsh => {
+            save_ssh(app);
+            Task::none()
+        }
+        Message::CancelSsh => {
+            app.editing_ssh = None;
+            Task::none()
+        }
+        Message::DeleteSsh(i) => {
+            app.editing_ssh = None;
+            if i < app.ssh_configs.len() {
+                let removed = app.ssh_configs.remove(i);
+                info!(ssh = %removed.name, "delete ssh config");
                 persist(&app.rows, &app.ssh_configs);
             }
             Task::none()
@@ -609,12 +710,22 @@ fn aggregate(states: impl Iterator<Item = TunnelState>) -> TunnelState {
 // ---- view ----
 
 fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
+    if let Some(form) = &app.editing_ssh {
+        return ssh_edit_view(form);
+    }
+    if app.managing_ssh {
+        return ssh_list_view(&app.ssh_configs);
+    }
     if let Some(form) = &app.editing {
-        return edit_view(form);
+        return edit_view(form, &app.ssh_names());
     }
 
     let header = row![
         text("sshoal").size(22).width(Length::Fill),
+        button(text("SSH configs").size(12))
+            .style(pill_secondary)
+            .padding([4, 10])
+            .on_press(Message::OpenSshConfigs),
         tip(
             button(text(ICON_PLUS).font(LUCIDE).size(18))
                 .style(button::text)
@@ -623,6 +734,7 @@ fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
             "Add tunnel",
         ),
     ]
+    .spacing(8)
     .align_y(iced::Alignment::Center);
 
     let mut list = column![].spacing(2);
@@ -800,7 +912,7 @@ fn pill(base: iced::widget::button::Style) -> iced::widget::button::Style {
     }
 }
 
-fn edit_view(form: &EditForm) -> Element<'_, Message> {
+fn edit_view<'a>(form: &'a EditForm, ssh_names: &[String]) -> Element<'a, Message> {
     let title = if form.target.is_some() {
         "Edit tunnel"
     } else {
@@ -819,15 +931,29 @@ fn edit_view(form: &EditForm) -> Element<'_, Message> {
         .into()
     };
 
+    // SSH config: a dropdown of known configs (plus the current value if it
+    // names an alias that isn't a saved config).
+    let mut options = ssh_names.to_vec();
+    if !form.ssh.is_empty() && !options.contains(&form.ssh) {
+        options.push(form.ssh.clone());
+    }
+    let selected = (!form.ssh.is_empty()).then(|| form.ssh.clone());
+    let ssh_field: Element<Message> = row![
+        text("SSH config").size(13).width(Length::Fixed(110.0)),
+        pick_list(options, selected, |name| {
+            Message::EditField(Field::Ssh, name)
+        })
+        .placeholder("choose an SSH config")
+        .text_size(13),
+    ]
+    .spacing(8)
+    .align_y(iced::Alignment::Center)
+    .into();
+
     let mut col = column![
         text(title).size(18),
         field("Path", &form.path, Field::Path, "gc/dev/db/app-api"),
-        field(
-            "SSH config",
-            &form.ssh,
-            Field::Ssh,
-            "gemx-dev (ssh config name / alias)"
-        ),
+        ssh_field,
         field("Local port", &form.local_port, Field::LocalPort, "54321"),
         field(
             "Remote host",
@@ -865,6 +991,187 @@ fn edit_view(form: &EditForm) -> Element<'_, Message> {
                 .style(pill_danger)
                 .padding([5, 16])
                 .on_press(Message::DeleteTunnel(idx)),
+        );
+    }
+    col = col.push(buttons);
+
+    container(col).padding(16).into()
+}
+
+fn save_ssh(app: &mut App) {
+    let Some(form) = &app.editing_ssh else {
+        return;
+    };
+    let name = form.name.trim().to_string();
+    let host = form.host.trim().to_string();
+    let port_str = form.port.trim().to_string();
+    let user = nonempty(&form.user);
+    let identity = nonempty(&form.identity);
+    let target = form.target;
+
+    let error = if name.is_empty() {
+        Some("Name is required")
+    } else if host.is_empty() {
+        Some("Host is required")
+    } else if !port_str.is_empty() && port_str.parse::<u16>().is_err() {
+        Some("Port must be 1–65535")
+    } else if app
+        .ssh_configs
+        .iter()
+        .enumerate()
+        .any(|(i, c)| c.name == name && Some(i) != target)
+    {
+        Some("A config with that name already exists")
+    } else {
+        None
+    };
+
+    if let Some(msg) = error {
+        if let Some(form) = &mut app.editing_ssh {
+            form.error = Some(msg.to_string());
+        }
+        return;
+    }
+
+    let config = SshConfig {
+        name,
+        host,
+        port: port_str.parse().unwrap_or(22),
+        user,
+        identity_file: identity,
+    };
+    match target {
+        Some(i) if i < app.ssh_configs.len() => app.ssh_configs[i] = config,
+        _ => app.ssh_configs.push(config),
+    }
+    app.editing_ssh = None;
+    persist(&app.rows, &app.ssh_configs);
+}
+
+fn nonempty(s: &str) -> Option<String> {
+    let t = s.trim();
+    (!t.is_empty()).then(|| t.to_string())
+}
+
+fn ssh_list_view(configs: &[SshConfig]) -> Element<'_, Message> {
+    let header = row![
+        button(text("‹ Back").size(13))
+            .style(pill_secondary)
+            .padding([4, 12])
+            .on_press(Message::CloseSshConfigs),
+        text("SSH configs").size(20).width(Length::Fill),
+        tip(
+            button(text(ICON_PLUS).font(LUCIDE).size(18))
+                .style(button::text)
+                .padding([2, 8])
+                .on_press(Message::StartAddSsh),
+            "Add SSH config",
+        ),
+    ]
+    .spacing(8)
+    .align_y(iced::Alignment::Center);
+
+    let mut list = column![].spacing(4);
+    if configs.is_empty() {
+        list = list
+            .push(text("No SSH configs yet. Click + to add, or run `sshoal import-ssh`.").size(13));
+    }
+    for (i, c) in configs.iter().enumerate() {
+        let user = c.user.as_deref().unwrap_or("-");
+        let sub = format!("{user}@{}:{}", c.host, c.port);
+        let line = row![
+            column![
+                text(c.name.clone()).size(14),
+                text(sub).size(11).color(Color::from_rgb(0.55, 0.55, 0.6)),
+            ]
+            .spacing(2)
+            .width(Length::Fill),
+            tip(
+                button(text(ICON_PENCIL).font(LUCIDE).size(15))
+                    .style(button::text)
+                    .padding([2, 6])
+                    .on_press(Message::StartEditSsh(i)),
+                "Edit",
+            ),
+            tip(
+                button(text("✕").size(11))
+                    .style(pill_danger)
+                    .padding([2, 8])
+                    .on_press(Message::DeleteSsh(i)),
+                "Delete",
+            ),
+            space().width(Length::Fixed(8.0)),
+        ]
+        .spacing(10)
+        .align_y(iced::Alignment::Center);
+        list = list.push(container(line).padding([4, 6]));
+    }
+
+    container(column![header, scrollable(list).height(Length::Fill)].spacing(12))
+        .padding(14)
+        .into()
+}
+
+fn ssh_edit_view(form: &SshForm) -> Element<'_, Message> {
+    let title = if form.target.is_some() {
+        "Edit SSH config"
+    } else {
+        "New SSH config"
+    };
+
+    let field = |label: &str, value: &str, f: SshField, placeholder: &str| -> Element<Message> {
+        row![
+            text(label.to_string()).size(13).width(Length::Fixed(110.0)),
+            text_input(placeholder, value)
+                .size(13)
+                .on_input(move |s| Message::EditSshField(f, s)),
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center)
+        .into()
+    };
+
+    let mut col = column![
+        text(title).size(18),
+        field("Name", &form.name, SshField::Name, "gemx-dev"),
+        field("Host", &form.host, SshField::Host, "1.2.3.4 or alias"),
+        field("Port", &form.port, SshField::Port, "22"),
+        field("User", &form.user, SshField::User, "(optional)"),
+        field(
+            "Key file",
+            &form.identity,
+            SshField::Identity,
+            "~/.ssh/id_ed25519 (optional)"
+        ),
+    ]
+    .spacing(10);
+
+    if let Some(err) = &form.error {
+        col = col.push(
+            text(err.clone())
+                .size(12)
+                .color(Color::from_rgb(0.9, 0.3, 0.3)),
+        );
+    }
+
+    let mut buttons = row![
+        button(text("Save").size(13))
+            .style(pill_button)
+            .padding([5, 16])
+            .on_press(Message::SaveSsh),
+        button(text("Cancel").size(13))
+            .style(pill_secondary)
+            .padding([5, 16])
+            .on_press(Message::CancelSsh),
+    ]
+    .spacing(10);
+    if let Some(idx) = form.target {
+        buttons = buttons.push(space().width(Length::Fill));
+        buttons = buttons.push(
+            button(text("Delete").size(13))
+                .style(pill_danger)
+                .padding([5, 16])
+                .on_press(Message::DeleteSsh(idx)),
         );
     }
     col = col.push(buttons);
