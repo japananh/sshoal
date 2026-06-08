@@ -160,8 +160,8 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 if event.id == app.menu.open {
                     if app.window.is_none() {
                         let settings = window::Settings {
-                            size: Size::new(480.0, 640.0),
-                            min_size: Some(Size::new(380.0, 420.0)),
+                            size: Size::new(420.0, 620.0),
+                            min_size: Some(Size::new(340.0, 380.0)),
                             ..window::Settings::default()
                         };
                         let (id, task) = window::open(settings);
@@ -577,7 +577,28 @@ fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
                 .on_press(Message::DeleteTunnel(idx)),
         );
     }
-    line.align_y(iced::Alignment::Center).into()
+    // Keep controls clear of the scrollbar on the right.
+    line = line.push(space().width(Length::Fixed(10.0)));
+
+    let line = line.align_y(iced::Alignment::Center);
+    if is_folder {
+        // Highlight folder rows with a subtle background band.
+        container(line)
+            .width(Length::Fill)
+            .padding([3, 4])
+            .style(folder_band)
+            .into()
+    } else {
+        container(line).padding([2, 4]).into()
+    }
+}
+
+fn folder_band(theme: &iced::Theme) -> iced::widget::container::Style {
+    let palette = theme.extended_palette();
+    iced::widget::container::Style {
+        background: Some(iced::Background::Color(palette.background.weak.color)),
+        ..iced::widget::container::Style::default()
+    }
 }
 
 fn edit_view(form: &EditForm) -> Element<'_, Message> {
