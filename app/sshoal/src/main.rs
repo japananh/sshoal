@@ -895,7 +895,19 @@ fn pill_button(theme: &iced::Theme, status: button::Status) -> iced::widget::but
 }
 
 fn pill_secondary(theme: &iced::Theme, status: button::Status) -> iced::widget::button::Style {
-    pill(button::secondary(theme, status))
+    let shade = match status {
+        button::Status::Hovered => 0.88,
+        button::Status::Pressed => 0.82,
+        _ => 0.93,
+    };
+    let mut base = button::secondary(theme, status);
+    base.background = Some(iced::Background::Color(Color::from_rgb(
+        shade,
+        shade,
+        shade + 0.02,
+    )));
+    base.text_color = Color::from_rgb(0.18, 0.18, 0.22);
+    pill(base)
 }
 
 fn pill_danger(theme: &iced::Theme, status: button::Status) -> iced::widget::button::Style {
