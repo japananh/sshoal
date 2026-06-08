@@ -30,6 +30,8 @@ const ICON_PLUS: &str = "\u{e13d}";
 const ICON_PENCIL: &str = "\u{e1f9}";
 const ICON_FOLDER: &str = "\u{e0d7}";
 const ICON_FOLDER_OPEN: &str = "\u{e247}";
+use global_hotkey::hotkey::{Code, HotKey, Modifiers};
+use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use sshoal_core::{
     AppConfig, Backoff, OpenSshTransport, Transport, Tunnel, TunnelState, TunnelSupervisor,
 };
@@ -110,6 +112,9 @@ struct App {
     /// after the app's event loop is running, not during `boot`.
     tray: Option<TrayIcon>,
     menu: Option<MenuIds>,
+    /// Global hotkey (⌃⌘S) to summon the window — reliable even when the tray
+    /// icon is hidden behind the notch on a crowded menu bar.
+    _hotkey: Option<GlobalHotKeyManager>,
     window: Option<window::Id>,
     runtime: Arc<tokio::runtime::Runtime>,
     transport: Arc<dyn Transport>,
@@ -147,6 +152,7 @@ fn boot(runtime: Arc<tokio::runtime::Runtime>) -> (App, Task<Message>) {
     let mut app = App {
         tray: None,
         menu: None,
+        _hotkey: None,
         window: None,
         runtime,
         transport: Arc::new(OpenSshTransport),
@@ -195,6 +201,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 let (tray, menu) = build_tray();
                 app.tray = Some(tray);
                 app.menu = Some(menu);
+                app._hotkey = register_hotkey();
             }
 
             let ids = app
@@ -223,6 +230,23 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 } else if event.id == *connect_all {
                     for i in 0..app.rows.len() {
                         set_enabled(app, i, true);
+                    }
+                }
+            }
+
+            // Global hotkey (⌃⌘S) → summon the window.
+            let hk_rx = GlobalHotKeyEvent::receiver();
+            while let Ok(event) = hk_rx.try_recv() {
+                if event.state == HotKeyState::Pressed {
+                    if app.window.is_none() {
+                        let (id, task) = window::open(open_window_settings());
+                        app.window = Some(id);
+                        return Task::batch([
+                            task.map(Message::WindowOpened),
+                            window::gain_focus(id),
+                        ]);
+                    } else if let Some(id) = app.window {
+                        return window::gain_focus(id);
                     }
                 }
             }
@@ -893,6 +917,24 @@ fn kill_stale_tunnels() {
         .status();
 }
 
+/// Register the ⌃⌘S global hotkey. Best-effort: returns the manager (which must
+/// be kept alive) even if registration fails.
+fn register_hotkey() -> Option<GlobalHotKeyManager> {
+    let manager = match GlobalHotKeyManager::new() {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(error = %e, "global hotkey manager unavailable");
+            return None;
+        }
+    };
+    let hotkey = HotKey::new(Some(Modifiers::CONTROL | Modifiers::SUPER), Code::KeyS);
+    match manager.register(hotkey) {
+        Ok(()) => info!("global hotkey Ctrl+Cmd+S registered (opens sshoal)"),
+        Err(e) => tracing::warn!(error = %e, "failed to register global hotkey"),
+    }
+    Some(manager)
+}
+
 fn open_window_settings() -> window::Settings {
     window::Settings {
         size: Size::new(420.0, 620.0),
@@ -916,9 +958,17 @@ fn build_tray() -> (TrayIcon, MenuIds) {
         .with_menu_on_left_click(true)
         .with_icon(make_icon())
         .with_tooltip("sshoal")
-        .build()
-        .expect("build tray icon");
-    (tray, menu)
+        .build();
+    match tray {
+        Ok(tray) => {
+            info!("tray icon created");
+            (tray, menu)
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "FAILED to create tray icon");
+            panic!("tray: {e}");
+        }
+    }
 }
 
 /// Render the bundled SVG logo to an RGBA tray icon.
