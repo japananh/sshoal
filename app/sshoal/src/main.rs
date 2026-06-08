@@ -21,7 +21,15 @@ use std::time::Duration;
 use iced::widget::{
     button, column, container, row, scrollable, space, text, text_input, toggler, tooltip,
 };
-use iced::{Color, Element, Length, Size, Subscription, Task, Theme, window};
+use iced::{Color, Element, Font, Length, Size, Subscription, Task, Theme, window};
+
+/// Lucide icon font (bundled) — iced can't render colour emoji, so we use a
+/// monochrome icon font for crisp Add/Edit/folder glyphs.
+const LUCIDE: Font = Font::with_name("lucide");
+const ICON_PLUS: &str = "\u{e13d}";
+const ICON_PENCIL: &str = "\u{e1f9}";
+const ICON_FOLDER: &str = "\u{e0d7}";
+const ICON_FOLDER_OPEN: &str = "\u{e247}";
 use sshoal_core::{
     AppConfig, Backoff, OpenSshTransport, Transport, Tunnel, TunnelState, TunnelSupervisor,
 };
@@ -54,6 +62,7 @@ enum Message {
     SaveEdit,
     CancelEdit,
     DeleteTunnel(usize),
+    DismissNotice,
 }
 
 struct MenuIds {
@@ -72,6 +81,10 @@ struct TunnelRow {
 impl TunnelRow {
     fn enabled(&self) -> bool {
         self.supervisor.is_some()
+    }
+
+    fn local_port(&self) -> u16 {
+        self.tunnel.local_port
     }
 }
 
@@ -97,6 +110,8 @@ struct App {
     rows: Vec<TunnelRow>,
     expanded: HashSet<String>,
     editing: Option<EditForm>,
+    /// Transient banner (e.g. a skipped-due-to-port-conflict warning).
+    notice: Option<String>,
 }
 
 fn boot(runtime: Arc<tokio::runtime::Runtime>) -> (App, Task<Message>) {
@@ -145,6 +160,7 @@ fn boot(runtime: Arc<tokio::runtime::Runtime>) -> (App, Task<Message>) {
         rows,
         expanded,
         editing: None,
+        notice: None,
     };
     (app, Task::none())
 }
@@ -175,6 +191,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                     info!("quitting");
                     return iced::exit();
                 } else if event.id == app.menu.connect_all {
+                    app.notice = None;
                     for i in 0..app.rows.len() {
                         set_enabled(app, i, true);
                     }
@@ -183,11 +200,13 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::ToggleTunnel(i) => {
+            app.notice = None;
             let on = !app.rows.get(i).map(TunnelRow::enabled).unwrap_or(false);
             set_enabled(app, i, on);
             Task::none()
         }
         Message::ToggleFolder(path) => {
+            app.notice = None;
             let indices = descendant_indices(&app.rows, &path);
             let all_on = indices.iter().all(|&i| app.rows[i].enabled());
             for i in indices {
@@ -269,6 +288,10 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             }
             Task::none()
         }
+        Message::DismissNotice => {
+            app.notice = None;
+            Task::none()
+        }
     }
 }
 
@@ -348,6 +371,22 @@ fn persist(rows: &[TunnelRow]) {
 fn set_enabled(app: &mut App, i: usize, on: bool) {
     let transport = app.transport.clone();
     let runtime = app.runtime.clone();
+
+    // Refuse to bring up a tunnel whose local port is already taken by another
+    // active tunnel — that would just fail and spin forever.
+    if on && app.rows.get(i).is_some_and(|r| !r.enabled()) {
+        let port = app.rows[i].local_port();
+        if let Some(j) = (0..app.rows.len())
+            .find(|&j| j != i && app.rows[j].enabled() && app.rows[j].local_port() == port)
+        {
+            app.notice = Some(format!(
+                "Local port {port} already used by “{}” — skipped “{}”.",
+                app.rows[j].tunnel.path, app.rows[i].tunnel.path
+            ));
+            return;
+        }
+    }
+
     let Some(row) = app.rows.get_mut(i) else {
         return;
     };
@@ -512,9 +551,9 @@ fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
     let header = row![
         text("sshoal").size(22).width(Length::Fill),
         tip(
-            button(text("+").size(22))
+            button(text(ICON_PLUS).font(LUCIDE).size(18))
                 .style(button::text)
-                .padding([0, 6])
+                .padding([2, 8])
                 .on_press(Message::StartAdd),
             "Add tunnel",
         ),
@@ -535,9 +574,42 @@ fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
     }
 
     let body = scrollable(list).height(Length::Fill);
-    container(column![header, body].spacing(12))
-        .padding(14)
-        .into()
+    let mut root = column![header].spacing(10);
+    if let Some(msg) = &app.notice {
+        root = root.push(notice_banner(msg));
+    }
+    root = root.push(body);
+    container(root).padding(14).into()
+}
+
+fn notice_banner(msg: &str) -> Element<'_, Message> {
+    container(
+        row![
+            text(msg.to_string()).size(12).width(Length::Fill),
+            button(text("✕").size(11))
+                .style(button::text)
+                .padding(0)
+                .on_press(Message::DismissNotice),
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center),
+    )
+    .padding([6, 10])
+    .width(Length::Fill)
+    .style(notice_style)
+    .into()
+}
+
+fn notice_style(_theme: &iced::Theme) -> iced::widget::container::Style {
+    iced::widget::container::Style {
+        background: Some(iced::Background::Color(Color::from_rgb(1.0, 0.94, 0.80))),
+        text_color: Some(Color::from_rgb(0.55, 0.36, 0.02)),
+        border: iced::Border {
+            radius: 8.0.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
 }
 
 fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
@@ -546,9 +618,13 @@ fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
 
     let lead: Element<Message> = if is_folder {
         let expanded = app.expanded.contains(&d.path);
-        let icon = if expanded { "📂" } else { "📁" };
+        let icon = if expanded {
+            ICON_FOLDER_OPEN
+        } else {
+            ICON_FOLDER
+        };
         tip(
-            button(text(icon).size(15))
+            button(text(icon).font(LUCIDE).size(15))
                 .style(button::text)
                 .padding(2)
                 .on_press(Message::ExpandCollapse(d.path.clone())),
@@ -592,7 +668,7 @@ fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
         line = line.push(status_dot(d.status));
     } else if let Some(idx) = d.row_idx {
         line = line.push(tip(
-            button(text("✏️").size(13))
+            button(text(ICON_PENCIL).font(LUCIDE).size(15))
                 .style(button::text)
                 .padding([2, 6])
                 .on_press(Message::StartEdit(idx)),
@@ -819,6 +895,7 @@ fn main() -> iced::Result {
 
     let boot_runtime = runtime.clone();
     iced::daemon(move || boot(boot_runtime.clone()), update, view)
+        .font(include_bytes!("../assets/lucide.ttf").as_slice())
         .subscription(subscription)
         .theme(|_app: &App, _id| Theme::Light)
         .title(|_app: &App, _id| String::from("sshoal"))
