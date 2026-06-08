@@ -512,9 +512,9 @@ fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
     let header = row![
         text("sshoal").size(22).width(Length::Fill),
         tip(
-            button(text("+").size(17))
-                .style(pill_button)
-                .padding([1, 11])
+            button(text("+").size(22))
+                .style(button::text)
+                .padding([0, 6])
                 .on_press(Message::StartAdd),
             "Add tunnel",
         ),
@@ -592,9 +592,9 @@ fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
         line = line.push(status_dot(d.status));
     } else if let Some(idx) = d.row_idx {
         line = line.push(tip(
-            button(text("✎").size(14))
-                .style(pill_secondary)
-                .padding([2, 9])
+            button(text("✏️").size(13))
+                .style(button::text)
+                .padding([2, 6])
                 .on_press(Message::StartEdit(idx)),
             "Edit tunnel",
         ));
