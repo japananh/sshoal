@@ -45,6 +45,7 @@ enum Message {
     ToggleFolder(String),
     ExpandCollapse(String),
     WindowOpened(window::Id),
+    WindowClosed(window::Id),
     StartAdd,
     StartEdit(usize),
     EditField(Field, String),
@@ -257,6 +258,13 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::WindowOpened(id) => {
             info!(window = ?id, "window opened");
+            Task::none()
+        }
+        Message::WindowClosed(id) => {
+            // Forget the window so the next "Open" can spawn a fresh one.
+            if app.window == Some(id) {
+                app.window = None;
+            }
             Task::none()
         }
     }
@@ -701,7 +709,10 @@ fn status_dot(state: TunnelState) -> Element<'static, Message> {
 }
 
 fn subscription(_app: &App) -> Subscription<Message> {
-    iced::time::every(Duration::from_millis(200)).map(|_| Message::Tick)
+    Subscription::batch([
+        iced::time::every(Duration::from_millis(200)).map(|_| Message::Tick),
+        iced::window::close_events().map(Message::WindowClosed),
+    ])
 }
 
 /// `~/.config/sshoal/servers.yaml` on both macOS and Linux.
