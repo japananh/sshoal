@@ -9,11 +9,13 @@
 //! without touching the network.
 
 pub mod config;
+pub mod import;
 pub mod supervisor;
 pub mod transfer;
 pub mod transport;
 
 pub use config::{AppConfig, ServerConfig, TunnelSpec};
+pub use import::{SshHost, parse_ssh_config, parse_tunnel_file};
 pub use supervisor::{Backoff, TunnelState, TunnelSupervisor};
 pub use transfer::{ExportError, ImportError, export, import};
 pub use transport::{OpenSshTransport, Transport, TunnelHandle, build_ssh_args};

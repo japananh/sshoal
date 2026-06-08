@@ -332,6 +332,7 @@ mod tests {
             local_port: 1,
             remote_host: "127.0.0.1".into(),
             remote_port: 2,
+            label: None,
         }
     }
 

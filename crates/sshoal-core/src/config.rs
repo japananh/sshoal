@@ -20,6 +20,9 @@ pub struct TunnelSpec {
     pub remote_host: String,
     /// Port on `remote_host` to forward to.
     pub remote_port: u16,
+    /// Optional human label (e.g. the `# App-api` comment in a tunnel file).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 /// One server the user connects to, plus the tunnels to bring up for it.
@@ -139,6 +142,7 @@ mod tests {
                     local_port: 5432,
                     remote_host: "127.0.0.1".into(),
                     remote_port: 5432,
+                    label: None,
                 }],
             }],
         }

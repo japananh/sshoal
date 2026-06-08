@@ -4,8 +4,9 @@
 //! the work and exit; otherwise we return and the app launches normally.
 
 use std::io::Write;
+use std::path::Path;
 
-use sshoal_core::{AppConfig, ImportError, export, import};
+use sshoal_core::{AppConfig, ImportError, export, import, parse_ssh_config, parse_tunnel_file};
 
 use crate::config_path;
 
@@ -15,6 +16,7 @@ pub fn maybe_run() {
     match args.get(1).map(String::as_str) {
         Some("export") => std::process::exit(run_export(&args[2..])),
         Some("import") => std::process::exit(run_import(&args[2..])),
+        Some("import-ssh") => std::process::exit(run_import_ssh(&args[2..])),
         Some("help" | "-h" | "--help") => {
             print_usage();
             std::process::exit(0);
@@ -29,9 +31,84 @@ fn print_usage() {
          Usage:\n  \
          sshoal                      launch the tray app\n  \
          sshoal export [FILE] [--encrypt]   write config to FILE (or stdout)\n  \
-         sshoal import FILE [--no-overwrite]  merge config from FILE\n\n\
-         Passphrase is read from $SSHOAL_PASSPHRASE, else prompted."
+         sshoal import FILE [--no-overwrite]  merge config from FILE\n  \
+         sshoal import-ssh TUNNELFILE...    import opentunnels.sh-style files\n  \
+         \\                                  ([--dry-run] [--no-overwrite])\n\n\
+         Passphrase is read from $SSHOAL_PASSPHRASE, else prompted.\n\
+         import-ssh resolves ssh aliases via ~/.ssh/config ($SSHOAL_SSH_CONFIG)."
     );
+}
+
+fn run_import_ssh(args: &[String]) -> i32 {
+    let dry_run = args.iter().any(|a| a == "--dry-run");
+    let overwrite = !args.iter().any(|a| a == "--no-overwrite");
+    let files: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
+    if files.is_empty() {
+        return fail("import-ssh needs at least one tunnel file".to_string());
+    }
+
+    let ssh_config_path =
+        std::env::var("SSHOAL_SSH_CONFIG").unwrap_or_else(|_| format!("{}/.ssh/config", home()));
+    let hosts = match std::fs::read_to_string(&ssh_config_path) {
+        Ok(text) => parse_ssh_config(&text),
+        Err(_) => {
+            eprintln!("note: could not read {ssh_config_path}; aliases used as hostnames");
+            Default::default()
+        }
+    };
+
+    let mut imported = AppConfig::default();
+    for file in &files {
+        let text = match std::fs::read_to_string(file) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("skip {file}: {e}");
+                continue;
+            }
+        };
+        let stem = Path::new(file)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("imported")
+            .to_string();
+        imported
+            .servers
+            .extend(parse_tunnel_file(&stem, &text, &hosts));
+    }
+
+    for s in &imported.servers {
+        eprintln!(
+            "  {} [{}]  {}  — {} tunnel(s)",
+            s.name,
+            s.group.as_deref().unwrap_or("-"),
+            s.host,
+            s.tunnels.len()
+        );
+    }
+    let count = imported.servers.len();
+    if dry_run {
+        eprintln!("(dry-run: {count} server(s) parsed, nothing saved)");
+        return 0;
+    }
+
+    let mut current = match AppConfig::load(config_path()) {
+        Ok(c) => c,
+        Err(e) => return fail(format!("loading config: {e}")),
+    };
+    current.merge(imported, overwrite);
+    if let Err(e) = current.save(config_path()) {
+        return fail(format!("saving config: {e}"));
+    }
+    eprintln!(
+        "imported {count} server(s) into {} (now {} total)",
+        config_path().display(),
+        current.servers.len()
+    );
+    0
+}
+
+fn home() -> String {
+    std::env::var("HOME").unwrap_or_else(|_| ".".to_string())
 }
 
 fn run_export(args: &[String]) -> i32 {

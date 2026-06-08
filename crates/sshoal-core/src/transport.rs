@@ -162,6 +162,7 @@ mod tests {
             local_port: 5432,
             remote_host: "127.0.0.1".into(),
             remote_port: 5432,
+            label: None,
         };
 
         let args = build_ssh_args(&server, &tunnel);
@@ -189,6 +190,7 @@ mod tests {
             local_port: 8080,
             remote_host: "localhost".into(),
             remote_port: 80,
+            label: None,
         };
 
         let args = build_ssh_args(&server, &tunnel);
