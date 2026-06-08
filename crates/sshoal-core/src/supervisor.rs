@@ -21,7 +21,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::config::{ServerConfig, TunnelSpec};
+use crate::config::Tunnel;
 use crate::transport::Transport;
 
 /// What a single tunnel is doing right now.
@@ -97,15 +97,10 @@ pub struct TunnelSupervisor {
 impl TunnelSupervisor {
     /// Start supervising `tunnel` on `server`. Must be called from within a
     /// Tokio runtime.
-    pub fn spawn(
-        transport: Arc<dyn Transport>,
-        server: ServerConfig,
-        tunnel: TunnelSpec,
-        backoff: Backoff,
-    ) -> Self {
+    pub fn spawn(transport: Arc<dyn Transport>, tunnel: Tunnel, backoff: Backoff) -> Self {
         let (state_tx, state_rx) = watch::channel(TunnelState::Idle);
         let (cancel_tx, cancel_rx) = watch::channel(false);
-        let task = tokio::spawn(run(transport, server, tunnel, backoff, state_tx, cancel_rx));
+        let task = tokio::spawn(run(transport, tunnel, backoff, state_tx, cancel_rx));
         Self {
             state_rx,
             cancel_tx,
@@ -139,8 +134,7 @@ impl TunnelSupervisor {
 
 async fn run(
     transport: Arc<dyn Transport>,
-    server: ServerConfig,
-    tunnel: TunnelSpec,
+    tunnel: Tunnel,
     backoff: Backoff,
     state_tx: watch::Sender<TunnelState>,
     mut cancel_rx: watch::Receiver<bool>,
@@ -166,7 +160,7 @@ async fn run(
             _ = cancel_rx.changed() => {
                 if *cancel_rx.borrow() { break; } else { continue; }
             }
-            result = transport.connect(&server, &tunnel) => result,
+            result = transport.connect(&tunnel) => result,
         };
 
         match connected {
@@ -193,7 +187,7 @@ async fn run(
                     let delay = backoff.delay(attempt);
                     let _ = state_tx.send(TunnelState::Failed);
                     tracing::warn!(
-                        server = %server.name,
+                        tunnel = %tunnel.path,
                         attempt,
                         uptime_ms = uptime.as_millis() as u64,
                         delay_ms = delay.as_millis() as u64,
@@ -207,7 +201,7 @@ async fn run(
                 } else {
                     // Was healthy; reconnect promptly with backoff reset.
                     attempt = 0;
-                    tracing::info!(server = %server.name, "tunnel dropped; reconnecting");
+                    tracing::info!(tunnel = %tunnel.path, "tunnel dropped; reconnecting");
                 }
             }
             Err(err) => {
@@ -215,7 +209,7 @@ async fn run(
                 let delay = backoff.delay(attempt);
                 let _ = state_tx.send(TunnelState::Failed);
                 tracing::warn!(
-                    server = %server.name,
+                    tunnel = %tunnel.path,
                     attempt,
                     error = %err,
                     delay_ms = delay.as_millis() as u64,
@@ -300,11 +294,7 @@ mod tests {
 
     #[async_trait]
     impl Transport for FakeTransport {
-        async fn connect(
-            &self,
-            _server: &ServerConfig,
-            _tunnel: &TunnelSpec,
-        ) -> anyhow::Result<Box<dyn TunnelHandle>> {
+        async fn connect(&self, _tunnel: &Tunnel) -> anyhow::Result<Box<dyn TunnelHandle>> {
             let n = self.connect_calls.fetch_add(1, Ordering::SeqCst);
             if n < self.fail_first {
                 anyhow::bail!("simulated connect failure #{n}");
@@ -316,23 +306,14 @@ mod tests {
         }
     }
 
-    fn server() -> ServerConfig {
-        ServerConfig {
-            name: "test".into(),
-            host: "h".into(),
-            port: 22,
-            user: None,
-            group: None,
-            tunnels: vec![],
-        }
-    }
-
-    fn tunnel() -> TunnelSpec {
-        TunnelSpec {
+    fn tunnel() -> Tunnel {
+        Tunnel {
+            path: "test/tunnel".into(),
+            ssh: "host".into(),
+            ssh_port: None,
             local_port: 1,
             remote_host: "127.0.0.1".into(),
             remote_port: 2,
-            label: None,
         }
     }
 
@@ -361,7 +342,6 @@ mod tests {
         let transport = FakeTransport::new(0);
         let sup = TunnelSupervisor::spawn(
             transport.clone(),
-            server(),
             tunnel(),
             Backoff::new(Duration::from_millis(10), Duration::from_millis(100))
                 .with_stable_after(Duration::from_millis(20)),
@@ -386,7 +366,6 @@ mod tests {
         let transport = FakeTransport::always_dropping();
         let sup = TunnelSupervisor::spawn(
             transport.clone(),
-            server(),
             tunnel(),
             Backoff::new(Duration::from_millis(10), Duration::from_millis(1000))
                 .with_stable_after(Duration::from_secs(1)),
@@ -414,7 +393,6 @@ mod tests {
         let transport = FakeTransport::new(2);
         let sup = TunnelSupervisor::spawn(
             transport.clone(),
-            server(),
             tunnel(),
             Backoff::new(Duration::from_millis(10), Duration::from_millis(100)),
         );

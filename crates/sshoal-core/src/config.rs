@@ -1,58 +1,55 @@
-//! The persisted configuration model: the servers a user manages, the tunnels
-//! each one forwards, and load/save to a YAML file (the unit of export/import).
+//! The persisted configuration model: a flat list of tunnels, each placed in a
+//! slash-separated tree `path` (e.g. `gc/dev/db/app-api`) and pointed at an SSH
+//! target. Load/save to a YAML file (the unit of export/import).
 //!
 //! Private keys are intentionally *not* stored here — sshoal relies on the
-//! user's existing `~/.ssh` (config, keys, agent, known_hosts). This file holds
-//! only the tunnel topology and labels, which is what makes it safe-ish to
-//! export and copy between machines.
+//! user's existing `~/.ssh` (config, keys, agent, known_hosts). The `ssh` field
+//! is just an alias / `user@host` passed straight to `ssh`, so the same value
+//! works in a plain terminal too.
 
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-/// A single local→remote port forward over an SSH connection.
+/// A single local→remote port forward, placed in the tree at `path`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TunnelSpec {
+pub struct Tunnel {
+    /// Tree location, slash-separated. The last segment is the display name,
+    /// e.g. `gc/dev/db/app-api` shows as `app-api` under `gc › dev › db`.
+    pub path: String,
+    /// SSH target passed straight to `ssh`: an `~/.ssh/config` alias (preferred)
+    /// or `user@host`. Keeping it an alias means the same value works in a plain
+    /// terminal and host details stay in one place (`~/.ssh/config`).
+    pub ssh: String,
+    /// Optional ssh port override. When `None`, ssh uses `~/.ssh/config` / 22.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_port: Option<u16>,
     /// Port opened on the local machine (the `L` side of `ssh -L`).
     pub local_port: u16,
-    /// Host the server should forward to, as seen *from the server*
-    /// (e.g. `127.0.0.1` for a service on the box, or `db.internal`).
+    /// Host to forward to, as seen *from the ssh server* (e.g. `127.0.0.1` or an
+    /// RDS endpoint).
     pub remote_host: String,
     /// Port on `remote_host` to forward to.
     pub remote_port: u16,
-    /// Optional human label (e.g. the `# App-api` comment in a tunnel file).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub label: Option<String>,
 }
 
-/// One server the user connects to, plus the tunnels to bring up for it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ServerConfig {
-    /// Human label shown in the tray/UI.
-    pub name: String,
-    /// Hostname or IP. May be an alias defined in `~/.ssh/config`.
-    pub host: String,
-    #[serde(default = "default_port")]
-    pub port: u16,
-    /// SSH user. When `None`, ssh resolves it from `~/.ssh/config`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub user: Option<String>,
-    /// Optional group label for bulk "connect all in group" actions.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub group: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tunnels: Vec<TunnelSpec>,
+impl Tunnel {
+    /// The leaf name (last path segment).
+    pub fn name(&self) -> &str {
+        self.path.rsplit('/').next().unwrap_or(&self.path)
+    }
+
+    /// The non-empty path segments, e.g. `["gc", "dev", "db", "app-api"]`.
+    pub fn segments(&self) -> Vec<&str> {
+        self.path.split('/').filter(|s| !s.is_empty()).collect()
+    }
 }
 
-fn default_port() -> u16 {
-    22
-}
-
-/// The whole config file.
+/// The whole config file: just the tunnels (the tree is derived from `path`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(default)]
-    pub servers: Vec<ServerConfig>,
+    pub tunnels: Vec<Tunnel>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -97,15 +94,15 @@ impl AppConfig {
         }
     }
 
-    /// Merge servers from `other` into this config. On a name collision,
-    /// `overwrite` decides whether the incoming server replaces the existing one
-    /// (used by import: replace your local copy, or keep it).
+    /// Merge tunnels from `other` into this config, keyed by `path`. On a path
+    /// collision, `overwrite` decides whether the incoming tunnel replaces the
+    /// existing one (used by import: replace your local copy, or keep it).
     pub fn merge(&mut self, other: AppConfig, overwrite: bool) {
-        for incoming in other.servers {
-            match self.servers.iter_mut().find(|s| s.name == incoming.name) {
+        for incoming in other.tunnels {
+            match self.tunnels.iter_mut().find(|t| t.path == incoming.path) {
                 Some(existing) if overwrite => *existing = incoming,
                 Some(_) => {}
-                None => self.servers.push(incoming),
+                None => self.tunnels.push(incoming),
             }
         }
     }
@@ -132,20 +129,22 @@ mod tests {
 
     fn sample() -> AppConfig {
         AppConfig {
-            servers: vec![ServerConfig {
-                name: "staging db".into(),
-                host: "staging.example.com".into(),
-                port: 22,
-                user: Some("deploy".into()),
-                group: Some("staging".into()),
-                tunnels: vec![TunnelSpec {
-                    local_port: 5432,
-                    remote_host: "127.0.0.1".into(),
-                    remote_port: 5432,
-                    label: None,
-                }],
+            tunnels: vec![Tunnel {
+                path: "gc/dev/db/app-api".into(),
+                ssh: "gemx-dev".into(),
+                ssh_port: None,
+                local_port: 54321,
+                remote_host: "db.internal".into(),
+                remote_port: 5432,
             }],
         }
+    }
+
+    #[test]
+    fn tunnel_name_and_segments() {
+        let t = &sample().tunnels[0];
+        assert_eq!(t.name(), "app-api");
+        assert_eq!(t.segments(), vec!["gc", "dev", "db", "app-api"]);
     }
 
     #[test]
@@ -157,18 +156,6 @@ mod tests {
     }
 
     #[test]
-    fn port_defaults_to_22_when_omitted() {
-        let yaml = r#"
-servers:
-  - name: web
-    host: web.example.com
-"#;
-        let cfg = AppConfig::from_yaml(yaml).expect("parse");
-        assert_eq!(cfg.servers[0].port, 22);
-        assert!(cfg.servers[0].tunnels.is_empty());
-    }
-
-    #[test]
     fn load_missing_file_yields_empty_config() {
         let cfg = AppConfig::load("/nonexistent/sshoal/servers.yaml").expect("load");
         assert_eq!(cfg, AppConfig::default());
@@ -176,27 +163,25 @@ servers:
 
     #[test]
     fn merge_adds_new_and_optionally_overwrites() {
-        let mut base = sample(); // one server named "staging db"
+        let mut base = sample(); // gc/dev/db/app-api -> 54321
         let mut incoming = sample();
-        incoming.servers[0].host = "changed.example.com".into();
-        incoming.servers.push(ServerConfig {
-            name: "web".into(),
-            host: "web.example.com".into(),
-            port: 22,
-            user: None,
-            group: None,
-            tunnels: vec![],
+        incoming.tunnels[0].local_port = 59999;
+        incoming.tunnels.push(Tunnel {
+            path: "gc/dev/redis/app-api".into(),
+            ssh: "gemx-dev".into(),
+            ssh_port: None,
+            local_port: 63799,
+            remote_host: "redis.internal".into(),
+            remote_port: 6379,
         });
 
-        // Without overwrite: new server added, existing one untouched.
         let mut keep = base.clone();
         keep.merge(incoming.clone(), false);
-        assert_eq!(keep.servers.len(), 2);
-        assert_eq!(keep.servers[0].host, "staging.example.com");
+        assert_eq!(keep.tunnels.len(), 2);
+        assert_eq!(keep.tunnels[0].local_port, 54321); // untouched
 
-        // With overwrite: existing server replaced.
         base.merge(incoming, true);
-        assert_eq!(base.servers.len(), 2);
-        assert_eq!(base.servers[0].host, "changed.example.com");
+        assert_eq!(base.tunnels.len(), 2);
+        assert_eq!(base.tunnels[0].local_port, 59999); // replaced
     }
 }

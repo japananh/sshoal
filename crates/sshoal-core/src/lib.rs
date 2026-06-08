@@ -14,7 +14,7 @@ pub mod supervisor;
 pub mod transfer;
 pub mod transport;
 
-pub use config::{AppConfig, ServerConfig, TunnelSpec};
+pub use config::{AppConfig, Tunnel};
 pub use import::{SshHost, parse_ssh_config, parse_tunnel_file};
 pub use supervisor::{Backoff, TunnelState, TunnelSupervisor};
 pub use transfer::{ExportError, ImportError, export, import};

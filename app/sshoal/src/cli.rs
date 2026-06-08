@@ -6,7 +6,7 @@
 use std::io::Write;
 use std::path::Path;
 
-use sshoal_core::{AppConfig, ImportError, export, import, parse_ssh_config, parse_tunnel_file};
+use sshoal_core::{AppConfig, ImportError, export, import, parse_tunnel_file};
 
 use crate::config_path;
 
@@ -32,30 +32,31 @@ fn print_usage() {
          sshoal                      launch the tray app\n  \
          sshoal export [FILE] [--encrypt]   write config to FILE (or stdout)\n  \
          sshoal import FILE [--no-overwrite]  merge config from FILE\n  \
-         sshoal import-ssh TUNNELFILE...    import opentunnels.sh-style files\n  \
-         \\                                  ([--dry-run] [--no-overwrite])\n\n\
-         Passphrase is read from $SSHOAL_PASSPHRASE, else prompted.\n\
-         import-ssh resolves ssh aliases via ~/.ssh/config ($SSHOAL_SSH_CONFIG)."
+         sshoal import-ssh TUNNELFILE...    import opentunnels.sh tunnel files\n  \
+         \\                                  ([--prefix gc] [--dry-run] [--no-overwrite])\n\n\
+         Passphrase is read from $SSHOAL_PASSPHRASE, else prompted."
     );
 }
 
 fn run_import_ssh(args: &[String]) -> i32 {
-    let dry_run = args.iter().any(|a| a == "--dry-run");
-    let overwrite = !args.iter().any(|a| a == "--no-overwrite");
-    let files: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
+    let mut dry_run = false;
+    let mut overwrite = true;
+    let mut prefix: Option<String> = None;
+    let mut files: Vec<String> = Vec::new();
+
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--dry-run" => dry_run = true,
+            "--no-overwrite" => overwrite = false,
+            "--prefix" => prefix = it.next().cloned(),
+            other if other.starts_with("--") => eprintln!("note: ignoring unknown flag {other}"),
+            other => files.push(other.to_string()),
+        }
+    }
     if files.is_empty() {
         return fail("import-ssh needs at least one tunnel file".to_string());
     }
-
-    let ssh_config_path =
-        std::env::var("SSHOAL_SSH_CONFIG").unwrap_or_else(|_| format!("{}/.ssh/config", home()));
-    let hosts = match std::fs::read_to_string(&ssh_config_path) {
-        Ok(text) => parse_ssh_config(&text),
-        Err(_) => {
-            eprintln!("note: could not read {ssh_config_path}; aliases used as hostnames");
-            Default::default()
-        }
-    };
 
     let mut imported = AppConfig::default();
     for file in &files {
@@ -72,22 +73,19 @@ fn run_import_ssh(args: &[String]) -> i32 {
             .unwrap_or("imported")
             .to_string();
         imported
-            .servers
-            .extend(parse_tunnel_file(&stem, &text, &hosts));
+            .tunnels
+            .extend(parse_tunnel_file(&stem, &text, prefix.as_deref()));
     }
 
-    for s in &imported.servers {
+    for t in &imported.tunnels {
         eprintln!(
-            "  {} [{}]  {}  — {} tunnel(s)",
-            s.name,
-            s.group.as_deref().unwrap_or("-"),
-            s.host,
-            s.tunnels.len()
+            "  {}  (ssh {} → {}:{})",
+            t.path, t.ssh, t.remote_host, t.remote_port
         );
     }
-    let count = imported.servers.len();
+    let count = imported.tunnels.len();
     if dry_run {
-        eprintln!("(dry-run: {count} server(s) parsed, nothing saved)");
+        eprintln!("(dry-run: {count} tunnel(s) parsed, nothing saved)");
         return 0;
     }
 
@@ -100,15 +98,11 @@ fn run_import_ssh(args: &[String]) -> i32 {
         return fail(format!("saving config: {e}"));
     }
     eprintln!(
-        "imported {count} server(s) into {} (now {} total)",
+        "imported {count} tunnel(s) into {} (now {} total)",
         config_path().display(),
-        current.servers.len()
+        current.tunnels.len()
     );
     0
-}
-
-fn home() -> String {
-    std::env::var("HOME").unwrap_or_else(|_| ".".to_string())
 }
 
 fn run_export(args: &[String]) -> i32 {
@@ -136,8 +130,8 @@ fn run_export(args: &[String]) -> i32 {
                 return fail(format!("writing {path}: {e}"));
             }
             eprintln!(
-                "exported {} server(s) to {path}{}",
-                config.servers.len(),
+                "exported {} tunnel(s) to {path}{}",
+                config.tunnels.len(),
                 if encrypt { " (encrypted)" } else { "" }
             );
         }
@@ -175,15 +169,15 @@ fn run_import(args: &[String]) -> i32 {
         Ok(c) => c,
         Err(e) => return fail(format!("loading config: {e}")),
     };
-    let added = incoming.servers.len();
+    let added = incoming.tunnels.len();
     current.merge(incoming, overwrite);
     if let Err(e) = current.save(config_path()) {
         return fail(format!("saving config: {e}"));
     }
     eprintln!(
-        "imported {added} server(s) into {} (now {} total)",
+        "imported {added} tunnel(s) into {} (now {} total)",
         config_path().display(),
-        current.servers.len()
+        current.tunnels.len()
     );
     0
 }

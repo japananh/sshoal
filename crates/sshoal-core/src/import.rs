@@ -7,16 +7,18 @@
 //! 54321:db.internal:5432 gemx-dev   # All DB
 //! ```
 //!
-//! i.e. `localport:remotehost:remoteport  <ssh-alias>  # label`, where the alias
-//! is an `~/.ssh/config` Host that supplies the real hostname/user/port. We parse
-//! those files plus `~/.ssh/config`, resolve the alias, and turn each file into
-//! one sshoal server (a toggleable bundle of tunnels).
+//! i.e. `localport:remotehost:remoteport  <ssh-alias>  # label`. We turn each
+//! line into a [`Tunnel`] whose `ssh` is the alias (kept as-is so it still works
+//! in a plain terminal) and whose tree `path` is derived from the file name and
+//! the label: `devredis` + `App-api` → `<prefix>/dev/redis/app-api`.
 
 use std::collections::HashMap;
 
-use crate::config::{ServerConfig, TunnelSpec};
+use crate::config::Tunnel;
 
-/// The connection details resolved for an `~/.ssh/config` Host alias.
+/// The connection details resolved for an `~/.ssh/config` Host alias. Kept for
+/// callers that want to display/verify alias targets; import stores the alias
+/// itself rather than resolving it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SshHost {
     pub host: String,
@@ -81,16 +83,12 @@ pub fn parse_ssh_config(text: &str) -> HashMap<String, SshHost> {
     map
 }
 
-/// Parse one `opentunnels.sh`-style file into servers, resolving ssh aliases
-/// against `hosts`. `file_stem` (e.g. `devdb`) names the resulting server(s).
-pub fn parse_tunnel_file(
-    file_stem: &str,
-    text: &str,
-    hosts: &HashMap<String, SshHost>,
-) -> Vec<ServerConfig> {
-    // Preserve first-seen alias order.
-    let mut order: Vec<String> = Vec::new();
-    let mut by_alias: HashMap<String, Vec<TunnelSpec>> = HashMap::new();
+/// Parse one `opentunnels.sh`-style file into tunnels. `file_stem` (e.g.
+/// `devredis`) seeds the path's env/type segments; `prefix` (e.g. `gc`) is an
+/// optional tree root.
+pub fn parse_tunnel_file(file_stem: &str, text: &str, prefix: Option<&str>) -> Vec<Tunnel> {
+    let (env, kind) = split_stem(file_stem);
+    let mut tunnels = Vec::new();
 
     for raw in text.lines() {
         let line = raw.trim();
@@ -98,79 +96,80 @@ pub fn parse_tunnel_file(
             continue;
         }
         let (addr, label) = match line.split_once('#') {
-            Some((a, c)) => (a.trim(), Some(c.trim().to_string())),
+            Some((a, c)) => (a.trim(), Some(c.trim())),
             None => (line, None),
         };
         let mut tokens = addr.split_whitespace();
         let Some(spec) = tokens.next() else { continue };
         let Some(alias) = tokens.next() else { continue };
-        let Some(tunnel) = parse_forward_spec(spec, label) else {
+        let Some((local_port, remote_host, remote_port)) = parse_forward_spec(spec) else {
             continue;
         };
-        by_alias
-            .entry(alias.to_string())
-            .or_insert_with(|| {
-                order.push(alias.to_string());
-                Vec::new()
-            })
-            .push(tunnel);
+
+        let leaf = label
+            .map(slugify)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| local_port.to_string());
+        let path = join_path(&[prefix.unwrap_or(""), &env, &kind, &leaf]);
+
+        tunnels.push(Tunnel {
+            path,
+            ssh: alias.to_string(),
+            ssh_port: None,
+            local_port,
+            remote_host,
+            remote_port,
+        });
     }
-
-    let multiple = order.len() > 1;
-    let group = derive_group(file_stem);
-
-    order
-        .into_iter()
-        .map(|alias| {
-            let tunnels = by_alias.remove(&alias).unwrap_or_default();
-            let resolved = hosts.get(&alias).cloned().unwrap_or(SshHost {
-                host: alias.clone(),
-                user: None,
-                port: 22,
-            });
-            let name = if multiple {
-                format!("{file_stem} ({alias})")
-            } else {
-                file_stem.to_string()
-            };
-            ServerConfig {
-                name,
-                host: resolved.host,
-                port: resolved.port,
-                user: resolved.user,
-                group: group.clone(),
-                tunnels,
-            }
-        })
-        .collect()
+    tunnels
 }
 
-/// `54321:host:5432` or `bind:54321:host:5432` -> a [`TunnelSpec`].
-fn parse_forward_spec(spec: &str, label: Option<String>) -> Option<TunnelSpec> {
-    let parts: Vec<&str> = spec.split(':').collect();
-    let (local, remote_host, remote) = match parts.as_slice() {
-        [local, host, remote] => (*local, *host, *remote),
-        [_bind, local, host, remote] => (*local, *host, *remote),
-        _ => return None,
-    };
-    Some(TunnelSpec {
-        local_port: local.parse().ok()?,
-        remote_host: remote_host.to_string(),
-        remote_port: remote.parse().ok()?,
-        label,
-    })
-}
-
-/// `devdb` -> `dev`, `stgservers` -> `stg`, `proddb` -> `prod`, for grouping.
-fn derive_group(file_stem: &str) -> Option<String> {
+/// `devredis` -> (`dev`, `redis`), `proddb` -> (`prod`, `db`), `gemx` -> (`gemx`, "").
+fn split_stem(file_stem: &str) -> (String, String) {
     for suffix in ["servers", "server", "db", "redis", "cache"] {
         if let Some(prefix) = file_stem.strip_suffix(suffix)
             && !prefix.is_empty()
         {
-            return Some(prefix.to_string());
+            return (prefix.to_string(), suffix.to_string());
         }
     }
-    None
+    (file_stem.to_string(), String::new())
+}
+
+/// `54321:host:5432` or `bind:54321:host:5432` -> (local, host, remote).
+fn parse_forward_spec(spec: &str) -> Option<(u16, String, u16)> {
+    let parts: Vec<&str> = spec.split(':').collect();
+    let (local, host, remote) = match parts.as_slice() {
+        [local, host, remote] => (*local, *host, *remote),
+        [_bind, local, host, remote] => (*local, *host, *remote),
+        _ => return None,
+    };
+    Some((local.parse().ok()?, host.to_string(), remote.parse().ok()?))
+}
+
+/// Lower-case, replace runs of non-alphanumeric chars with a single `-`.
+fn slugify(s: &str) -> String {
+    let mut out = String::new();
+    let mut dash = false;
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            dash = false;
+        } else if !out.is_empty() && !dash {
+            out.push('-');
+            dash = true;
+        }
+    }
+    out.trim_end_matches('-').to_string()
+}
+
+fn join_path(segments: &[&str]) -> String {
+    segments
+        .iter()
+        .filter(|s| !s.is_empty())
+        .copied()
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn split_kv(line: &str) -> (&str, &str) {
@@ -200,7 +199,6 @@ Host gemx-dev
   User tunneluser
 Host gemx-pro
   HostName 3.219.76.151
-  User violettran
   Port 2222
 Host *
   ServerAliveInterval 30
@@ -209,44 +207,35 @@ Host *
         assert_eq!(hosts.len(), 2);
         assert_eq!(hosts["gemx-dev"].host, "18.141.105.247");
         assert_eq!(hosts["gemx-dev"].user.as_deref(), Some("tunneluser"));
-        assert_eq!(hosts["gemx-dev"].port, 22);
         assert_eq!(hosts["gemx-pro"].port, 2222);
         assert!(!hosts.contains_key("*"));
     }
 
     #[test]
-    fn tunnel_file_becomes_one_server_with_labelled_tunnels() {
-        let hosts = parse_ssh_config("Host gemx-dev\n  HostName 1.2.3.4\n  User deploy\n");
+    fn tunnel_file_builds_tree_paths_keeping_alias() {
         let file = "\
-54321:gem-dev.rds.amazonaws.com:5432 gemx-dev # All DB
-54399:gpv6-dev.rds.amazonaws.com:5432 gemx-dev # DB v6
+63799:redis.internal:6379 gemx-dev # App-api
+6378:redis.internal:6379 gemx-dev # Auth Service
 ";
-        let servers = parse_tunnel_file("devdb", file, &hosts);
-        assert_eq!(servers.len(), 1);
-        let s = &servers[0];
-        assert_eq!(s.name, "devdb");
-        assert_eq!(s.host, "1.2.3.4");
-        assert_eq!(s.user.as_deref(), Some("deploy"));
-        assert_eq!(s.group.as_deref(), Some("dev"));
-        assert_eq!(s.tunnels.len(), 2);
-        assert_eq!(s.tunnels[0].local_port, 54321);
-        assert_eq!(s.tunnels[0].remote_host, "gem-dev.rds.amazonaws.com");
-        assert_eq!(s.tunnels[0].remote_port, 5432);
-        assert_eq!(s.tunnels[0].label.as_deref(), Some("All DB"));
+        let tunnels = parse_tunnel_file("devredis", file, Some("gc"));
+        assert_eq!(tunnels.len(), 2);
+        assert_eq!(tunnels[0].path, "gc/dev/redis/app-api");
+        assert_eq!(tunnels[0].ssh, "gemx-dev");
+        assert_eq!(tunnels[0].local_port, 63799);
+        assert_eq!(tunnels[0].remote_host, "redis.internal");
+        assert_eq!(tunnels[1].path, "gc/dev/redis/auth-service");
     }
 
     #[test]
-    fn unknown_alias_falls_back_to_using_it_as_host() {
-        let servers = parse_tunnel_file("x", "9000:svc:9000 myhost\n", &HashMap::new());
-        assert_eq!(servers[0].host, "myhost");
-        assert_eq!(servers[0].user, None);
+    fn path_without_prefix_or_label_falls_back() {
+        let tunnels = parse_tunnel_file("proddb", "54321:db:5432 gemx-pro\n", None);
+        assert_eq!(tunnels[0].path, "prod/db/54321");
     }
 
     #[test]
-    fn multiple_aliases_in_one_file_split_into_named_servers() {
-        let servers = parse_tunnel_file("mixed", "1:a:1 alpha\n2:b:2 beta\n", &HashMap::new());
-        assert_eq!(servers.len(), 2);
-        assert!(servers.iter().any(|s| s.name == "mixed (alpha)"));
-        assert!(servers.iter().any(|s| s.name == "mixed (beta)"));
+    fn slugify_handles_spaces_and_punctuation() {
+        assert_eq!(slugify("All DB v7"), "all-db-v7");
+        assert_eq!(slugify("App-api"), "app-api");
+        assert_eq!(slugify("  weird/name! "), "weird-name");
     }
 }

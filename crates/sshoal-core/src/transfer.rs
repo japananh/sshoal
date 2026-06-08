@@ -84,22 +84,17 @@ fn decrypt(bytes: &[u8], passphrase: &str) -> Result<Vec<u8>, ImportError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ServerConfig, TunnelSpec};
+    use crate::config::Tunnel;
 
     fn sample() -> AppConfig {
         AppConfig {
-            servers: vec![ServerConfig {
-                name: "db".into(),
-                host: "example.com".into(),
-                port: 22,
-                user: Some("deploy".into()),
-                group: Some("prod".into()),
-                tunnels: vec![TunnelSpec {
-                    local_port: 5432,
-                    remote_host: "127.0.0.1".into(),
-                    remote_port: 5432,
-                    label: None,
-                }],
+            tunnels: vec![Tunnel {
+                path: "gc/prod/db/app-api".into(),
+                ssh: "gemx-pro".into(),
+                ssh_port: None,
+                local_port: 5432,
+                remote_host: "127.0.0.1".into(),
+                remote_port: 5432,
             }],
         }
     }

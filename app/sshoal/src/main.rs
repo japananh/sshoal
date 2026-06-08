@@ -1,26 +1,25 @@
 //! sshoal — tray-resident SSH tunnel manager.
 //!
 //! The app is an `iced::daemon`: it lives in the menu bar / system tray with no
-//! window at launch. Opening the window shows the server list; closing it just
+//! window at launch. Opening the window shows the tunnel tree; closing it just
 //! hides the window — the daemon (and every tunnel) keeps running until you quit
 //! from the tray.
 //!
-//! All the real work lives in `sshoal-core`. This binary is the thin shell:
-//! load config, spawn a [`TunnelSupervisor`] per tunnel on a Tokio runtime, and
-//! render their live state.
+//! Tunnels are organized by their slash-separated `path` into a collapsible
+//! tree. Toggling a leaf brings one tunnel up/down; toggling a folder does the
+//! same for everything under it. Each tunnel is supervised independently.
 
 mod cli;
 mod logging;
 
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use iced::widget::{button, column, container, row, scrollable, text};
+use iced::widget::{button, column, container, row, scrollable, space, text};
 use iced::{Color, Element, Length, Subscription, Task, window};
-use sshoal_core::{
-    AppConfig, Backoff, OpenSshTransport, ServerConfig, Transport, TunnelState, TunnelSupervisor,
-};
+use sshoal_core::{AppConfig, Backoff, OpenSshTransport, Transport, TunnelState, TunnelSupervisor};
 use tracing::info;
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
@@ -29,36 +28,40 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 enum Message {
     /// Periodic: refresh status dots and poll the tray menu channel.
     Tick,
-    /// Toggle a server's tunnels on/off (from the window button).
-    Toggle(usize),
+    ToggleTunnel(usize),
+    ToggleFolder(String),
+    ExpandCollapse(String),
     WindowOpened(window::Id),
 }
 
-/// Tray menu item ids we match clicks against.
 struct MenuIds {
     connect_all: MenuId,
     open: MenuId,
     quit: MenuId,
 }
 
-/// One row in the server list: its config, whether it's on, the supervisors
-/// keeping its tunnels alive, and the aggregated status shown as a dot.
-struct ServerRow {
-    config: ServerConfig,
-    enabled: bool,
-    supervisors: Vec<TunnelSupervisor>,
+/// One tunnel plus the supervisor keeping it alive (when enabled).
+struct TunnelRow {
+    tunnel: sshoal_core::Tunnel,
+    supervisor: Option<TunnelSupervisor>,
     status: TunnelState,
 }
 
+impl TunnelRow {
+    fn enabled(&self) -> bool {
+        self.supervisor.is_some()
+    }
+}
+
 struct App {
-    /// Kept alive for the whole process — dropping it removes the tray icon.
     _tray: TrayIcon,
     menu: MenuIds,
     window: Option<window::Id>,
-    /// Runtime that hosts the tunnel supervisor tasks.
     runtime: Arc<tokio::runtime::Runtime>,
     transport: Arc<dyn Transport>,
-    servers: Vec<ServerRow>,
+    rows: Vec<TunnelRow>,
+    /// Folder paths currently expanded in the tree.
+    expanded: HashSet<String>,
 }
 
 fn boot(runtime: Arc<tokio::runtime::Runtime>) -> (App, Task<Message>) {
@@ -68,18 +71,20 @@ fn boot(runtime: Arc<tokio::runtime::Runtime>) -> (App, Task<Message>) {
         tracing::error!(error = %err, path = %path.display(), "failed to load config");
         AppConfig::default()
     });
-    info!(path = %path.display(), servers = config.servers.len(), "config loaded");
+    info!(path = %path.display(), tunnels = config.tunnels.len(), "config loaded");
 
-    let servers = config
-        .servers
+    let rows: Vec<TunnelRow> = config
+        .tunnels
         .into_iter()
-        .map(|config| ServerRow {
-            config,
-            enabled: false,
-            supervisors: Vec::new(),
+        .map(|tunnel| TunnelRow {
+            tunnel,
+            supervisor: None,
             status: TunnelState::Idle,
         })
         .collect();
+
+    // Expand every folder by default so the whole tree is visible at first.
+    let expanded = all_folder_paths(&rows);
 
     let connect_all = MenuItem::new("Connect all", true, None);
     let open = MenuItem::new("Open sshoal", true, None);
@@ -104,7 +109,8 @@ fn boot(runtime: Arc<tokio::runtime::Runtime>) -> (App, Task<Message>) {
         window: None,
         runtime,
         transport: Arc::new(OpenSshTransport),
-        servers,
+        rows,
+        expanded,
     };
     (app, Task::none())
 }
@@ -112,9 +118,9 @@ fn boot(runtime: Arc<tokio::runtime::Runtime>) -> (App, Task<Message>) {
 fn update(app: &mut App, message: Message) -> Task<Message> {
     match message {
         Message::Tick => {
-            for row in &mut app.servers {
-                if row.enabled && !row.supervisors.is_empty() {
-                    row.status = aggregate(&row.supervisors);
+            for row in &mut app.rows {
+                if let Some(sup) = &row.supervisor {
+                    row.status = sup.state();
                 }
             }
 
@@ -130,16 +136,31 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                     info!("quitting");
                     return iced::exit();
                 } else if event.id == app.menu.connect_all {
-                    for i in 0..app.servers.len() {
+                    for i in 0..app.rows.len() {
                         set_enabled(app, i, true);
                     }
                 }
             }
             Task::none()
         }
-        Message::Toggle(i) => {
-            let on = !app.servers.get(i).map(|r| r.enabled).unwrap_or(false);
+        Message::ToggleTunnel(i) => {
+            let on = !app.rows.get(i).map(TunnelRow::enabled).unwrap_or(false);
             set_enabled(app, i, on);
+            Task::none()
+        }
+        Message::ToggleFolder(path) => {
+            let indices: Vec<usize> = descendant_indices(&app.rows, &path);
+            // If everything under the folder is already on, turn it off; else on.
+            let all_on = indices.iter().all(|&i| app.rows[i].enabled());
+            for i in indices {
+                set_enabled(app, i, !all_on);
+            }
+            Task::none()
+        }
+        Message::ExpandCollapse(path) => {
+            if !app.expanded.remove(&path) {
+                app.expanded.insert(path);
+            }
             Task::none()
         }
         Message::WindowOpened(id) => {
@@ -149,112 +170,233 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
     }
 }
 
-/// Spawn or tear down a server's tunnel supervisors.
+/// Spawn or tear down the supervisor for one tunnel row.
 fn set_enabled(app: &mut App, i: usize, on: bool) {
     let transport = app.transport.clone();
     let runtime = app.runtime.clone();
-    let Some(row) = app.servers.get_mut(i) else {
+    let Some(row) = app.rows.get_mut(i) else {
         return;
     };
 
-    if on && !row.enabled {
+    if on && row.supervisor.is_none() {
         let _guard = runtime.enter();
-        row.supervisors = row
-            .config
-            .tunnels
-            .iter()
-            .map(|tunnel| {
-                TunnelSupervisor::spawn(
-                    transport.clone(),
-                    row.config.clone(),
-                    tunnel.clone(),
-                    Backoff::default(),
-                )
-            })
-            .collect();
-        row.enabled = true;
-        row.status = if row.supervisors.is_empty() {
-            TunnelState::Idle
-        } else {
-            TunnelState::Connecting
-        };
-        info!(server = %row.config.name, tunnels = row.supervisors.len(), "connect");
-    } else if !on && row.enabled {
-        for supervisor in row.supervisors.drain(..) {
-            supervisor.cancel();
+        let sup = TunnelSupervisor::spawn(transport, row.tunnel.clone(), Backoff::default());
+        row.supervisor = Some(sup);
+        row.status = TunnelState::Connecting;
+        info!(tunnel = %row.tunnel.path, "connect");
+    } else if !on && row.supervisor.is_some() {
+        if let Some(sup) = row.supervisor.take() {
+            sup.cancel();
         }
-        row.enabled = false;
         row.status = TunnelState::Idle;
-        info!(server = %row.config.name, "disconnect");
+        info!(tunnel = %row.tunnel.path, "disconnect");
     }
 }
 
-/// Combine per-tunnel states into one status for the server row.
-fn aggregate(supervisors: &[TunnelSupervisor]) -> TunnelState {
-    let mut all_up = true;
-    let mut any_connecting = false;
-    let mut any_bad = false;
-    for supervisor in supervisors {
-        match supervisor.state() {
-            TunnelState::Up => {}
-            TunnelState::Connecting => {
-                all_up = false;
-                any_connecting = true;
-            }
-            TunnelState::Reconnecting | TunnelState::Failed => {
-                all_up = false;
-                any_bad = true;
-            }
-            TunnelState::Idle => all_up = false,
+/// Row indices whose tunnel sits at or under `folder_path`.
+fn descendant_indices(rows: &[TunnelRow], folder_path: &str) -> Vec<usize> {
+    let prefix = format!("{folder_path}/");
+    rows.iter()
+        .enumerate()
+        .filter(|(_, r)| r.tunnel.path == folder_path || r.tunnel.path.starts_with(&prefix))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+// ---- tree construction ----
+
+#[derive(Default)]
+struct Folder {
+    subfolders: BTreeMap<String, Folder>,
+    leaves: Vec<usize>,
+}
+
+fn build_tree(rows: &[TunnelRow]) -> Folder {
+    let mut root = Folder::default();
+    for (i, row) in rows.iter().enumerate() {
+        let segments = row.tunnel.segments();
+        insert_leaf(&mut root, &segments, i);
+    }
+    root
+}
+
+fn insert_leaf(folder: &mut Folder, segments: &[&str], row_idx: usize) {
+    match segments {
+        [] => {}
+        [_leaf] => folder.leaves.push(row_idx),
+        [head, rest @ ..] => insert_leaf(
+            folder.subfolders.entry(head.to_string()).or_default(),
+            rest,
+            row_idx,
+        ),
+    }
+}
+
+fn all_folder_paths(rows: &[TunnelRow]) -> HashSet<String> {
+    let mut set = HashSet::new();
+    for row in rows {
+        let segments = row.tunnel.segments();
+        // every prefix except the leaf is a folder
+        for end in 1..segments.len() {
+            set.insert(segments[..end].join("/"));
         }
     }
-    if all_up {
-        TunnelState::Up
+    set
+}
+
+struct DisplayRow {
+    depth: usize,
+    path: String,
+    name: String,
+    is_folder: bool,
+    enabled: bool,
+    status: TunnelState,
+}
+
+fn flatten(
+    folder: &Folder,
+    prefix: &str,
+    depth: usize,
+    rows: &[TunnelRow],
+    expanded: &HashSet<String>,
+    out: &mut Vec<DisplayRow>,
+) {
+    for (name, sub) in &folder.subfolders {
+        let path = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        let leaves = collect_leaves(sub);
+        let enabled = leaves.iter().any(|&i| rows[i].enabled());
+        let status = aggregate(leaves.iter().map(|&i| rows[i].status));
+        out.push(DisplayRow {
+            depth,
+            path: path.clone(),
+            name: name.clone(),
+            is_folder: true,
+            enabled,
+            status,
+        });
+        if expanded.contains(&path) {
+            flatten(sub, &path, depth + 1, rows, expanded, out);
+        }
+    }
+    for &idx in &folder.leaves {
+        let row = &rows[idx];
+        out.push(DisplayRow {
+            depth,
+            path: row.tunnel.path.clone(),
+            name: row.tunnel.name().to_string(),
+            is_folder: false,
+            enabled: row.enabled(),
+            status: row.status,
+        });
+    }
+}
+
+fn collect_leaves(folder: &Folder) -> Vec<usize> {
+    let mut out = folder.leaves.clone();
+    for sub in folder.subfolders.values() {
+        out.extend(collect_leaves(sub));
+    }
+    out
+}
+
+fn aggregate(states: impl Iterator<Item = TunnelState>) -> TunnelState {
+    let mut any = false;
+    let mut any_up = false;
+    let mut any_connecting = false;
+    let mut any_bad = false;
+    for s in states {
+        any = true;
+        match s {
+            TunnelState::Up => any_up = true,
+            TunnelState::Connecting => any_connecting = true,
+            TunnelState::Reconnecting | TunnelState::Failed => any_bad = true,
+            TunnelState::Idle => {}
+        }
+    }
+    if !any {
+        TunnelState::Idle
     } else if any_bad {
         TunnelState::Reconnecting
     } else if any_connecting {
         TunnelState::Connecting
+    } else if any_up {
+        TunnelState::Up
     } else {
         TunnelState::Idle
     }
 }
 
-fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
-    let mut list = column![].spacing(8);
+// ---- view ----
 
-    if app.servers.is_empty() {
+fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
+    let mut list = column![].spacing(4);
+
+    if app.rows.is_empty() {
         list = list.push(text(format!(
-            "No servers yet. Edit {} and reopen.",
+            "No tunnels yet. Import with `sshoal import-ssh ...` or edit {}.",
             config_path().display()
         )));
     }
 
-    for (i, row) in app.servers.iter().enumerate() {
-        let target = match &row.config.user {
-            Some(user) => format!("{user}@{}:{}", row.config.host, row.config.port),
-            None => format!("{}:{}", row.config.host, row.config.port),
+    let tree = build_tree(&app.rows);
+    let mut display = Vec::new();
+    flatten(&tree, "", 0, &app.rows, &app.expanded, &mut display);
+
+    for d in &display {
+        let indent = space().width(Length::Fixed(d.depth as f32 * 16.0));
+
+        let lead: Element<Message> = if d.is_folder {
+            let arrow = if app.expanded.contains(&d.path) {
+                "▾"
+            } else {
+                "▸"
+            };
+            button(text(arrow).size(14))
+                .padding(2)
+                .on_press(Message::ExpandCollapse(d.path.clone()))
+                .into()
+        } else {
+            status_dot(d.status)
         };
-        let label = column![
-            text(row.config.name.clone()).size(16),
-            text(target)
-                .size(12)
-                .color(Color::from_rgb(0.55, 0.55, 0.6)),
-        ]
-        .spacing(2)
+
+        let label = if d.is_folder {
+            text(d.name.clone()).size(15)
+        } else {
+            text(d.name.clone()).size(14)
+        }
         .width(Length::Fill);
 
-        let action = button(text(if row.enabled { "Disconnect" } else { "Connect" }))
-            .on_press(Message::Toggle(i));
+        let action = button(text(if d.enabled { "Disconnect" } else { "Connect" }).size(12))
+            .padding([2, 8])
+            .on_press(if d.is_folder {
+                Message::ToggleFolder(d.path.clone())
+            } else {
+                Message::ToggleTunnel(
+                    app.rows
+                        .iter()
+                        .position(|r| r.tunnel.path == d.path)
+                        .unwrap_or(0),
+                )
+            });
 
-        let line = row![status_dot(row.status), label, action]
-            .spacing(12)
+        let folder_dot: Element<Message> = if d.is_folder {
+            status_dot(d.status)
+        } else {
+            space().width(Length::Fixed(0.0)).into()
+        };
+
+        let line = row![indent, lead, label, folder_dot, action]
+            .spacing(8)
             .align_y(iced::Alignment::Center);
-        list = list.push(container(line).padding(8));
+        list = list.push(line);
     }
 
     let header = text("sshoal").size(22);
     let body = scrollable(list).height(Length::Fill);
-
     container(column![header, body].spacing(12))
         .padding(16)
         .into()
@@ -272,7 +414,7 @@ fn status_dot(state: TunnelState) -> Element<'static, Message> {
     } else {
         "●"
     };
-    text(glyph).size(16).color(color).into()
+    text(glyph).size(15).color(color).into()
 }
 
 fn subscription(_app: &App) -> Subscription<Message> {
@@ -285,7 +427,6 @@ pub(crate) fn config_path() -> PathBuf {
     PathBuf::from(home).join(".config/sshoal/servers.yaml")
 }
 
-/// Write a starter config the first time the app runs, so there's something to edit.
 fn ensure_example(path: &Path) {
     if path.exists() {
         return;
@@ -299,19 +440,15 @@ fn ensure_example(path: &Path) {
 }
 
 const EXAMPLE_YAML: &str = "\
-# sshoal config — the servers and tunnels to keep alive.
-# Private keys are NOT stored here; sshoal uses your existing ~/.ssh setup
-# (config, keys, agent, known_hosts). `host` may be an alias from ~/.ssh/config.
-servers:
-  - name: Example DB
-    host: example.com
-    port: 22
-    user: deploy
-    group: staging
-    tunnels:
-      - local_port: 5432
-        remote_host: 127.0.0.1
-        remote_port: 5432
+# sshoal config — tunnels to keep alive, organized by `path` (a slash tree).
+# `ssh` is an ~/.ssh/config alias (or user@host) passed straight to ssh, so the
+# same value works in a plain terminal. Private keys are NOT stored here.
+tunnels:
+  - path: example/dev/db/app-api
+    ssh: gemx-dev
+    local_port: 54321
+    remote_host: db.internal
+    remote_port: 5432
 ";
 
 fn make_icon() -> Icon {
@@ -324,10 +461,7 @@ fn make_icon() -> Icon {
 }
 
 fn main() -> iced::Result {
-    // Handle `export`/`import` subcommands before touching the GUI or logger
-    // (so a blob written to stdout stays clean).
     cli::maybe_run();
-
     logging::init();
 
     let runtime = Arc::new(
