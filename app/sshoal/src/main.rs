@@ -28,7 +28,8 @@ use iced::{Color, Element, Font, Length, Size, Subscription, Task, Theme, window
 /// monochrome icon font for crisp Add/Edit/folder glyphs.
 const LUCIDE: Font = Font::with_name("lucide");
 const ICON_PLUS: &str = "\u{e13d}";
-const ICON_PENCIL: &str = "\u{e1f9}";
+const ICON_MINUS: &str = "\u{e11c}";
+const ICON_CHEVRON_LEFT: &str = "\u{e06e}";
 const ICON_FOLDER: &str = "\u{e0d7}";
 const ICON_FOLDER_OPEN: &str = "\u{e247}";
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
@@ -74,6 +75,10 @@ enum Message {
     SaveSsh,
     CancelSsh,
     DeleteSsh(usize),
+    // Selection / keyboard nav
+    SelectDelta(i32),
+    DeleteSelected,
+    Keyboard(iced::keyboard::Event),
 }
 
 struct MenuIds {
@@ -156,6 +161,9 @@ struct App {
     managing_ssh: bool,
     /// In-progress add/edit of an SSH config.
     editing_ssh: Option<SshForm>,
+    /// Currently selected row (tunnel-row index on the tree, ssh-config index on
+    /// the SSH-configs screen) — for keyboard nav + the delete (−) button.
+    selected: Option<usize>,
 }
 
 impl App {
@@ -213,6 +221,7 @@ fn boot(runtime: Arc<tokio::runtime::Runtime>) -> (App, Task<Message>) {
         editing: None,
         managing_ssh: false,
         editing_ssh: None,
+        selected: None,
     };
 
     // Show the window on launch so opening the app always surfaces it (the tray
@@ -335,6 +344,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::StartEdit(i) => {
+            app.selected = Some(i);
             if let Some(row) = app.rows.get(i) {
                 let t = &row.tunnel;
                 app.editing = Some(EditForm {
@@ -385,11 +395,13 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::OpenSshConfigs => {
             app.managing_ssh = true;
             app.editing = None;
+            app.selected = None;
             Task::none()
         }
         Message::CloseSshConfigs => {
             app.managing_ssh = false;
             app.editing_ssh = None;
+            app.selected = None;
             Task::none()
         }
         Message::StartAddSsh => {
@@ -400,6 +412,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::StartEditSsh(i) => {
+            app.selected = Some(i);
             if let Some(c) = app.ssh_configs.get(i) {
                 app.editing_ssh = Some(SshForm {
                     target: Some(i),
@@ -439,6 +452,45 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 let removed = app.ssh_configs.remove(i);
                 info!(ssh = %removed.name, "delete ssh config");
                 persist(&app.rows, &app.ssh_configs);
+            }
+            Task::none()
+        }
+        Message::SelectDelta(delta) => {
+            let len = if app.managing_ssh {
+                app.ssh_configs.len()
+            } else {
+                app.rows.len()
+            };
+            if len > 0 {
+                let cur = app.selected.unwrap_or(0) as i32;
+                let next = (cur + delta).rem_euclid(len as i32) as usize;
+                app.selected = Some(next);
+            }
+            Task::none()
+        }
+        Message::DeleteSelected => {
+            if let Some(i) = app.selected.take() {
+                if app.managing_ssh {
+                    return update(app, Message::DeleteSsh(i));
+                }
+                return update(app, Message::DeleteTunnel(i));
+            }
+            Task::none()
+        }
+        Message::Keyboard(event) => {
+            use iced::keyboard::{Event, Key, key::Named};
+            // Only navigate the list when not typing in a form.
+            if app.editing.is_none() && app.editing_ssh.is_none() {
+                if let Event::KeyPressed { key, .. } = event {
+                    return match key {
+                        Key::Named(Named::ArrowUp) => update(app, Message::SelectDelta(-1)),
+                        Key::Named(Named::ArrowDown) => update(app, Message::SelectDelta(1)),
+                        Key::Named(Named::Backspace | Named::Delete) => {
+                            update(app, Message::DeleteSelected)
+                        }
+                        _ => Task::none(),
+                    };
+                }
             }
             Task::none()
         }
@@ -714,7 +766,7 @@ fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
         return ssh_edit_view(form);
     }
     if app.managing_ssh {
-        return ssh_list_view(&app.ssh_configs);
+        return ssh_list_view(app);
     }
     if let Some(form) = &app.editing {
         return edit_view(form, &app.ssh_names());
@@ -727,12 +779,10 @@ fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
             .padding([4, 10])
             .on_press(Message::OpenSshConfigs),
         tip(
-            button(text(ICON_PLUS).font(LUCIDE).size(18))
-                .style(button::text)
-                .padding([2, 8])
-                .on_press(Message::StartAdd),
-            "Add tunnel",
+            icon_button(ICON_MINUS, Message::DeleteSelected),
+            "Delete selected"
         ),
+        tip(icon_button(ICON_PLUS, Message::StartAdd), "Add tunnel"),
     ]
     .spacing(8)
     .align_y(iced::Alignment::Center);
@@ -758,86 +808,56 @@ fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
 
 fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
     let indent = space().width(Length::Fixed(d.depth as f32 * 16.0));
-    let is_folder = d.row_idx.is_none();
 
-    let lead: Element<Message> = if is_folder {
+    // Folder: a full-width band you click to expand/collapse. No toggle/status.
+    let Some(idx) = d.row_idx else {
         let expanded = app.expanded.contains(&d.path);
         let icon = if expanded {
             ICON_FOLDER_OPEN
         } else {
             ICON_FOLDER
         };
-        tip(
-            button(text(icon).font(LUCIDE).size(15))
-                .style(button::text)
-                .padding(2)
-                .on_press(Message::ExpandCollapse(d.path.clone())),
-            if expanded { "Collapse" } else { "Expand" },
-        )
-    } else {
-        status_dot(d.status)
-    };
-
-    let name: Element<Message> = if is_folder {
-        text(d.name.clone()).size(14).width(Length::Fill).into()
-    } else {
-        text(d.name.clone()).size(13).width(Length::Fill).into()
-    };
-
-    // On/off switch: cleaner than a text button, and doesn't read as up/down.
-    let switch: Element<Message> = if is_folder {
-        let path = d.path.clone();
-        tip(
-            toggler(d.enabled)
-                .size(18)
-                .on_toggle(move |_| Message::ToggleFolder(path.clone())),
-            if d.enabled {
-                "Disconnect all"
-            } else {
-                "Connect all"
-            },
-        )
-    } else {
-        let idx = d.row_idx.unwrap();
-        tip(
-            toggler(d.enabled)
-                .size(18)
-                .on_toggle(move |_| Message::ToggleTunnel(idx)),
-            if d.enabled { "Disconnect" } else { "Connect" },
-        )
-    };
-
-    let mut line = row![indent, lead, name].spacing(10);
-    if is_folder {
-        line = line.push(status_dot(d.status));
-    } else if let Some(idx) = d.row_idx {
-        line = line.push(tip(
-            button(text(ICON_PENCIL).font(LUCIDE).size(15))
-                .style(button::text)
-                .padding([2, 6])
-                .on_press(Message::StartEdit(idx)),
-            "Edit tunnel",
-        ));
-    }
-    line = line.push(switch);
-    // Keep controls clear of the scrollbar on the right.
-    line = line.push(space().width(Length::Fixed(8.0)));
-
-    let line = line.align_y(iced::Alignment::Center);
-    if is_folder {
-        // Highlight folder rows with a subtle background band.
-        return container(line)
+        let content = row![
+            indent,
+            text(icon).font(LUCIDE).size(15),
+            text(d.name.clone()).size(14).width(Length::Fill),
+        ]
+        .spacing(10)
+        .align_y(iced::Alignment::Center);
+        return button(content)
+            .style(folder_button)
             .width(Length::Fill)
             .padding([5, 6])
-            .style(folder_band)
+            .on_press(Message::ExpandCollapse(d.path.clone()))
             .into();
-    }
+    };
 
-    // Leaf: optionally show a transient reason line underneath.
-    let mut col = column![container(line).padding([3, 6])].spacing(1);
-    if let Some(idx) = d.row_idx
-        && let Some((msg, _)) = &app.rows[idx].notice
-    {
+    // Leaf: clicking the row opens edit; the toggler (sibling) connects/disconnects.
+    let selected = app.selected == Some(idx);
+    let label = row![
+        indent,
+        status_dot(d.status),
+        text(d.name.clone()).size(13).width(Length::Fill),
+    ]
+    .spacing(10)
+    .align_y(iced::Alignment::Center);
+    let click = button(label)
+        .style(if selected { row_selected } else { row_plain })
+        .width(Length::Fill)
+        .padding([3, 6])
+        .on_press(Message::StartEdit(idx));
+    let switch = tip(
+        toggler(d.enabled)
+            .size(18)
+            .on_toggle(move |_| Message::ToggleTunnel(idx)),
+        if d.enabled { "Disconnect" } else { "Connect" },
+    );
+    let line = row![click, switch, space().width(Length::Fixed(8.0))]
+        .spacing(8)
+        .align_y(iced::Alignment::Center);
+
+    let mut col = column![line].spacing(1);
+    if let Some((msg, _)) = &app.rows[idx].notice {
         col = col.push(
             row![
                 space().width(Length::Fixed(d.depth as f32 * 16.0 + 26.0)),
@@ -849,6 +869,43 @@ fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
         );
     }
     col.into()
+}
+
+fn row_style(bg: Option<Color>, radius: f32) -> iced::widget::button::Style {
+    iced::widget::button::Style {
+        background: bg.map(iced::Background::Color),
+        text_color: Color::from_rgb(0.13, 0.13, 0.18),
+        border: iced::Border {
+            radius: radius.into(),
+            ..iced::Border::default()
+        },
+        shadow: iced::Shadow::default(),
+        snap: true,
+    }
+}
+
+/// Folder row: a slightly darker band so folders stand out from leaves.
+fn folder_button(_theme: &iced::Theme, status: button::Status) -> iced::widget::button::Style {
+    let shade = match status {
+        button::Status::Hovered => 0.82,
+        button::Status::Pressed => 0.78,
+        _ => 0.86,
+    };
+    row_style(Some(Color::from_rgb(shade, shade, shade + 0.03)), 0.0)
+}
+
+/// Leaf row, not selected: transparent, faint highlight on hover.
+fn row_plain(_theme: &iced::Theme, status: button::Status) -> iced::widget::button::Style {
+    let bg = match status {
+        button::Status::Hovered => Some(Color::from_rgb(0.95, 0.95, 0.97)),
+        _ => None,
+    };
+    row_style(bg, 6.0)
+}
+
+/// Leaf row, selected: a light blue highlight.
+fn row_selected(_theme: &iced::Theme, _status: button::Status) -> iced::widget::button::Style {
+    row_style(Some(Color::from_rgb(0.80, 0.87, 1.0)), 6.0)
 }
 
 /// Wrap a control with a hover tooltip.
@@ -876,38 +933,47 @@ fn tooltip_bubble(_theme: &iced::Theme) -> iced::widget::container::Style {
     }
 }
 
-/// Soft, light, rounded band behind folder rows (macOS-list feel).
-fn folder_band(_theme: &iced::Theme) -> iced::widget::container::Style {
-    iced::widget::container::Style {
-        background: Some(iced::Background::Color(Color::from_rgb(0.945, 0.945, 0.96))),
-        border: iced::Border {
-            radius: 8.0.into(),
-            ..Default::default()
-        },
-        ..iced::widget::container::Style::default()
-    }
-}
-
 /// Rounded "pill" buttons — one per visual role, all sharing the Add button's
 /// rounded shape so the UI is consistent.
 fn pill_button(theme: &iced::Theme, status: button::Status) -> iced::widget::button::Style {
     pill(button::primary(theme, status))
 }
 
-fn pill_secondary(theme: &iced::Theme, status: button::Status) -> iced::widget::button::Style {
+/// Light, bordered secondary button (reads clearly as a button, not flat).
+fn pill_secondary(_theme: &iced::Theme, status: button::Status) -> iced::widget::button::Style {
     let shade = match status {
-        button::Status::Hovered => 0.88,
-        button::Status::Pressed => 0.82,
-        _ => 0.93,
+        button::Status::Hovered => 0.90,
+        button::Status::Pressed => 0.84,
+        _ => 0.95,
     };
-    let mut base = button::secondary(theme, status);
-    base.background = Some(iced::Background::Color(Color::from_rgb(
-        shade,
-        shade,
-        shade + 0.02,
-    )));
-    base.text_color = Color::from_rgb(0.18, 0.18, 0.22);
-    pill(base)
+    iced::widget::button::Style {
+        background: Some(iced::Background::Color(Color::from_rgb(
+            shade,
+            shade,
+            shade + 0.01,
+        ))),
+        text_color: Color::from_rgb(0.18, 0.18, 0.22),
+        border: iced::Border {
+            color: Color::from_rgb(0.76, 0.76, 0.80),
+            width: 1.0,
+            radius: 14.0.into(),
+        },
+        shadow: iced::Shadow::default(),
+        snap: true,
+    }
+}
+
+/// Rounded text-input style (Tahoe-ish).
+fn rounded_input(
+    theme: &iced::Theme,
+    status: iced::widget::text_input::Status,
+) -> iced::widget::text_input::Style {
+    let mut style = iced::widget::text_input::default(theme, status);
+    style.border = iced::Border {
+        radius: 9.0.into(),
+        ..style.border
+    };
+    style
 }
 
 fn pill_danger(theme: &iced::Theme, status: button::Status) -> iced::widget::button::Style {
@@ -936,6 +1002,8 @@ fn edit_view<'a>(form: &'a EditForm, ssh_names: &[String]) -> Element<'a, Messag
             text(label.to_string()).size(13).width(Length::Fixed(110.0)),
             text_input(placeholder, value)
                 .size(13)
+                .padding([6, 9])
+                .style(rounded_input)
                 .on_input(move |s| Message::EditField(f, s)),
         ]
         .spacing(8)
@@ -1065,62 +1133,63 @@ fn nonempty(s: &str) -> Option<String> {
     (!t.is_empty()).then(|| t.to_string())
 }
 
-fn ssh_list_view(configs: &[SshConfig]) -> Element<'_, Message> {
+fn ssh_list_view(app: &App) -> Element<'_, Message> {
     let header = row![
-        button(text("‹ Back").size(13))
-            .style(pill_secondary)
-            .padding([4, 12])
-            .on_press(Message::CloseSshConfigs),
+        tip(
+            button(text(ICON_CHEVRON_LEFT).font(LUCIDE).size(18))
+                .style(button::text)
+                .padding([2, 6])
+                .on_press(Message::CloseSshConfigs),
+            "Back",
+        ),
         text("SSH configs").size(20).width(Length::Fill),
         tip(
-            button(text(ICON_PLUS).font(LUCIDE).size(18))
-                .style(button::text)
-                .padding([2, 8])
-                .on_press(Message::StartAddSsh),
-            "Add SSH config",
+            icon_button(ICON_MINUS, Message::DeleteSelected),
+            "Delete selected"
+        ),
+        tip(
+            icon_button(ICON_PLUS, Message::StartAddSsh),
+            "Add SSH config"
         ),
     ]
     .spacing(8)
     .align_y(iced::Alignment::Center);
 
-    let mut list = column![].spacing(4);
-    if configs.is_empty() {
+    let mut list = column![].spacing(2);
+    if app.ssh_configs.is_empty() {
         list = list
             .push(text("No SSH configs yet. Click + to add, or run `sshoal import-ssh`.").size(13));
     }
-    for (i, c) in configs.iter().enumerate() {
+    for (i, c) in app.ssh_configs.iter().enumerate() {
         let user = c.user.as_deref().unwrap_or("-");
         let sub = format!("{user}@{}:{}", c.host, c.port);
-        let line = row![
-            column![
-                text(c.name.clone()).size(14),
-                text(sub).size(11).color(Color::from_rgb(0.55, 0.55, 0.6)),
-            ]
-            .spacing(2)
-            .width(Length::Fill),
-            tip(
-                button(text(ICON_PENCIL).font(LUCIDE).size(15))
-                    .style(button::text)
-                    .padding([2, 6])
-                    .on_press(Message::StartEditSsh(i)),
-                "Edit",
-            ),
-            tip(
-                button(text("✕").size(11))
-                    .style(pill_danger)
-                    .padding([2, 8])
-                    .on_press(Message::DeleteSsh(i)),
-                "Delete",
-            ),
-            space().width(Length::Fixed(8.0)),
+        let content = column![
+            text(c.name.clone()).size(14),
+            text(sub).size(11).color(Color::from_rgb(0.5, 0.5, 0.56)),
         ]
-        .spacing(10)
-        .align_y(iced::Alignment::Center);
-        list = list.push(container(line).padding([4, 6]));
+        .spacing(2)
+        .width(Length::Fill);
+        let selected = app.selected == Some(i);
+        list = list.push(
+            button(content)
+                .style(if selected { row_selected } else { row_plain })
+                .width(Length::Fill)
+                .padding([6, 8])
+                .on_press(Message::StartEditSsh(i)),
+        );
     }
 
     container(column![header, scrollable(list).height(Length::Fill)].spacing(12))
         .padding(14)
+        .into()
+}
+
+/// A borderless icon button (lucide glyph), e.g. the +/− header actions.
+fn icon_button<'a>(icon: &'a str, msg: Message) -> Element<'a, Message> {
+    button(text(icon).font(LUCIDE).size(18))
+        .style(button::text)
+        .padding([2, 8])
+        .on_press(msg)
         .into()
 }
 
@@ -1136,6 +1205,8 @@ fn ssh_edit_view(form: &SshForm) -> Element<'_, Message> {
             text(label.to_string()).size(13).width(Length::Fixed(110.0)),
             text_input(placeholder, value)
                 .size(13)
+                .padding([6, 9])
+                .style(rounded_input)
                 .on_input(move |s| Message::EditSshField(f, s)),
         ]
         .spacing(8)
@@ -1210,6 +1281,7 @@ fn subscription(_app: &App) -> Subscription<Message> {
     Subscription::batch([
         iced::time::every(Duration::from_millis(200)).map(|_| Message::Tick),
         iced::window::close_events().map(Message::WindowClosed),
+        iced::keyboard::listen().map(Message::Keyboard),
     ])
 }
 
