@@ -56,8 +56,7 @@ enum Message {
     /// Periodic: refresh status dots and poll the tray menu channel.
     Tick,
     ToggleTunnel(usize),
-    ToggleFolder(String),
-    ExpandCollapse(String),
+    ClickFolder(String),
     WindowOpened(window::Id),
     WindowClosed(window::Id),
     StartAdd,
@@ -78,6 +77,9 @@ enum Message {
     // Selection / keyboard nav
     SelectDelta(i32),
     DeleteSelected,
+    ConfirmDeleteInput(String),
+    ConfirmDeleteDo,
+    ConfirmDeleteCancel,
     Keyboard(iced::keyboard::Event),
 }
 
@@ -161,9 +163,39 @@ struct App {
     managing_ssh: bool,
     /// In-progress add/edit of an SSH config.
     editing_ssh: Option<SshForm>,
-    /// Currently selected row (tunnel-row index on the tree, ssh-config index on
-    /// the SSH-configs screen) — for keyboard nav + the delete (−) button.
-    selected: Option<usize>,
+    /// Currently selected row, by identity (tunnel/folder `path` on the tree, or
+    /// ssh-config `name` on the SSH screen) — for keyboard nav + delete (−).
+    selected: Option<String>,
+    /// Pending folder deletion awaiting type-to-confirm.
+    confirm_delete: Option<ConfirmDelete>,
+}
+
+/// Type-the-name confirmation for deleting a whole folder of tunnels.
+struct ConfirmDelete {
+    path: String,
+    name: String,
+    count: usize,
+    typed: String,
+}
+
+impl App {
+    /// The selectable items on the current screen, in display order.
+    fn selectable(&self) -> Vec<String> {
+        if self.managing_ssh {
+            self.ssh_configs.iter().map(|c| c.name.clone()).collect()
+        } else {
+            let mut disp = Vec::new();
+            flatten(
+                &build_tree(&self.rows),
+                "",
+                0,
+                &self.rows,
+                &self.expanded,
+                &mut disp,
+            );
+            disp.into_iter().map(|d| d.path).collect()
+        }
+    }
 }
 
 impl App {
@@ -222,6 +254,7 @@ fn boot(runtime: Arc<tokio::runtime::Runtime>) -> (App, Task<Message>) {
         managing_ssh: false,
         editing_ssh: None,
         selected: None,
+        confirm_delete: None,
     };
 
     // Show the window on launch so opening the app always surfaces it (the tray
@@ -320,17 +353,8 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             set_enabled(app, i, on);
             Task::none()
         }
-        Message::ToggleFolder(path) => {
-            let indices = descendant_indices(&app.rows, &path);
-            // The folder switch shows ON if *any* child is on, so clicking it
-            // when any are on should turn the whole folder OFF.
-            let any_on = indices.iter().any(|&i| app.rows[i].enabled());
-            for i in indices {
-                set_enabled(app, i, !any_on);
-            }
-            Task::none()
-        }
-        Message::ExpandCollapse(path) => {
+        Message::ClickFolder(path) => {
+            app.selected = Some(path.clone());
             if !app.expanded.remove(&path) {
                 app.expanded.insert(path);
             }
@@ -344,7 +368,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::StartEdit(i) => {
-            app.selected = Some(i);
+            app.selected = app.rows.get(i).map(|r| r.tunnel.path.clone());
             if let Some(row) = app.rows.get(i) {
                 let t = &row.tunnel;
                 app.editing = Some(EditForm {
@@ -412,7 +436,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::StartEditSsh(i) => {
-            app.selected = Some(i);
+            app.selected = app.ssh_configs.get(i).map(|c| c.name.clone());
             if let Some(c) = app.ssh_configs.get(i) {
                 app.editing_ssh = Some(SshForm {
                     target: Some(i),
@@ -456,41 +480,86 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::SelectDelta(delta) => {
-            let len = if app.managing_ssh {
-                app.ssh_configs.len()
-            } else {
-                app.rows.len()
-            };
-            if len > 0 {
-                let cur = app.selected.unwrap_or(0) as i32;
-                let next = (cur + delta).rem_euclid(len as i32) as usize;
-                app.selected = Some(next);
+            let items = app.selectable();
+            if !items.is_empty() {
+                let cur = app
+                    .selected
+                    .as_ref()
+                    .and_then(|s| items.iter().position(|it| it == s))
+                    .unwrap_or(0) as i32;
+                let next = (cur + delta).rem_euclid(items.len() as i32) as usize;
+                app.selected = Some(items[next].clone());
             }
             Task::none()
         }
         Message::DeleteSelected => {
-            if let Some(i) = app.selected.take() {
-                if app.managing_ssh {
+            let Some(sel) = app.selected.take() else {
+                return Task::none();
+            };
+            if app.managing_ssh {
+                if let Some(i) = app.ssh_configs.iter().position(|c| c.name == sel) {
                     return update(app, Message::DeleteSsh(i));
                 }
+            } else if let Some(i) = app.rows.iter().position(|r| r.tunnel.path == sel) {
+                // A leaf tunnel.
                 return update(app, Message::DeleteTunnel(i));
+            } else {
+                // A folder: confirm by typing its name before deleting the lot.
+                let count = descendant_indices(&app.rows, &sel).len();
+                if count > 0 {
+                    let name = sel.rsplit('/').next().unwrap_or(&sel).to_string();
+                    app.confirm_delete = Some(ConfirmDelete {
+                        path: sel,
+                        name,
+                        count,
+                        typed: String::new(),
+                    });
+                }
+            }
+            Task::none()
+        }
+        Message::ConfirmDeleteInput(value) => {
+            if let Some(c) = &mut app.confirm_delete {
+                c.typed = value;
+            }
+            Task::none()
+        }
+        Message::ConfirmDeleteCancel => {
+            app.confirm_delete = None;
+            Task::none()
+        }
+        Message::ConfirmDeleteDo => {
+            if let Some(c) = app.confirm_delete.take()
+                && c.typed.trim() == c.name
+            {
+                for i in descendant_indices(&app.rows, &c.path).into_iter().rev() {
+                    let mut row = app.rows.remove(i);
+                    if let Some(sup) = row.supervisor.take() {
+                        sup.cancel();
+                    }
+                }
+                info!(folder = %c.path, "delete folder");
+                app.expanded = all_folder_paths(&app.rows);
+                persist(&app.rows, &app.ssh_configs);
             }
             Task::none()
         }
         Message::Keyboard(event) => {
             use iced::keyboard::{Event, Key, key::Named};
             // Only navigate the list when not typing in a form.
-            if app.editing.is_none() && app.editing_ssh.is_none() {
-                if let Event::KeyPressed { key, .. } = event {
-                    return match key {
-                        Key::Named(Named::ArrowUp) => update(app, Message::SelectDelta(-1)),
-                        Key::Named(Named::ArrowDown) => update(app, Message::SelectDelta(1)),
-                        Key::Named(Named::Backspace | Named::Delete) => {
-                            update(app, Message::DeleteSelected)
-                        }
-                        _ => Task::none(),
-                    };
-                }
+            if app.editing.is_none()
+                && app.editing_ssh.is_none()
+                && app.confirm_delete.is_none()
+                && let Event::KeyPressed { key, .. } = event
+            {
+                return match key {
+                    Key::Named(Named::ArrowUp) => update(app, Message::SelectDelta(-1)),
+                    Key::Named(Named::ArrowDown) => update(app, Message::SelectDelta(1)),
+                    Key::Named(Named::Backspace | Named::Delete) => {
+                        update(app, Message::DeleteSelected)
+                    }
+                    _ => Task::none(),
+                };
             }
             Task::none()
         }
@@ -762,6 +831,9 @@ fn aggregate(states: impl Iterator<Item = TunnelState>) -> TunnelState {
 // ---- view ----
 
 fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
+    if let Some(c) = &app.confirm_delete {
+        return confirm_view(c);
+    }
     if let Some(form) = &app.editing_ssh {
         return ssh_edit_view(form);
     }
@@ -778,11 +850,14 @@ fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
             .style(pill_secondary)
             .padding([4, 10])
             .on_press(Message::OpenSshConfigs),
-        tip(
-            icon_button(ICON_MINUS, Message::DeleteSelected),
-            "Delete selected"
-        ),
-        tip(icon_button(ICON_PLUS, Message::StartAdd), "Add tunnel"),
+        row![
+            tip(icon_button(ICON_PLUS, Message::StartAdd), "Add tunnel"),
+            tip(
+                icon_button(ICON_MINUS, Message::DeleteSelected),
+                "Delete selected"
+            ),
+        ]
+        .spacing(2),
     ]
     .spacing(8)
     .align_y(iced::Alignment::Center);
@@ -824,16 +899,21 @@ fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
         ]
         .spacing(10)
         .align_y(iced::Alignment::Center);
+        let selected = app.selected.as_deref() == Some(d.path.as_str());
         return button(content)
-            .style(folder_button)
+            .style(if selected {
+                row_selected
+            } else {
+                folder_button
+            })
             .width(Length::Fill)
             .padding([5, 6])
-            .on_press(Message::ExpandCollapse(d.path.clone()))
+            .on_press(Message::ClickFolder(d.path.clone()))
             .into();
     };
 
     // Leaf: clicking the row opens edit; the toggler (sibling) connects/disconnects.
-    let selected = app.selected == Some(idx);
+    let selected = app.selected.as_deref() == Some(d.path.as_str());
     let label = row![
         indent,
         status_dot(d.status),
@@ -1143,14 +1223,17 @@ fn ssh_list_view(app: &App) -> Element<'_, Message> {
             "Back",
         ),
         text("SSH configs").size(20).width(Length::Fill),
-        tip(
-            icon_button(ICON_MINUS, Message::DeleteSelected),
-            "Delete selected"
-        ),
-        tip(
-            icon_button(ICON_PLUS, Message::StartAddSsh),
-            "Add SSH config"
-        ),
+        row![
+            tip(
+                icon_button(ICON_PLUS, Message::StartAddSsh),
+                "Add SSH config"
+            ),
+            tip(
+                icon_button(ICON_MINUS, Message::DeleteSelected),
+                "Delete selected"
+            ),
+        ]
+        .spacing(2),
     ]
     .spacing(8)
     .align_y(iced::Alignment::Center);
@@ -1169,7 +1252,7 @@ fn ssh_list_view(app: &App) -> Element<'_, Message> {
         ]
         .spacing(2)
         .width(Length::Fill);
-        let selected = app.selected == Some(i);
+        let selected = app.selected.as_deref() == Some(c.name.as_str());
         list = list.push(
             button(content)
                 .style(if selected { row_selected } else { row_plain })
@@ -1259,6 +1342,43 @@ fn ssh_edit_view(form: &SshForm) -> Element<'_, Message> {
     }
     col = col.push(buttons);
 
+    container(col).padding(16).into()
+}
+
+fn confirm_view(c: &ConfirmDelete) -> Element<'_, Message> {
+    let matches = c.typed.trim() == c.name;
+    let mut col = column![
+        text("Delete folder").size(18),
+        text(format!(
+            "This permanently deletes “{}” and its {} tunnel(s).",
+            c.path, c.count
+        ))
+        .size(13),
+        text(format!("Type “{}” to confirm:", c.name)).size(13),
+        text_input(&c.name, &c.typed)
+            .size(13)
+            .padding([6, 9])
+            .style(rounded_input)
+            .on_input(Message::ConfirmDeleteInput),
+    ]
+    .spacing(10);
+
+    let mut delete = button(text("Delete").size(13))
+        .style(pill_danger)
+        .padding([5, 16]);
+    if matches {
+        delete = delete.on_press(Message::ConfirmDeleteDo);
+    }
+    col = col.push(
+        row![
+            delete,
+            button(text("Cancel").size(13))
+                .style(pill_secondary)
+                .padding([5, 16])
+                .on_press(Message::ConfirmDeleteCancel),
+        ]
+        .spacing(10),
+    );
     container(col).padding(16).into()
 }
 
