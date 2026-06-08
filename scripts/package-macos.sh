@@ -21,6 +21,12 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp target/release/sshoal "$APP/Contents/MacOS/sshoal"
 
+echo "==> rendering icon"
+ICONSET="target/sshoal.iconset"
+rm -rf "$ICONSET"
+cargo run --release --example gen_icon -p sshoal -- "$ICONSET" >/dev/null
+iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/icon.icns"
+
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -34,6 +40,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <string>dev.japananh.sshoal</string>
     <key>CFBundleExecutable</key>
     <string>sshoal</string>
+    <key>CFBundleIconFile</key>
+    <string>icon</string>
     <key>CFBundleVersion</key>
     <string>${VERSION}</string>
     <key>CFBundleShortVersionString</key>

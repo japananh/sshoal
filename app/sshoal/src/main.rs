@@ -921,13 +921,32 @@ fn build_tray() -> (TrayIcon, MenuIds) {
     (tray, menu)
 }
 
+/// Render the bundled SVG logo to an RGBA tray icon.
 fn make_icon() -> Icon {
-    let (w, h) = (32u32, 32u32);
-    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
-    for _ in 0..(w * h) {
-        rgba.extend_from_slice(&[0x2e, 0xc4, 0xb6, 0xff]);
+    const SVG: &str = include_str!("../assets/icon.svg");
+    let size: u32 = 64;
+
+    let tree =
+        resvg::usvg::Tree::from_str(SVG, &resvg::usvg::Options::default()).expect("parse icon svg");
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(size, size).expect("alloc pixmap");
+    let scale = size as f32 / 512.0;
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::from_scale(scale, scale),
+        &mut pixmap.as_mut(),
+    );
+
+    // tiny-skia stores premultiplied alpha; tray-icon wants straight RGBA.
+    let mut rgba = pixmap.take();
+    for px in rgba.chunks_exact_mut(4) {
+        let a = px[3] as u32;
+        if a > 0 && a < 255 {
+            px[0] = (px[0] as u32 * 255 / a) as u8;
+            px[1] = (px[1] as u32 * 255 / a) as u8;
+            px[2] = (px[2] as u32 * 255 / a) as u8;
+        }
     }
-    Icon::from_rgba(rgba, w, h).expect("valid rgba icon")
+    Icon::from_rgba(rgba, size, size).expect("valid rgba icon")
 }
 
 fn main() -> iced::Result {
