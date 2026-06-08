@@ -1,14 +1,16 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
   <defs>
-    <linearGradient id="g" x1="44" y1="44" x2="468" y2="468" gradientUnits="userSpaceOnUse">
+    <linearGradient id="g" x1="28" y1="28" x2="484" y2="484" gradientUnits="userSpaceOnUse">
       <stop offset="0" stop-color="#E60A3D"/>
       <stop offset="0.5" stop-color="#B5179E"/>
       <stop offset="1" stop-color="#5A2EE5"/>
     </linearGradient>
   </defs>
-  <g stroke="url(#g)" stroke-width="34" stroke-linecap="round" stroke-linejoin="round">
-    <rect x="44" y="44" width="424" height="424" rx="104"/>
-    <polyline points="150,176 236,256 150,336"/>
-    <line x1="276" y1="336" x2="392" y2="336"/>
+  <!-- Light tile so the logo stands out on a dark menu bar. -->
+  <rect x="28" y="28" width="456" height="456" rx="112" fill="#FFFFFF"/>
+  <g fill="none" stroke="url(#g)" stroke-width="36" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="28" y="28" width="456" height="456" rx="112"/>
+    <polyline points="138,168 234,256 138,344"/>
+    <line x1="276" y1="344" x2="404" y2="344"/>
   </g>
 </svg>
