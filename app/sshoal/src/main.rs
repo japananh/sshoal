@@ -502,7 +502,8 @@ fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
     let header = row![
         text("sshoal").size(22).width(Length::Fill),
         button(text("+ Add").size(13))
-            .padding([4, 10])
+            .style(pill_button)
+            .padding([5, 14])
             .on_press(Message::StartAdd),
     ]
     .align_y(iced::Alignment::Center);
@@ -531,12 +532,12 @@ fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
     let is_folder = d.row_idx.is_none();
 
     let lead: Element<Message> = if is_folder {
-        let arrow = if app.expanded.contains(&d.path) {
-            "▾"
+        let icon = if app.expanded.contains(&d.path) {
+            "📂"
         } else {
-            "▸"
+            "📁"
         };
-        button(text(arrow).size(13))
+        button(text(icon).size(15))
             .style(button::text)
             .padding(2)
             .on_press(Message::ExpandCollapse(d.path.clone()))
@@ -593,11 +594,27 @@ fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
     }
 }
 
-fn folder_band(theme: &iced::Theme) -> iced::widget::container::Style {
-    let palette = theme.extended_palette();
+/// Soft, light, rounded band behind folder rows (macOS-list feel).
+fn folder_band(_theme: &iced::Theme) -> iced::widget::container::Style {
     iced::widget::container::Style {
-        background: Some(iced::Background::Color(palette.background.weak.color)),
+        background: Some(iced::Background::Color(Color::from_rgb(0.945, 0.945, 0.96))),
+        border: iced::Border {
+            radius: 8.0.into(),
+            ..Default::default()
+        },
         ..iced::widget::container::Style::default()
+    }
+}
+
+/// Rounded "pill" button for the Add action.
+fn pill_button(theme: &iced::Theme, status: button::Status) -> iced::widget::button::Style {
+    let base = button::primary(theme, status);
+    iced::widget::button::Style {
+        border: iced::Border {
+            radius: 14.0.into(),
+            ..base.border
+        },
+        ..base
     }
 }
 
@@ -740,7 +757,7 @@ fn main() -> iced::Result {
     let boot_runtime = runtime.clone();
     iced::daemon(move || boot(boot_runtime.clone()), update, view)
         .subscription(subscription)
-        .theme(|_app: &App, _id| Theme::CatppuccinLatte)
+        .theme(|_app: &App, _id| Theme::Light)
         .title(|_app: &App, _id| String::from("sshoal"))
         .run()
 }
