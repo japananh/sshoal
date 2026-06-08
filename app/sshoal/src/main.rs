@@ -509,9 +509,9 @@ fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
 
     let header = row![
         text("sshoal").size(22).width(Length::Fill),
-        button(text("+ Add").size(13))
+        button(text("+").size(17))
             .style(pill_button)
-            .padding([5, 14])
+            .padding([1, 11])
             .on_press(Message::StartAdd),
     ]
     .align_y(iced::Alignment::Center);
@@ -580,9 +580,9 @@ fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
         line = line.push(status_dot(d.status));
     } else if let Some(idx) = d.row_idx {
         line = line.push(
-            button(text("Edit").size(11))
+            button(text("✎").size(14))
                 .style(pill_secondary)
-                .padding([2, 10])
+                .padding([2, 9])
                 .on_press(Message::StartEdit(idx)),
         );
     }
