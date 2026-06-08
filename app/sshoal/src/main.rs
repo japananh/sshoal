@@ -554,16 +554,10 @@ fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
         status_dot(d.status)
     };
 
-    // Name: folders just show text; leaves are a text-styled button → edit.
     let name: Element<Message> = if is_folder {
         text(d.name.clone()).size(14).width(Length::Fill).into()
     } else {
-        button(text(d.name.clone()).size(13))
-            .style(button::text)
-            .padding(0)
-            .width(Length::Fill)
-            .on_press(Message::StartEdit(d.row_idx.unwrap()))
-            .into()
+        text(d.name.clone()).size(13).width(Length::Fill).into()
     };
 
     // On/off switch: cleaner than a text button, and doesn't read as up/down.
@@ -584,6 +578,13 @@ fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
     let mut line = row![indent, lead, name].spacing(10);
     if is_folder {
         line = line.push(status_dot(d.status));
+    } else if let Some(idx) = d.row_idx {
+        line = line.push(
+            button(text("Edit").size(11))
+                .style(pill_secondary)
+                .padding([2, 10])
+                .on_press(Message::StartEdit(idx)),
+        );
     }
     line = line.push(switch);
     // Keep controls clear of the scrollbar on the right.
@@ -614,9 +615,21 @@ fn folder_band(_theme: &iced::Theme) -> iced::widget::container::Style {
     }
 }
 
-/// Rounded "pill" button for the Add action.
+/// Rounded "pill" buttons — one per visual role, all sharing the Add button's
+/// rounded shape so the UI is consistent.
 fn pill_button(theme: &iced::Theme, status: button::Status) -> iced::widget::button::Style {
-    let base = button::primary(theme, status);
+    pill(button::primary(theme, status))
+}
+
+fn pill_secondary(theme: &iced::Theme, status: button::Status) -> iced::widget::button::Style {
+    pill(button::secondary(theme, status))
+}
+
+fn pill_danger(theme: &iced::Theme, status: button::Status) -> iced::widget::button::Style {
+    pill(button::danger(theme, status))
+}
+
+fn pill(base: iced::widget::button::Style) -> iced::widget::button::Style {
     iced::widget::button::Style {
         border: iced::Border {
             radius: 14.0.into(),
@@ -671,11 +684,12 @@ fn edit_view(form: &EditForm) -> Element<'_, Message> {
 
     let mut buttons = row![
         button(text("Save").size(13))
-            .style(button::primary)
-            .padding([4, 14])
+            .style(pill_button)
+            .padding([5, 16])
             .on_press(Message::SaveEdit),
         button(text("Cancel").size(13))
-            .padding([4, 14])
+            .style(pill_secondary)
+            .padding([5, 16])
             .on_press(Message::CancelEdit),
     ]
     .spacing(10);
@@ -683,8 +697,8 @@ fn edit_view(form: &EditForm) -> Element<'_, Message> {
         buttons = buttons.push(space().width(Length::Fill));
         buttons = buttons.push(
             button(text("Delete").size(13))
-                .style(button::danger)
-                .padding([4, 14])
+                .style(pill_danger)
+                .padding([5, 16])
                 .on_press(Message::DeleteTunnel(idx)),
         );
     }
