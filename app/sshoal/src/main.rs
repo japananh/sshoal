@@ -106,8 +106,10 @@ struct EditForm {
 }
 
 struct App {
-    _tray: TrayIcon,
-    menu: MenuIds,
+    /// Created lazily on the first tick — on macOS the tray must be created
+    /// after the app's event loop is running, not during `boot`.
+    tray: Option<TrayIcon>,
+    menu: Option<MenuIds>,
     window: Option<window::Id>,
     runtime: Arc<tokio::runtime::Runtime>,
     transport: Arc<dyn Transport>,
@@ -142,26 +144,9 @@ fn boot(runtime: Arc<tokio::runtime::Runtime>) -> (App, Task<Message>) {
         .collect();
     let expanded = all_folder_paths(&rows);
 
-    let connect_all = MenuItem::new("Connect all", true, None);
-    let open = MenuItem::new("Open sshoal", true, None);
-    let quit = MenuItem::new("Quit", true, None);
-    let menu = MenuIds {
-        connect_all: connect_all.id().clone(),
-        open: open.id().clone(),
-        quit: quit.id().clone(),
-    };
-    let tray_menu = Menu::with_items(&[&connect_all, &open, &quit]).expect("build tray menu");
-    let tray = TrayIconBuilder::new()
-        .with_menu(Box::new(tray_menu))
-        .with_menu_on_left_click(true)
-        .with_icon(make_icon())
-        .with_tooltip("sshoal")
-        .build()
-        .expect("build tray icon");
-
     let mut app = App {
-        _tray: tray,
-        menu,
+        tray: None,
+        menu: None,
         window: None,
         runtime,
         transport: Arc::new(OpenSshTransport),
@@ -170,16 +155,13 @@ fn boot(runtime: Arc<tokio::runtime::Runtime>) -> (App, Task<Message>) {
         editing: None,
     };
 
-    // Show the window on launch so opening the app always surfaces it — the
-    // tray icon can be hard to spot, and closing the window keeps us in the tray.
-    let settings = window::Settings {
-        size: Size::new(420.0, 620.0),
-        min_size: Some(Size::new(340.0, 380.0)),
-        ..window::Settings::default()
-    };
-    let (id, task) = window::open(settings);
+    // Show the window on launch so opening the app always surfaces it (the tray
+    // icon can be hard to spot); `gain_focus` brings it to the front since we
+    // run as a menu-bar accessory with no Dock icon.
+    let (id, open_task) = window::open(open_window_settings());
     app.window = Some(id);
-    (app, task.map(Message::WindowOpened))
+    let task = Task::batch([open_task.map(Message::WindowOpened), window::gain_focus(id)]);
+    (app, task)
 }
 
 fn update(app: &mut App, message: Message) -> Task<Message> {
@@ -207,23 +189,38 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 }
             }
 
+            // Create the tray icon once the event loop is running — on macOS it
+            // must not be created during `boot`, or it never appears.
+            if app.tray.is_none() {
+                let (tray, menu) = build_tray();
+                app.tray = Some(tray);
+                app.menu = Some(menu);
+            }
+
+            let ids = app
+                .menu
+                .as_ref()
+                .map(|m| (m.open.clone(), m.quit.clone(), m.connect_all.clone()));
             let rx = MenuEvent::receiver();
             while let Ok(event) = rx.try_recv() {
-                if event.id == app.menu.open {
+                let Some((open, quit, connect_all)) = ids.as_ref() else {
+                    break;
+                };
+                if event.id == *open {
                     if app.window.is_none() {
-                        let settings = window::Settings {
-                            size: Size::new(420.0, 620.0),
-                            min_size: Some(Size::new(340.0, 380.0)),
-                            ..window::Settings::default()
-                        };
-                        let (id, task) = window::open(settings);
+                        let (id, task) = window::open(open_window_settings());
                         app.window = Some(id);
-                        return task.map(Message::WindowOpened);
+                        return Task::batch([
+                            task.map(Message::WindowOpened),
+                            window::gain_focus(id),
+                        ]);
+                    } else if let Some(id) = app.window {
+                        return window::gain_focus(id);
                     }
-                } else if event.id == app.menu.quit {
+                } else if event.id == *quit {
                     info!("quitting");
                     return iced::exit();
-                } else if event.id == app.menu.connect_all {
+                } else if event.id == *connect_all {
                     for i in 0..app.rows.len() {
                         set_enabled(app, i, true);
                     }
@@ -894,6 +891,34 @@ fn kill_stale_tunnels() {
     let _ = std::process::Command::new("pkill")
         .args(["-f", signature])
         .status();
+}
+
+fn open_window_settings() -> window::Settings {
+    window::Settings {
+        size: Size::new(420.0, 620.0),
+        min_size: Some(Size::new(340.0, 380.0)),
+        ..window::Settings::default()
+    }
+}
+
+fn build_tray() -> (TrayIcon, MenuIds) {
+    let connect_all = MenuItem::new("Connect all", true, None);
+    let open = MenuItem::new("Open sshoal", true, None);
+    let quit = MenuItem::new("Quit", true, None);
+    let menu = MenuIds {
+        connect_all: connect_all.id().clone(),
+        open: open.id().clone(),
+        quit: quit.id().clone(),
+    };
+    let tray_menu = Menu::with_items(&[&connect_all, &open, &quit]).expect("build tray menu");
+    let tray = TrayIconBuilder::new()
+        .with_menu(Box::new(tray_menu))
+        .with_menu_on_left_click(true)
+        .with_icon(make_icon())
+        .with_tooltip("sshoal")
+        .build()
+        .expect("build tray icon");
+    (tray, menu)
 }
 
 fn make_icon() -> Icon {
