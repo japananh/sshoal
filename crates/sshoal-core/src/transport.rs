@@ -49,6 +49,8 @@ pub fn build_ssh_args(server: &ServerConfig, tunnel: &TunnelSpec) -> Vec<String>
         "ServerAliveCountMax=3".to_string(),
         "-o".to_string(),
         "ExitOnForwardFailure=yes".to_string(),
+        "-o".to_string(),
+        "ConnectTimeout=10".to_string(),
         "-L".to_string(),
         format!(
             "{}:{}:{}",
