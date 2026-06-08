@@ -115,6 +115,10 @@ struct App {
 }
 
 fn boot(runtime: Arc<tokio::runtime::Runtime>) -> (App, Task<Message>) {
+    // Tunnels shouldn't outlive the app — clean up any orphaned ssh from a
+    // previous run that was force-killed (so their local ports are free again).
+    kill_stale_tunnels();
+
     let path = config_path();
     ensure_example(&path);
     let config = AppConfig::load(&path).unwrap_or_else(|err| {
@@ -208,9 +212,11 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::ToggleFolder(path) => {
             app.notice = None;
             let indices = descendant_indices(&app.rows, &path);
-            let all_on = indices.iter().all(|&i| app.rows[i].enabled());
+            // The folder switch shows ON if *any* child is on, so clicking it
+            // when any are on should turn the whole folder OFF.
+            let any_on = indices.iter().any(|&i| app.rows[i].enabled());
             for i in indices {
-                set_enabled(app, i, !all_on);
+                set_enabled(app, i, !any_on);
             }
             Task::none()
         }
@@ -872,6 +878,16 @@ tunnels:
     remote_host: db.internal
     remote_port: 5432
 ";
+
+/// Kill orphaned sshoal tunnels from a previous run. Matches our exact ssh
+/// option signature so it never touches the user's own ssh sessions (e.g. a
+/// plain `ssh -L` or an opentunnels.sh tunnel).
+fn kill_stale_tunnels() {
+    let signature = "ServerAliveInterval=15 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes -o ConnectTimeout=10";
+    let _ = std::process::Command::new("pkill")
+        .args(["-f", signature])
+        .status();
+}
 
 fn make_icon() -> Icon {
     let (w, h) = (32u32, 32u32);
