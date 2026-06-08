@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 
-use crate::config::Tunnel;
+use crate::config::{SshConfig, Tunnel};
 
 /// The connection details resolved for an `~/.ssh/config` Host alias. Kept for
 /// callers that want to display/verify alias targets; import stores the alias
@@ -24,6 +24,7 @@ pub struct SshHost {
     pub host: String,
     pub user: Option<String>,
     pub port: u16,
+    pub identity_file: Option<String>,
 }
 
 /// Parse `~/.ssh/config` into a map of concrete alias -> connection details.
@@ -34,11 +35,13 @@ pub fn parse_ssh_config(text: &str) -> HashMap<String, SshHost> {
     let mut host: Option<String> = None;
     let mut user: Option<String> = None;
     let mut port: u16 = 22;
+    let mut identity: Option<String> = None;
 
     let mut flush = |patterns: &mut Vec<String>,
                      host: &mut Option<String>,
                      user: &mut Option<String>,
-                     port: &mut u16| {
+                     port: &mut u16,
+                     identity: &mut Option<String>| {
         for pattern in patterns.drain(..) {
             map.insert(
                 pattern.clone(),
@@ -46,12 +49,14 @@ pub fn parse_ssh_config(text: &str) -> HashMap<String, SshHost> {
                     host: host.clone().unwrap_or(pattern),
                     user: user.clone(),
                     port: *port,
+                    identity_file: identity.clone(),
                 },
             );
         }
         *host = None;
         *user = None;
         *port = 22;
+        *identity = None;
     };
 
     for raw in text.lines() {
@@ -62,7 +67,13 @@ pub fn parse_ssh_config(text: &str) -> HashMap<String, SshHost> {
         let (key, value) = split_kv(line);
         match key.to_ascii_lowercase().as_str() {
             "host" => {
-                flush(&mut patterns, &mut host, &mut user, &mut port);
+                flush(
+                    &mut patterns,
+                    &mut host,
+                    &mut user,
+                    &mut port,
+                    &mut identity,
+                );
                 patterns = value
                     .split_whitespace()
                     .filter(|p| !is_glob(p))
@@ -71,6 +82,7 @@ pub fn parse_ssh_config(text: &str) -> HashMap<String, SshHost> {
             }
             "hostname" => host = Some(value.to_string()),
             "user" => user = Some(value.to_string()),
+            "identityfile" => identity = Some(value.to_string()),
             "port" => {
                 if let Ok(p) = value.trim().parse() {
                     port = p;
@@ -79,8 +91,38 @@ pub fn parse_ssh_config(text: &str) -> HashMap<String, SshHost> {
             _ => {}
         }
     }
-    flush(&mut patterns, &mut host, &mut user, &mut port);
+    flush(
+        &mut patterns,
+        &mut host,
+        &mut user,
+        &mut port,
+        &mut identity,
+    );
     map
+}
+
+/// Build [`SshConfig`]s for the ssh aliases referenced by `tunnels`, resolving
+/// each against `hosts` (from `~/.ssh/config`) when possible.
+pub fn ssh_configs_for(tunnels: &[Tunnel], hosts: &HashMap<String, SshHost>) -> Vec<SshConfig> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut configs = Vec::new();
+    for tunnel in tunnels {
+        if !seen.insert(tunnel.ssh.clone()) {
+            continue;
+        }
+        let config = match hosts.get(&tunnel.ssh) {
+            Some(h) => SshConfig {
+                name: tunnel.ssh.clone(),
+                host: h.host.clone(),
+                port: h.port,
+                user: h.user.clone(),
+                identity_file: h.identity_file.clone(),
+            },
+            None => SshConfig::alias(&tunnel.ssh),
+        };
+        configs.push(config);
+    }
+    configs
 }
 
 /// Parse one `opentunnels.sh`-style file into tunnels. `file_stem` (e.g.
@@ -115,7 +157,6 @@ pub fn parse_tunnel_file(file_stem: &str, text: &str, prefix: Option<&str>) -> V
         tunnels.push(Tunnel {
             path,
             ssh: alias.to_string(),
-            ssh_port: None,
             local_port,
             remote_host,
             remote_port,

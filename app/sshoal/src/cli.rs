@@ -6,9 +6,15 @@
 use std::io::Write;
 use std::path::Path;
 
-use sshoal_core::{AppConfig, ImportError, export, import, parse_tunnel_file};
+use sshoal_core::{
+    AppConfig, ImportError, export, import, parse_ssh_config, parse_tunnel_file, ssh_configs_for,
+};
 
 use crate::config_path;
+
+fn home() -> String {
+    std::env::var("HOME").unwrap_or_else(|_| ".".to_string())
+}
 
 /// If invoked as a CLI subcommand, run it and exit the process. Otherwise return.
 pub fn maybe_run() {
@@ -77,9 +83,23 @@ fn run_import_ssh(args: &[String]) -> i32 {
             .extend(parse_tunnel_file(&stem, &text, prefix.as_deref()));
     }
 
+    // Build ssh configs for the referenced aliases, resolving host/user/port/key
+    // from ~/.ssh/config so the imported config is self-contained.
+    let ssh_config_path =
+        std::env::var("SSHOAL_SSH_CONFIG").unwrap_or_else(|_| format!("{}/.ssh/config", home()));
+    let hosts = std::fs::read_to_string(&ssh_config_path)
+        .map(|t| parse_ssh_config(&t))
+        .unwrap_or_default();
+    imported.ssh_configs = ssh_configs_for(&imported.tunnels, &hosts);
+
+    for c in &imported.ssh_configs {
+        let user = c.user.as_deref().unwrap_or("-");
+        let key = c.identity_file.as_deref().unwrap_or("(default key)");
+        eprintln!("  [ssh] {} → {user}@{}:{}  {key}", c.name, c.host, c.port);
+    }
     for t in &imported.tunnels {
         eprintln!(
-            "  {}  (ssh {} → {}:{})",
+            "  {}  (via {} → {}:{})",
             t.path, t.ssh, t.remote_host, t.remote_port
         );
     }

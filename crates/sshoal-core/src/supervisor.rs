@@ -21,7 +21,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::config::Tunnel;
+use crate::config::{SshConfig, Tunnel};
 use crate::transport::Transport;
 
 /// What a single tunnel is doing right now.
@@ -98,12 +98,17 @@ pub struct TunnelSupervisor {
 impl TunnelSupervisor {
     /// Start supervising `tunnel` on `server`. Must be called from within a
     /// Tokio runtime.
-    pub fn spawn(transport: Arc<dyn Transport>, tunnel: Tunnel, backoff: Backoff) -> Self {
+    pub fn spawn(
+        transport: Arc<dyn Transport>,
+        tunnel: Tunnel,
+        ssh: SshConfig,
+        backoff: Backoff,
+    ) -> Self {
         let (state_tx, state_rx) = watch::channel(TunnelState::Idle);
         let (error_tx, error_rx) = watch::channel(None);
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let task = tokio::spawn(run(
-            transport, tunnel, backoff, state_tx, error_tx, cancel_rx,
+            transport, tunnel, ssh, backoff, state_tx, error_tx, cancel_rx,
         ));
         Self {
             state_rx,
@@ -145,6 +150,7 @@ impl TunnelSupervisor {
 async fn run(
     transport: Arc<dyn Transport>,
     tunnel: Tunnel,
+    ssh: SshConfig,
     backoff: Backoff,
     state_tx: watch::Sender<TunnelState>,
     error_tx: watch::Sender<Option<String>>,
@@ -171,7 +177,7 @@ async fn run(
             _ = cancel_rx.changed() => {
                 if *cancel_rx.borrow() { break; } else { continue; }
             }
-            result = transport.connect(&tunnel) => result,
+            result = transport.connect(&tunnel, &ssh) => result,
         };
 
         match connected {
@@ -308,7 +314,11 @@ mod tests {
 
     #[async_trait]
     impl Transport for FakeTransport {
-        async fn connect(&self, _tunnel: &Tunnel) -> anyhow::Result<Box<dyn TunnelHandle>> {
+        async fn connect(
+            &self,
+            _tunnel: &Tunnel,
+            _ssh: &SshConfig,
+        ) -> anyhow::Result<Box<dyn TunnelHandle>> {
             let n = self.connect_calls.fetch_add(1, Ordering::SeqCst);
             if n < self.fail_first {
                 anyhow::bail!("simulated connect failure #{n}");
@@ -324,11 +334,14 @@ mod tests {
         Tunnel {
             path: "test/tunnel".into(),
             ssh: "host".into(),
-            ssh_port: None,
             local_port: 1,
             remote_host: "127.0.0.1".into(),
             remote_port: 2,
         }
+    }
+
+    fn ssh() -> SshConfig {
+        SshConfig::alias("host")
     }
 
     async fn wait_state(rx: &mut watch::Receiver<TunnelState>, want: TunnelState) {
@@ -357,6 +370,7 @@ mod tests {
         let sup = TunnelSupervisor::spawn(
             transport.clone(),
             tunnel(),
+            ssh(),
             Backoff::new(Duration::from_millis(10), Duration::from_millis(100))
                 .with_stable_after(Duration::from_millis(20)),
         );
@@ -381,6 +395,7 @@ mod tests {
         let sup = TunnelSupervisor::spawn(
             transport.clone(),
             tunnel(),
+            ssh(),
             Backoff::new(Duration::from_millis(10), Duration::from_millis(1000))
                 .with_stable_after(Duration::from_secs(1)),
         );
@@ -408,6 +423,7 @@ mod tests {
         let sup = TunnelSupervisor::spawn(
             transport.clone(),
             tunnel(),
+            ssh(),
             Backoff::new(Duration::from_millis(10), Duration::from_millis(100)),
         );
         let mut states = sup.subscribe();

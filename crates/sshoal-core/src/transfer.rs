@@ -88,10 +88,10 @@ mod tests {
 
     fn sample() -> AppConfig {
         AppConfig {
+            ssh_configs: vec![],
             tunnels: vec![Tunnel {
                 path: "gc/prod/db/app-api".into(),
                 ssh: "gemx-pro".into(),
-                ssh_port: None,
                 local_port: 5432,
                 remote_host: "127.0.0.1".into(),
                 remote_port: 5432,

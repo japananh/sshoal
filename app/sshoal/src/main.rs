@@ -33,7 +33,8 @@ const ICON_FOLDER_OPEN: &str = "\u{e247}";
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use sshoal_core::{
-    AppConfig, Backoff, OpenSshTransport, Transport, Tunnel, TunnelState, TunnelSupervisor,
+    AppConfig, Backoff, OpenSshTransport, SshConfig, Transport, Tunnel, TunnelState,
+    TunnelSupervisor,
 };
 use tracing::info;
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
@@ -43,7 +44,6 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 enum Field {
     Path,
     Ssh,
-    SshPort,
     LocalPort,
     RemoteHost,
     RemotePort,
@@ -100,7 +100,6 @@ struct EditForm {
     target: Option<usize>, // Some(idx) = editing existing, None = adding new
     path: String,
     ssh: String,
-    ssh_port: String,
     local_port: String,
     remote_host: String,
     remote_port: String,
@@ -118,9 +117,21 @@ struct App {
     window: Option<window::Id>,
     runtime: Arc<tokio::runtime::Runtime>,
     transport: Arc<dyn Transport>,
+    ssh_configs: Vec<SshConfig>,
     rows: Vec<TunnelRow>,
     expanded: HashSet<String>,
     editing: Option<EditForm>,
+}
+
+impl App {
+    /// Resolve the ssh config a tunnel uses (falling back to a bare alias).
+    fn resolve_ssh(&self, tunnel: &Tunnel) -> SshConfig {
+        self.ssh_configs
+            .iter()
+            .find(|c| c.name == tunnel.ssh)
+            .cloned()
+            .unwrap_or_else(|| SshConfig::alias(&tunnel.ssh))
+    }
 }
 
 fn boot(runtime: Arc<tokio::runtime::Runtime>) -> (App, Task<Message>) {
@@ -136,6 +147,7 @@ fn boot(runtime: Arc<tokio::runtime::Runtime>) -> (App, Task<Message>) {
     });
     info!(path = %path.display(), tunnels = config.tunnels.len(), "config loaded");
 
+    let ssh_configs = config.ssh_configs;
     let rows: Vec<TunnelRow> = config
         .tunnels
         .into_iter()
@@ -156,6 +168,7 @@ fn boot(runtime: Arc<tokio::runtime::Runtime>) -> (App, Task<Message>) {
         window: None,
         runtime,
         transport: Arc::new(OpenSshTransport),
+        ssh_configs,
         rows,
         expanded,
         editing: None,
@@ -287,7 +300,6 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                     target: Some(i),
                     path: t.path.clone(),
                     ssh: t.ssh.clone(),
-                    ssh_port: t.ssh_port.map(|p| p.to_string()).unwrap_or_default(),
                     local_port: t.local_port.to_string(),
                     remote_host: t.remote_host.clone(),
                     remote_port: t.remote_port.to_string(),
@@ -301,7 +313,6 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 match field {
                     Field::Path => form.path = value,
                     Field::Ssh => form.ssh = value,
-                    Field::SshPort => form.ssh_port = value,
                     Field::LocalPort => form.local_port = value,
                     Field::RemoteHost => form.remote_host = value,
                     Field::RemotePort => form.remote_port = value,
@@ -326,7 +337,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 }
                 info!(tunnel = %row.tunnel.path, "delete");
                 app.expanded = all_folder_paths(&app.rows);
-                persist(&app.rows);
+                persist(&app.rows, &app.ssh_configs);
             }
             Task::none()
         }
@@ -363,8 +374,6 @@ fn save_edit(app: &mut App) {
         Some("Local port must be 1–65535")
     } else if parse_port(&form.remote_port).is_none() {
         Some("Remote port must be 1–65535")
-    } else if !form.ssh_port.trim().is_empty() && parse_port(&form.ssh_port).is_none() {
-        Some("SSH port must be 1–65535")
     } else {
         None
     };
@@ -379,7 +388,6 @@ fn save_edit(app: &mut App) {
     let tunnel = Tunnel {
         path,
         ssh,
-        ssh_port: parse_port(&form.ssh_port),
         local_port: parse_port(&form.local_port).unwrap(),
         remote_host,
         remote_port: parse_port(&form.remote_port).unwrap(),
@@ -405,12 +413,13 @@ fn save_edit(app: &mut App) {
 
     app.editing = None;
     app.expanded = all_folder_paths(&app.rows);
-    persist(&app.rows);
+    persist(&app.rows, &app.ssh_configs);
 }
 
-/// Write the current tunnels back to the config file.
-fn persist(rows: &[TunnelRow]) {
+/// Write the current ssh configs + tunnels back to the config file.
+fn persist(rows: &[TunnelRow], ssh_configs: &[SshConfig]) {
     let config = AppConfig {
+        ssh_configs: ssh_configs.to_vec(),
         tunnels: rows.iter().map(|r| r.tunnel.clone()).collect(),
     };
     if let Err(e) = config.save(config_path()) {
@@ -439,13 +448,17 @@ fn set_enabled(app: &mut App, i: usize, on: bool) {
         }
     }
 
+    let ssh = match app.rows.get(i) {
+        Some(r) => app.resolve_ssh(&r.tunnel),
+        None => return,
+    };
     let Some(row) = app.rows.get_mut(i) else {
         return;
     };
 
     if on && row.supervisor.is_none() {
         let _guard = runtime.enter();
-        let sup = TunnelSupervisor::spawn(transport, row.tunnel.clone(), Backoff::default());
+        let sup = TunnelSupervisor::spawn(transport, row.tunnel.clone(), ssh, Backoff::default());
         row.supervisor = Some(sup);
         row.status = TunnelState::Connecting;
         info!(tunnel = %row.tunnel.path, "connect");
@@ -809,8 +822,12 @@ fn edit_view(form: &EditForm) -> Element<'_, Message> {
     let mut col = column![
         text(title).size(18),
         field("Path", &form.path, Field::Path, "gc/dev/db/app-api"),
-        field("SSH", &form.ssh, Field::Ssh, "gemx-dev or user@host"),
-        field("SSH port", &form.ssh_port, Field::SshPort, "(optional)"),
+        field(
+            "SSH config",
+            &form.ssh,
+            Field::Ssh,
+            "gemx-dev (ssh config name / alias)"
+        ),
         field("Local port", &form.local_port, Field::LocalPort, "54321"),
         field(
             "Remote host",

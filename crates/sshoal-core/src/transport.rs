@@ -1,12 +1,11 @@
 //! The SSH transport abstraction.
 //!
 //! Everything above this layer (the supervisor, the UI) only ever talks to a
-//! [`Transport`]: "open this tunnel, tell me when it drops, tear it down". The
-//! v1 implementation, [`OpenSshTransport`], shells out to the system `ssh` so we
-//! inherit `~/.ssh/config`, ProxyJump, agent and known_hosts for free. A future
-//! pure-Rust (`russh`) implementation — needed on mobile, where spawning `ssh`
-//! is impossible — can slot in behind the same trait without the supervisor
-//! noticing.
+//! [`Transport`]: "open this tunnel through this ssh config, tell me when it
+//! drops, tear it down". The v1 implementation, [`OpenSshTransport`], shells out
+//! to the system `ssh`. A future pure-Rust (`russh`) implementation — needed on
+//! mobile, where spawning `ssh` is impossible — can slot in behind the same
+//! trait without the supervisor noticing.
 
 use std::time::Duration;
 
@@ -15,7 +14,7 @@ use tokio::net::TcpStream;
 use tokio::process::Child;
 use tokio::time::Instant;
 
-use crate::config::Tunnel;
+use crate::config::{SshConfig, Tunnel};
 
 /// How long to wait for the local forward to start accepting connections before
 /// giving up on a connect attempt.
@@ -24,9 +23,13 @@ const FORWARD_READY_TIMEOUT: Duration = Duration::from_secs(15);
 /// Opens tunnels. One `Transport` can open many tunnels.
 #[async_trait]
 pub trait Transport: Send + Sync {
-    /// Establish a single tunnel. Resolves once the tunnel is up, yielding a
-    /// handle that reports when it later drops.
-    async fn connect(&self, tunnel: &Tunnel) -> anyhow::Result<Box<dyn TunnelHandle>>;
+    /// Establish a single tunnel through `ssh`. Resolves once the tunnel is up,
+    /// yielding a handle that reports when it later drops.
+    async fn connect(
+        &self,
+        tunnel: &Tunnel,
+        ssh: &SshConfig,
+    ) -> anyhow::Result<Box<dyn TunnelHandle>>;
 }
 
 /// A live tunnel.
@@ -34,20 +37,17 @@ pub trait Transport: Send + Sync {
 pub trait TunnelHandle: Send {
     /// Resolves when the tunnel drops on its own (process exit, network loss).
     async fn closed(&mut self);
-    /// Proactively tear the tunnel down (used when the user toggles it off or
-    /// the app shuts down).
+    /// Proactively tear the tunnel down.
     async fn shutdown(&mut self);
 }
 
 /// Builds the `ssh` argument vector for one tunnel. Pure and side-effect-free
 /// so it can be unit-tested without spawning anything.
-pub fn build_ssh_args(tunnel: &Tunnel) -> Vec<String> {
+pub fn build_ssh_args(tunnel: &Tunnel, ssh: &SshConfig) -> Vec<String> {
     let mut args = vec![
         // -N: no remote command; -T: no pty — we only want the forward.
         "-N".to_string(),
         "-T".to_string(),
-        // Detect a dead peer reasonably fast and fail loudly if the forward
-        // can't be set up, so the supervisor sees a clean drop and reconnects.
         "-o".to_string(),
         "ServerAliveInterval=15".to_string(),
         "-o".to_string(),
@@ -56,21 +56,44 @@ pub fn build_ssh_args(tunnel: &Tunnel) -> Vec<String> {
         "ExitOnForwardFailure=yes".to_string(),
         "-o".to_string(),
         "ConnectTimeout=10".to_string(),
-        "-L".to_string(),
-        format!(
-            "{}:{}:{}",
-            tunnel.local_port, tunnel.remote_host, tunnel.remote_port
-        ),
     ];
 
-    if let Some(port) = tunnel.ssh_port {
-        args.push("-p".to_string());
-        args.push(port.to_string());
+    if let Some(identity) = &ssh.identity_file {
+        args.push("-i".to_string());
+        args.push(expand_tilde(identity));
+        args.push("-o".to_string());
+        args.push("IdentitiesOnly=yes".to_string());
     }
 
-    // The ssh target (alias or user@host). ssh resolves the rest from config.
-    args.push(tunnel.ssh.clone());
+    args.push("-L".to_string());
+    args.push(format!(
+        "{}:{}:{}",
+        tunnel.local_port, tunnel.remote_host, tunnel.remote_port
+    ));
+
+    if ssh.port != 22 {
+        args.push("-p".to_string());
+        args.push(ssh.port.to_string());
+    }
+
+    let target = match &ssh.user {
+        Some(user) => format!("{user}@{}", ssh.host),
+        None => ssh.host.clone(),
+    };
+    args.push(target);
     args
+}
+
+/// Expand a leading `~/` to the home directory (ssh receives an absolute path
+/// since we spawn it without a shell).
+fn expand_tilde(path: &str) -> String {
+    match path.strip_prefix("~/") {
+        Some(rest) => match std::env::var("HOME") {
+            Ok(home) => format!("{home}/{rest}"),
+            Err(_) => path.to_string(),
+        },
+        None => path.to_string(),
+    }
 }
 
 /// v1 transport: supervises a child `ssh` process per tunnel.
@@ -78,8 +101,12 @@ pub struct OpenSshTransport;
 
 #[async_trait]
 impl Transport for OpenSshTransport {
-    async fn connect(&self, tunnel: &Tunnel) -> anyhow::Result<Box<dyn TunnelHandle>> {
-        let args = build_ssh_args(tunnel);
+    async fn connect(
+        &self,
+        tunnel: &Tunnel,
+        ssh: &SshConfig,
+    ) -> anyhow::Result<Box<dyn TunnelHandle>> {
+        let args = build_ssh_args(tunnel, ssh);
         let mut child = tokio::process::Command::new("ssh")
             .args(&args)
             .stderr(std::process::Stdio::piped())
@@ -87,9 +114,7 @@ impl Transport for OpenSshTransport {
             .spawn()?;
 
         // Don't report success until the local forward actually accepts
-        // connections — otherwise the UI would show "Up" the instant ssh is
-        // spawned, before the tunnel is really usable. On failure, surface ssh's
-        // own stderr (e.g. "connect to host ... Connection refused") as the error.
+        // connections. On failure, surface ssh's own stderr as the error.
         if let Err(err) = wait_forward_ready(&mut child, tunnel.local_port).await {
             let detail = read_stderr_tail(&mut child).await;
             let _ = child.start_kill();
@@ -158,7 +183,6 @@ mod tests {
         Tunnel {
             path: "gc/dev/db/app-api".into(),
             ssh: "gemx-dev".into(),
-            ssh_port: None,
             local_port: 54321,
             remote_host: "db.internal".into(),
             remote_port: 5432,
@@ -166,27 +190,33 @@ mod tests {
     }
 
     #[test]
-    fn args_carry_forward_and_ssh_target() {
-        let args = build_ssh_args(&tunnel());
-        assert!(args.contains(&"-N".to_string()));
-        assert!(args.contains(&"54321:db.internal:5432".to_string()));
-        // No explicit port -> rely on ssh config; target is last and is the alias.
-        assert!(!args.contains(&"-p".to_string()));
-        assert_eq!(args.last().unwrap(), "gemx-dev");
-    }
+    fn args_carry_forward_identity_and_target() {
+        let ssh = SshConfig {
+            name: "gemx-dev".into(),
+            host: "example.com".into(),
+            port: 2222,
+            user: Some("deploy".into()),
+            identity_file: Some("/keys/dev.pem".into()),
+        };
+        let args = build_ssh_args(&tunnel(), &ssh);
 
-    #[test]
-    fn args_include_explicit_ssh_port() {
-        let mut t = tunnel();
-        t.ssh_port = Some(2222);
-        t.ssh = "deploy@example.com".into();
-        let args = build_ssh_args(&t);
+        assert!(args.contains(&"54321:db.internal:5432".to_string()));
+        let i = args.iter().position(|a| a == "-i").expect("-i present");
+        assert_eq!(args[i + 1], "/keys/dev.pem");
         let p = args.iter().position(|a| a == "-p").expect("-p present");
         assert_eq!(args[p + 1], "2222");
         assert_eq!(args.last().unwrap(), "deploy@example.com");
     }
 
-    /// Grab a port that nothing is listening on (bind then release).
+    #[test]
+    fn args_minimal_for_alias_without_user_port_key() {
+        let ssh = SshConfig::alias("gemx-dev");
+        let args = build_ssh_args(&tunnel(), &ssh);
+        assert!(!args.contains(&"-i".to_string()));
+        assert!(!args.contains(&"-p".to_string())); // port 22 omitted
+        assert_eq!(args.last().unwrap(), "gemx-dev");
+    }
+
     async fn a_closed_port() -> u16 {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -213,9 +243,6 @@ mod tests {
     async fn forward_ready_fails_when_ssh_exits_early() {
         let port = a_closed_port().await;
         let mut child = tokio::process::Command::new("true").spawn().unwrap();
-
-        let result = wait_forward_ready(&mut child, port).await;
-
-        assert!(result.is_err());
+        assert!(wait_forward_ready(&mut child, port).await.is_err());
     }
 }

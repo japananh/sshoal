@@ -1,15 +1,50 @@
-//! The persisted configuration model: a flat list of tunnels, each placed in a
-//! slash-separated tree `path` (e.g. `gc/dev/db/app-api`) and pointed at an SSH
-//! target. Load/save to a YAML file (the unit of export/import).
+//! The persisted configuration model.
 //!
-//! Private keys are intentionally *not* stored here — sshoal relies on the
-//! user's existing `~/.ssh` (config, keys, agent, known_hosts). The `ssh` field
-//! is just an alias / `user@host` passed straight to `ssh`, so the same value
-//! works in a plain terminal too.
+//! Two lists: **ssh configs** (named connection targets — host/user/port/key,
+//! GoLand-style) and **tunnels** (each placed in a slash tree `path` and
+//! pointing at an ssh config by name). Keeping the connection details in our own
+//! config (rather than only `~/.ssh/config`) makes an exported config
+//! self-contained. Private keys themselves are never stored — only a path to
+//! the key file.
 
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+
+fn default_port() -> u16 {
+    22
+}
+
+/// A named SSH connection target — what a tunnel connects *through*.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshConfig {
+    /// Unique name; tunnels reference it via `Tunnel::ssh`.
+    pub name: String,
+    /// Hostname / IP, or an `~/.ssh/config` alias.
+    pub host: String,
+    #[serde(default = "default_port")]
+    pub port: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// Path to the private key (`ssh -i`). `None` lets ssh use its defaults /
+    /// agent / `~/.ssh/config`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_file: Option<String>,
+}
+
+impl SshConfig {
+    /// A bare config that just defers to `ssh`/`~/.ssh/config` for `name`
+    /// (used as a fallback when a tunnel references an unknown config).
+    pub fn alias(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            host: name.to_string(),
+            port: 22,
+            user: None,
+            identity_file: None,
+        }
+    }
+}
 
 /// A single local→remote port forward, placed in the tree at `path`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -17,13 +52,8 @@ pub struct Tunnel {
     /// Tree location, slash-separated. The last segment is the display name,
     /// e.g. `gc/dev/db/app-api` shows as `app-api` under `gc › dev › db`.
     pub path: String,
-    /// SSH target passed straight to `ssh`: an `~/.ssh/config` alias (preferred)
-    /// or `user@host`. Keeping it an alias means the same value works in a plain
-    /// terminal and host details stay in one place (`~/.ssh/config`).
+    /// Name of the [`SshConfig`] this tunnel connects through.
     pub ssh: String,
-    /// Optional ssh port override. When `None`, ssh uses `~/.ssh/config` / 22.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ssh_port: Option<u16>,
     /// Port opened on the local machine (the `L` side of `ssh -L`).
     pub local_port: u16,
     /// Host to forward to, as seen *from the ssh server* (e.g. `127.0.0.1` or an
@@ -45,9 +75,11 @@ impl Tunnel {
     }
 }
 
-/// The whole config file: just the tunnels (the tree is derived from `path`).
+/// The whole config file.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppConfig {
+    #[serde(default)]
+    pub ssh_configs: Vec<SshConfig>,
     #[serde(default)]
     pub tunnels: Vec<Tunnel>,
 }
@@ -81,6 +113,19 @@ impl AppConfig {
         Ok(serde_yaml::to_string(self)?)
     }
 
+    /// Find an ssh config by name.
+    pub fn ssh_config(&self, name: &str) -> Option<&SshConfig> {
+        self.ssh_configs.iter().find(|c| c.name == name)
+    }
+
+    /// Resolve the ssh config a tunnel uses, falling back to a bare alias config
+    /// so a tunnel that names an `~/.ssh/config` alias still works.
+    pub fn resolve_ssh(&self, tunnel: &Tunnel) -> SshConfig {
+        self.ssh_config(&tunnel.ssh)
+            .cloned()
+            .unwrap_or_else(|| SshConfig::alias(&tunnel.ssh))
+    }
+
     /// Load from a file, returning an empty config if the file does not exist.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
@@ -94,10 +139,21 @@ impl AppConfig {
         }
     }
 
-    /// Merge tunnels from `other` into this config, keyed by `path`. On a path
-    /// collision, `overwrite` decides whether the incoming tunnel replaces the
-    /// existing one (used by import: replace your local copy, or keep it).
+    /// Merge `other` into this config. Tunnels are keyed by `path`, ssh configs
+    /// by `name`; on a collision, `overwrite` decides whether the incoming entry
+    /// replaces the existing one.
     pub fn merge(&mut self, other: AppConfig, overwrite: bool) {
+        for incoming in other.ssh_configs {
+            match self
+                .ssh_configs
+                .iter_mut()
+                .find(|c| c.name == incoming.name)
+            {
+                Some(existing) if overwrite => *existing = incoming,
+                Some(_) => {}
+                None => self.ssh_configs.push(incoming),
+            }
+        }
         for incoming in other.tunnels {
             match self.tunnels.iter_mut().find(|t| t.path == incoming.path) {
                 Some(existing) if overwrite => *existing = incoming,
@@ -129,10 +185,16 @@ mod tests {
 
     fn sample() -> AppConfig {
         AppConfig {
+            ssh_configs: vec![SshConfig {
+                name: "gemx-dev".into(),
+                host: "1.2.3.4".into(),
+                port: 22,
+                user: Some("deploy".into()),
+                identity_file: Some("~/.ssh/dev.pem".into()),
+            }],
             tunnels: vec![Tunnel {
                 path: "gc/dev/db/app-api".into(),
                 ssh: "gemx-dev".into(),
-                ssh_port: None,
                 local_port: 54321,
                 remote_host: "db.internal".into(),
                 remote_port: 5432,
@@ -150,38 +212,49 @@ mod tests {
     #[test]
     fn yaml_roundtrips() {
         let cfg = sample();
-        let yaml = cfg.to_yaml().expect("serialize");
-        let parsed = AppConfig::from_yaml(&yaml).expect("parse");
+        let parsed = AppConfig::from_yaml(&cfg.to_yaml().unwrap()).unwrap();
         assert_eq!(cfg, parsed);
     }
 
     #[test]
+    fn resolve_ssh_falls_back_to_alias() {
+        let cfg = sample();
+        // known config
+        assert_eq!(cfg.resolve_ssh(&cfg.tunnels[0]).host, "1.2.3.4");
+        // unknown -> alias
+        let t = Tunnel {
+            path: "x".into(),
+            ssh: "other".into(),
+            local_port: 1,
+            remote_host: "h".into(),
+            remote_port: 2,
+        };
+        let resolved = cfg.resolve_ssh(&t);
+        assert_eq!(resolved.host, "other");
+        assert_eq!(resolved.user, None);
+    }
+
+    #[test]
     fn load_missing_file_yields_empty_config() {
-        let cfg = AppConfig::load("/nonexistent/sshoal/servers.yaml").expect("load");
+        let cfg = AppConfig::load("/nonexistent/sshoal/servers.yaml").unwrap();
         assert_eq!(cfg, AppConfig::default());
     }
 
     #[test]
-    fn merge_adds_new_and_optionally_overwrites() {
-        let mut base = sample(); // gc/dev/db/app-api -> 54321
+    fn merge_keys_tunnels_by_path_and_ssh_by_name() {
+        let mut base = sample();
         let mut incoming = sample();
         incoming.tunnels[0].local_port = 59999;
-        incoming.tunnels.push(Tunnel {
-            path: "gc/dev/redis/app-api".into(),
-            ssh: "gemx-dev".into(),
-            ssh_port: None,
-            local_port: 63799,
-            remote_host: "redis.internal".into(),
-            remote_port: 6379,
-        });
+        incoming.ssh_configs[0].host = "9.9.9.9".into();
 
         let mut keep = base.clone();
         keep.merge(incoming.clone(), false);
-        assert_eq!(keep.tunnels.len(), 2);
+        assert_eq!(keep.tunnels.len(), 1);
         assert_eq!(keep.tunnels[0].local_port, 54321); // untouched
+        assert_eq!(keep.ssh_configs[0].host, "1.2.3.4");
 
         base.merge(incoming, true);
-        assert_eq!(base.tunnels.len(), 2);
         assert_eq!(base.tunnels[0].local_port, 59999); // replaced
+        assert_eq!(base.ssh_configs[0].host, "9.9.9.9");
     }
 }
