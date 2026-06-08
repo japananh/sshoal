@@ -18,7 +18,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use iced::widget::{button, column, container, row, scrollable, space, text, text_input, toggler};
+use iced::widget::{
+    button, column, container, row, scrollable, space, text, text_input, toggler, tooltip,
+};
 use iced::{Color, Element, Length, Size, Subscription, Task, Theme, window};
 use sshoal_core::{
     AppConfig, Backoff, OpenSshTransport, Transport, Tunnel, TunnelState, TunnelSupervisor,
@@ -509,10 +511,13 @@ fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
 
     let header = row![
         text("sshoal").size(22).width(Length::Fill),
-        button(text("+").size(17))
-            .style(pill_button)
-            .padding([1, 11])
-            .on_press(Message::StartAdd),
+        tip(
+            button(text("+").size(17))
+                .style(pill_button)
+                .padding([1, 11])
+                .on_press(Message::StartAdd),
+            "Add tunnel",
+        ),
     ]
     .align_y(iced::Alignment::Center);
 
@@ -540,16 +545,15 @@ fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
     let is_folder = d.row_idx.is_none();
 
     let lead: Element<Message> = if is_folder {
-        let icon = if app.expanded.contains(&d.path) {
-            "📂"
-        } else {
-            "📁"
-        };
-        button(text(icon).size(15))
-            .style(button::text)
-            .padding(2)
-            .on_press(Message::ExpandCollapse(d.path.clone()))
-            .into()
+        let expanded = app.expanded.contains(&d.path);
+        let icon = if expanded { "📂" } else { "📁" };
+        tip(
+            button(text(icon).size(15))
+                .style(button::text)
+                .padding(2)
+                .on_press(Message::ExpandCollapse(d.path.clone())),
+            if expanded { "Collapse" } else { "Expand" },
+        )
     } else {
         status_dot(d.status)
     };
@@ -563,28 +567,37 @@ fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
     // On/off switch: cleaner than a text button, and doesn't read as up/down.
     let switch: Element<Message> = if is_folder {
         let path = d.path.clone();
-        toggler(d.enabled)
-            .size(18)
-            .on_toggle(move |_| Message::ToggleFolder(path.clone()))
-            .into()
+        tip(
+            toggler(d.enabled)
+                .size(18)
+                .on_toggle(move |_| Message::ToggleFolder(path.clone())),
+            if d.enabled {
+                "Disconnect all"
+            } else {
+                "Connect all"
+            },
+        )
     } else {
         let idx = d.row_idx.unwrap();
-        toggler(d.enabled)
-            .size(18)
-            .on_toggle(move |_| Message::ToggleTunnel(idx))
-            .into()
+        tip(
+            toggler(d.enabled)
+                .size(18)
+                .on_toggle(move |_| Message::ToggleTunnel(idx)),
+            if d.enabled { "Disconnect" } else { "Connect" },
+        )
     };
 
     let mut line = row![indent, lead, name].spacing(10);
     if is_folder {
         line = line.push(status_dot(d.status));
     } else if let Some(idx) = d.row_idx {
-        line = line.push(
+        line = line.push(tip(
             button(text("✎").size(14))
                 .style(pill_secondary)
                 .padding([2, 9])
                 .on_press(Message::StartEdit(idx)),
-        );
+            "Edit tunnel",
+        ));
     }
     line = line.push(switch);
     // Keep controls clear of the scrollbar on the right.
@@ -600,6 +613,31 @@ fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
             .into()
     } else {
         container(line).padding([3, 6]).into()
+    }
+}
+
+/// Wrap a control with a hover tooltip.
+fn tip<'a>(content: impl Into<Element<'a, Message>>, label: &'a str) -> Element<'a, Message> {
+    tooltip(
+        content,
+        container(text(label).size(12))
+            .padding([4, 8])
+            .style(tooltip_bubble),
+        tooltip::Position::Bottom,
+    )
+    .gap(6)
+    .into()
+}
+
+fn tooltip_bubble(_theme: &iced::Theme) -> iced::widget::container::Style {
+    iced::widget::container::Style {
+        background: Some(iced::Background::Color(Color::from_rgb(0.15, 0.15, 0.18))),
+        text_color: Some(Color::from_rgb(0.96, 0.96, 0.98)),
+        border: iced::Border {
+            radius: 6.0.into(),
+            ..Default::default()
+        },
+        ..Default::default()
     }
 }
 
