@@ -32,6 +32,10 @@ const ICON_MINUS: &str = "\u{e11c}";
 const ICON_CHEVRON_LEFT: &str = "\u{e06e}";
 const ICON_FOLDER: &str = "\u{e0d7}";
 const ICON_FOLDER_OPEN: &str = "\u{e247}";
+/// Blue used for the folder glyph (and a selected folder's name).
+const FOLDER_BLUE: Color = Color::from_rgb(0.20, 0.50, 0.95);
+/// Default dark row text.
+const TEXT_DARK: Color = Color::from_rgb(0.13, 0.13, 0.18);
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use sshoal_core::{
@@ -1048,8 +1052,7 @@ fn filter_bar(app: &App) -> Element<'_, Message> {
 fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
     let indent = space().width(Length::Fixed(d.depth as f32 * 16.0));
 
-    // Folder: a band you click to expand/collapse. No toggle/status. Selection
-    // is shown by an accent border, not by repainting the whole row.
+    // Folder: a transparent band you click to expand/collapse. No toggle/status.
     let Some(idx) = d.row_idx else {
         let expanded = app.expanded.contains(&d.path);
         let selected = app.selected.as_deref() == Some(d.path.as_str());
@@ -1058,34 +1061,16 @@ fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
         } else {
             ICON_FOLDER
         };
-        // The folder glyph sits on a rounded background tile: blue when selected,
-        // warm amber when closed, muted when open. Selection shows here — the row
-        // itself stays transparent (no grey band, no border).
-        let tile_bg = if selected {
-            Color::from_rgb(0.36, 0.56, 0.96)
-        } else if expanded {
-            Color::from_rgb(0.80, 0.84, 0.90)
-        } else {
-            Color::from_rgb(0.98, 0.84, 0.52)
-        };
-        let glyph = if selected {
-            Color::WHITE
-        } else {
-            Color::from_rgb(0.28, 0.30, 0.34)
-        };
-        let icon_tile = container(text(icon).font(LUCIDE).size(13.0).color(glyph))
-            .padding([2, 4])
-            .style(move |_t: &iced::Theme| iced::widget::container::Style {
-                background: Some(iced::Background::Color(tile_bg)),
-                border: iced::Border {
-                    radius: 5.0.into(),
-                    ..Default::default()
-                },
-                ..Default::default()
-            });
-        let content = row![indent, icon_tile, name_element(&d.name, 14.0, 26)]
-            .spacing(10)
-            .align_y(iced::Alignment::Center);
+        // The folder glyph itself is blue; the row stays transparent (no grey
+        // band, no border, no tile). Selection also turns the name blue.
+        let name_color = if selected { FOLDER_BLUE } else { TEXT_DARK };
+        let content = row![
+            indent,
+            text(icon).font(LUCIDE).size(16.0).color(FOLDER_BLUE),
+            name_element(&d.name, 14.0, 26, name_color),
+        ]
+        .spacing(10)
+        .align_y(iced::Alignment::Center);
         return button(content)
             .style(row_plain)
             .width(Length::Fill)
@@ -1099,7 +1084,7 @@ fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
     let label = row![
         indent,
         status_dot(d.status),
-        name_element(&d.name, 13.0, 26),
+        name_element(&d.name, 13.0, 26, TEXT_DARK),
     ]
     .spacing(10)
     .align_y(iced::Alignment::Center);
@@ -1191,13 +1176,17 @@ fn truncate(name: &str, max: usize) -> String {
 
 /// A row label that truncates long names to `max` chars and, when truncated,
 /// reveals the full name in a hover tooltip.
-fn name_element<'a>(name: &str, size: f32, max: usize) -> Element<'a, Message> {
+fn name_element<'a>(name: &str, size: f32, max: usize, color: Color) -> Element<'a, Message> {
     let shown = truncate(name, max);
     if shown == name {
-        text(shown).size(size).width(Length::Fill).into()
+        text(shown)
+            .size(size)
+            .color(color)
+            .width(Length::Fill)
+            .into()
     } else {
         tip_text(
-            container(text(shown).size(size)).width(Length::Fill),
+            container(text(shown).size(size).color(color)).width(Length::Fill),
             name.to_string(),
         )
     }
