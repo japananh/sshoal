@@ -19,8 +19,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use iced::widget::{
-    button, column, container, pick_list, row, scrollable, space, text, text_input, toggler,
-    tooltip,
+    button, checkbox, column, container, pick_list, row, scrollable, space, text, text_input,
+    toggler, tooltip,
 };
 use iced::{Color, Element, Font, Length, Size, Subscription, Task, Theme, window};
 
@@ -28,10 +28,13 @@ use iced::{Color, Element, Font, Length, Size, Subscription, Task, Theme, window
 /// monochrome icon font for crisp Add/Edit/folder glyphs.
 const LUCIDE: Font = Font::with_name("lucide");
 const ICON_PLUS: &str = "\u{e13d}";
-const ICON_MINUS: &str = "\u{e11c}";
 const ICON_CHEVRON_LEFT: &str = "\u{e06e}";
 const ICON_FOLDER: &str = "\u{e0d7}";
 const ICON_FOLDER_OPEN: &str = "\u{e247}";
+const ICON_TERMINAL: &str = "\u{e181}";
+const ICON_SETTINGS: &str = "\u{e154}";
+const ICON_TRASH: &str = "\u{e18e}";
+const ICON_SEARCH: char = '\u{e151}';
 /// Blue used for the folder glyph (and a selected folder's name).
 const FOLDER_BLUE: Color = Color::from_rgb(0.20, 0.50, 0.95);
 /// Default dark row text.
@@ -86,13 +89,16 @@ enum Message {
     SaveSsh,
     CancelSsh,
     DeleteSsh(usize),
-    // Selection / keyboard nav
-    SelectDelta(i32),
-    DeleteSelected,
-    ConfirmDeleteInput(String),
-    ConfirmDeleteDo,
-    ConfirmDeleteCancel,
-    Keyboard(iced::keyboard::Event),
+    // Multi-select (checkboxes) + bulk actions
+    ToggleCheck(String),
+    ToggleCheckFolder(String),
+    ClearChecks,
+    BulkConnect,
+    BulkDisconnect,
+    BulkDelete,
+    ConfirmBulkDelete,
+    CancelBulkDelete,
+    OpenTerminal(usize),
     // Filter bar (tunnels screen)
     FilterInput(String),
     SetFilter(StateFilter),
@@ -178,35 +184,17 @@ struct App {
     managing_ssh: bool,
     /// In-progress add/edit of an SSH config.
     editing_ssh: Option<SshForm>,
-    /// Currently selected row, by identity (tunnel/folder `path` on the tree, or
-    /// ssh-config `name` on the SSH screen) — for keyboard nav + delete (−).
-    selected: Option<String>,
-    /// Pending folder deletion awaiting type-to-confirm.
-    confirm_delete: Option<ConfirmDelete>,
+    /// Checked tunnel paths (leaves) for multi-select bulk actions.
+    checked: HashSet<String>,
+    /// Tunnel paths pending a bulk-delete confirmation.
+    confirm_delete: Option<Vec<String>>,
     /// Free-text filter (matches tunnel name or folder path).
     filter: String,
     /// Connection-state filter.
     filter_state: StateFilter,
 }
 
-/// Type-the-name confirmation for deleting a whole folder of tunnels.
-struct ConfirmDelete {
-    path: String,
-    name: String,
-    count: usize,
-    typed: String,
-}
-
 impl App {
-    /// The selectable items on the current screen, in display order.
-    fn selectable(&self) -> Vec<String> {
-        if self.managing_ssh {
-            self.ssh_configs.iter().map(|c| c.name.clone()).collect()
-        } else {
-            self.display_rows().into_iter().map(|d| d.path).collect()
-        }
-    }
-
     /// The tree rows currently visible (after the filter), in display order.
     /// Shared by the view and keyboard nav so they never disagree.
     fn display_rows(&self) -> Vec<DisplayRow> {
@@ -307,7 +295,7 @@ fn boot(runtime: Arc<tokio::runtime::Runtime>) -> (App, Task<Message>) {
         editing: None,
         managing_ssh: false,
         editing_ssh: None,
-        selected: None,
+        checked: HashSet::new(),
         confirm_delete: None,
         filter: String::new(),
         filter_state: StateFilter::All,
@@ -432,7 +420,6 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::ClickFolder(path) => {
-            app.selected = Some(path.clone());
             if !app.expanded.remove(&path) {
                 app.expanded.insert(path);
             }
@@ -446,7 +433,6 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::StartEdit(i) => {
-            app.selected = app.rows.get(i).map(|r| r.tunnel.path.clone());
             if let Some(row) = app.rows.get(i) {
                 let t = &row.tunnel;
                 app.editing = Some(EditForm {
@@ -489,6 +475,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                     sup.cancel();
                 }
                 info!(tunnel = %row.tunnel.path, "delete");
+                app.checked.remove(&row.tunnel.path);
                 app.expanded = all_folder_paths(&app.rows);
                 persist(&app.rows, &app.ssh_configs);
             }
@@ -497,13 +484,11 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::OpenSshConfigs => {
             app.managing_ssh = true;
             app.editing = None;
-            app.selected = None;
             Task::none()
         }
         Message::CloseSshConfigs => {
             app.managing_ssh = false;
             app.editing_ssh = None;
-            app.selected = None;
             Task::none()
         }
         Message::StartAddSsh => {
@@ -514,7 +499,6 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::StartEditSsh(i) => {
-            app.selected = app.ssh_configs.get(i).map(|c| c.name.clone());
             if let Some(c) = app.ssh_configs.get(i) {
                 app.editing_ssh = Some(SshForm {
                     target: Some(i),
@@ -557,102 +541,84 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             }
             Task::none()
         }
-        Message::SelectDelta(delta) => {
-            let items = app.selectable();
-            if !items.is_empty() {
-                let cur = app
-                    .selected
-                    .as_ref()
-                    .and_then(|s| items.iter().position(|it| it == s))
-                    .unwrap_or(0) as i32;
-                let next = (cur + delta).rem_euclid(items.len() as i32) as usize;
-                app.selected = Some(items[next].clone());
+        Message::ToggleCheck(path) => {
+            if !app.checked.remove(&path) {
+                app.checked.insert(path);
             }
             Task::none()
         }
-        Message::DeleteSelected => {
-            let Some(sel) = app.selected.take() else {
-                return Task::none();
-            };
-            if app.managing_ssh {
-                if let Some(i) = app.ssh_configs.iter().position(|c| c.name == sel) {
-                    return update(app, Message::DeleteSsh(i));
-                }
-            } else if let Some(i) = app.rows.iter().position(|r| r.tunnel.path == sel) {
-                // A leaf tunnel.
-                return update(app, Message::DeleteTunnel(i));
-            } else {
-                // A folder: confirm by typing its name before deleting the lot.
-                let count = descendant_indices(&app.rows, &sel).len();
-                if count > 0 {
-                    let name = sel.rsplit('/').next().unwrap_or(&sel).to_string();
-                    app.confirm_delete = Some(ConfirmDelete {
-                        path: sel,
-                        name,
-                        count,
-                        typed: String::new(),
-                    });
+        Message::ToggleCheckFolder(path) => {
+            let descendants: Vec<String> = descendant_indices(&app.rows, &path)
+                .into_iter()
+                .map(|i| app.rows[i].tunnel.path.clone())
+                .collect();
+            // If everything under the folder is already checked, uncheck it all;
+            // otherwise check it all.
+            let all_checked =
+                !descendants.is_empty() && descendants.iter().all(|p| app.checked.contains(p));
+            for p in descendants {
+                if all_checked {
+                    app.checked.remove(&p);
+                } else {
+                    app.checked.insert(p);
                 }
             }
             Task::none()
         }
-        Message::ConfirmDeleteInput(value) => {
-            if let Some(c) = &mut app.confirm_delete {
-                c.typed = value;
+        Message::ClearChecks => {
+            app.checked.clear();
+            Task::none()
+        }
+        Message::BulkConnect => {
+            for i in checked_indices(app) {
+                set_enabled(app, i, true);
             }
             Task::none()
         }
-        Message::ConfirmDeleteCancel => {
+        Message::BulkDisconnect => {
+            for i in checked_indices(app) {
+                set_enabled(app, i, false);
+            }
+            Task::none()
+        }
+        Message::BulkDelete => {
+            let paths: Vec<String> = checked_indices(app)
+                .into_iter()
+                .map(|i| app.rows[i].tunnel.path.clone())
+                .collect();
+            if !paths.is_empty() {
+                app.confirm_delete = Some(paths);
+            }
+            Task::none()
+        }
+        Message::CancelBulkDelete => {
             app.confirm_delete = None;
             Task::none()
         }
-        Message::ConfirmDeleteDo => {
-            if let Some(c) = app.confirm_delete.take()
-                && c.typed.trim() == c.name
-            {
-                for i in descendant_indices(&app.rows, &c.path).into_iter().rev() {
-                    let mut row = app.rows.remove(i);
-                    if let Some(sup) = row.supervisor.take() {
+        Message::ConfirmBulkDelete => {
+            if let Some(paths) = app.confirm_delete.take() {
+                let doomed: HashSet<String> = paths.into_iter().collect();
+                for row in &mut app.rows {
+                    if doomed.contains(&row.tunnel.path)
+                        && let Some(sup) = row.supervisor.take()
+                    {
                         sup.cancel();
                     }
                 }
-                info!(folder = %c.path, "delete folder");
+                app.rows.retain(|r| !doomed.contains(&r.tunnel.path));
+                for p in &doomed {
+                    app.checked.remove(p);
+                }
+                info!(count = doomed.len(), "bulk delete");
                 app.expanded = all_folder_paths(&app.rows);
                 persist(&app.rows, &app.ssh_configs);
             }
             Task::none()
         }
-        Message::Keyboard(event) => {
-            use iced::keyboard::{Event, Key, key::Named};
-            // Only navigate the list when not typing in a form. (Backspace/Delete
-            // are NOT bound to deletion here — the filter box would capture them;
-            // use the − button instead.)
-            if app.editing.is_none()
-                && app.editing_ssh.is_none()
-                && app.confirm_delete.is_none()
-                && let Event::KeyPressed { key, .. } = event
-            {
-                return match key {
-                    Key::Named(Named::ArrowUp) => update(app, Message::SelectDelta(-1)),
-                    Key::Named(Named::ArrowDown) => update(app, Message::SelectDelta(1)),
-                    Key::Named(Named::Enter) => {
-                        // While filtering (e.g. typing "gc/dev"), Enter just
-                        // commits the search: keep the filtered list visible and
-                        // move the cursor to the first match — never open an edit
-                        // form (click a row to edit a filtered tunnel).
-                        if filter_active(app) {
-                            let items = app.selectable();
-                            let keep = app.selected.as_ref().is_some_and(|s| items.contains(s));
-                            if !keep {
-                                app.selected = items.into_iter().next();
-                            }
-                            Task::none()
-                        } else {
-                            activate_selected(app)
-                        }
-                    }
-                    _ => Task::none(),
-                };
+        Message::OpenTerminal(i) => {
+            if let Some(row) = app.rows.get(i) {
+                let ssh = app.resolve_ssh(&row.tunnel);
+                open_terminal(&ssh);
             }
             Task::none()
         }
@@ -683,27 +649,62 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
 /// opens (otherwise typing goes nowhere until you click into it).
 const FILTER_ID: &str = "filter";
 
-/// Is the tunnel filter doing anything right now?
-fn filter_active(app: &App) -> bool {
-    !app.filter.trim().is_empty() || app.filter_state != StateFilter::All
+/// Row indices of the currently checked tunnels.
+fn checked_indices(app: &App) -> Vec<usize> {
+    app.rows
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| app.checked.contains(&r.tunnel.path))
+        .map(|(i, _)| i)
+        .collect()
 }
 
-/// Enter on the current selection: edit an ssh config / leaf tunnel, or
-/// expand/collapse a folder.
-fn activate_selected(app: &mut App) -> Task<Message> {
-    let Some(sel) = app.selected.clone() else {
-        return Task::none();
-    };
-    if app.managing_ssh {
-        if let Some(i) = app.ssh_configs.iter().position(|c| c.name == sel) {
-            return update(app, Message::StartEditSsh(i));
+/// Open a terminal with an interactive SSH session to a tunnel's host. macOS
+/// uses Terminal.app via AppleScript; Linux tries the common emulators.
+fn open_terminal(ssh: &SshConfig) {
+    let cmd = ssh_login_command(ssh);
+    info!(host = %ssh.host, "open terminal");
+    #[cfg(target_os = "macos")]
+    {
+        let script = format!(
+            "tell application \"Terminal\"\n    do script \"{}\"\n    activate\nend tell",
+            cmd.replace('\\', "\\\\").replace('"', "\\\"")
+        );
+        let _ = std::process::Command::new("osascript")
+            .args(["-e", &script])
+            .spawn();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        for term in ["x-terminal-emulator", "gnome-terminal", "konsole", "xterm"] {
+            let ok = std::process::Command::new(term)
+                .args(["-e", "sh", "-c", &format!("{cmd}; exec $SHELL")])
+                .spawn()
+                .is_ok();
+            if ok {
+                break;
+            }
         }
-        return Task::none();
     }
-    if let Some(i) = app.rows.iter().position(|r| r.tunnel.path == sel) {
-        return update(app, Message::StartEdit(i));
+}
+
+/// Build the interactive `ssh user@host` command (no port-forward flags) for a
+/// terminal session.
+fn ssh_login_command(ssh: &SshConfig) -> String {
+    let mut parts = vec!["ssh".to_string()];
+    if let Some(id) = &ssh.identity_file {
+        parts.push("-i".into());
+        parts.push(id.clone());
     }
-    update(app, Message::ClickFolder(sel))
+    if ssh.port != 22 {
+        parts.push("-p".into());
+        parts.push(ssh.port.to_string());
+    }
+    parts.push(match &ssh.user {
+        Some(u) => format!("{u}@{}", ssh.host),
+        None => ssh.host.clone(),
+    });
+    parts.join(" ")
 }
 
 /// Validate the edit form and apply it (replace or append a tunnel), then save.
@@ -984,8 +985,8 @@ fn aggregate(states: impl Iterator<Item = TunnelState>) -> TunnelState {
 // ---- view ----
 
 fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
-    if let Some(c) = &app.confirm_delete {
-        return confirm_view(c);
+    if let Some(paths) = &app.confirm_delete {
+        return confirm_view(paths);
     }
     if let Some(form) = &app.editing_ssh {
         return ssh_edit_view(form);
@@ -997,29 +998,52 @@ fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
         return edit_view(form, &app.ssh_names());
     }
 
+    // Compact header: search box (with a leading magnifier) + settings + add.
+    let search = text_input("Search name or folder (e.g. gc/dev)…", &app.filter)
+        .id(FILTER_ID)
+        .size(13)
+        .padding([6, 9])
+        .style(rounded_input)
+        .icon(text_input::Icon {
+            font: LUCIDE,
+            code_point: ICON_SEARCH,
+            size: Some(13.0.into()),
+            spacing: 6.0,
+            side: text_input::Side::Left,
+        })
+        .on_input(Message::FilterInput)
+        .width(Length::Fill);
     let header = row![
-        text("sshoal").size(22).width(Length::Fill),
-        button(text("SSH configs").size(12))
-            .style(pill_secondary)
-            .padding([4, 10])
-            .on_press(Message::OpenSshConfigs),
-        row![
-            tip(
-                icon_button(ICON_PLUS, 19.0, Message::StartAdd),
-                "Add tunnel"
-            ),
-            tip(
-                icon_button(ICON_MINUS, 19.0, Message::DeleteSelected),
-                "Delete selected"
-            ),
-        ]
-        .spacing(8),
+        search,
+        tip(
+            icon_button(ICON_SETTINGS, 18.0, Message::OpenSshConfigs),
+            "SSH configs"
+        ),
+        tip(
+            icon_button(ICON_PLUS, 18.0, Message::StartAdd),
+            "Add tunnel"
+        ),
     ]
-    .spacing(8)
+    .spacing(6)
     .align_y(iced::Alignment::Center);
 
+    // State chips.
+    let chip = |label: &'static str, state: StateFilter| {
+        let active = app.filter_state == state;
+        button(text(label).size(11))
+            .style(move |_t: &iced::Theme, status| chip_style(active, status))
+            .padding([3, 10])
+            .on_press(Message::SetFilter(state))
+    };
+    let chips = row![
+        chip("All", StateFilter::All),
+        chip("Connected", StateFilter::Connected),
+        chip("Disconnected", StateFilter::Disconnected),
+    ]
+    .spacing(6);
+
     let display = app.display_rows();
-    let mut list = column![].spacing(2);
+    let mut list = column![].spacing(1);
     if app.rows.is_empty() {
         list = list.push(text("No tunnels yet. Click + Add, or run `sshoal import-ssh`.").size(13));
     } else if display.is_empty() {
@@ -1034,94 +1058,117 @@ fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
     }
 
     let body = scrollable(list).height(Length::Fill);
-    let mut screen = column![header].spacing(10);
+    let mut screen = column![header].spacing(8);
     if !app.rows.is_empty() {
-        screen = screen.push(filter_bar(app));
+        screen = screen.push(chips);
     }
     screen = screen.push(body);
-    container(screen).padding(14).into()
+    if let Some(bar) = bulk_bar(app) {
+        screen = screen.push(bar);
+    }
+    container(screen).padding(12).into()
 }
 
-/// The filter bar: a free-text search (name or folder) plus state chips.
-fn filter_bar(app: &App) -> Element<'_, Message> {
-    let search = text_input("Search name or folder (e.g. gc/dev)…", &app.filter)
-        .id(FILTER_ID)
-        .size(12)
-        .padding([5, 9])
-        .style(rounded_input)
-        .on_input(Message::FilterInput)
-        .width(Length::Fill);
-
-    let chip = |label: &'static str, state: StateFilter| {
-        let active = app.filter_state == state;
-        button(text(label).size(11))
-            .style(move |_t: &iced::Theme, status| chip_style(active, status))
-            .padding([4, 10])
-            .on_press(Message::SetFilter(state))
-    };
-
-    row![
-        search,
-        chip("All", StateFilter::All),
-        chip("Connected", StateFilter::Connected),
-        chip("Disconnected", StateFilter::Disconnected),
-    ]
-    .spacing(6)
-    .align_y(iced::Alignment::Center)
-    .into()
+/// The bulk-action bar shown at the bottom while ≥1 tunnel is checked.
+fn bulk_bar(app: &App) -> Option<Element<'_, Message>> {
+    let n = app.checked.len();
+    if n == 0 {
+        return None;
+    }
+    let bar = container(
+        row![
+            button(text(format!("{n} selected")).size(12))
+                .style(pill_secondary)
+                .padding([4, 10])
+                .on_press(Message::ClearChecks),
+            space().width(Length::Fill),
+            button(text("Connect").size(12))
+                .style(pill_button)
+                .padding([4, 12])
+                .on_press(Message::BulkConnect),
+            button(text("Disconnect").size(12))
+                .style(pill_secondary)
+                .padding([4, 12])
+                .on_press(Message::BulkDisconnect),
+            tip(
+                icon_button(ICON_TRASH, 16.0, Message::BulkDelete),
+                "Delete selected"
+            ),
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center),
+    )
+    .padding([6, 4]);
+    Some(bar.into())
 }
 
 fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
-    let indent = space().width(Length::Fixed(d.depth as f32 * 16.0));
+    let indent = space().width(Length::Fixed(d.depth as f32 * 14.0));
 
-    // Folder: a transparent band you click to expand/collapse. No toggle/status.
+    // Folder: [checkbox over its tunnels] [blue glyph] [name → expand/collapse].
     let Some(idx) = d.row_idx else {
         let expanded = app.expanded.contains(&d.path);
-        let selected = app.selected.as_deref() == Some(d.path.as_str());
         let icon = if expanded {
             ICON_FOLDER_OPEN
         } else {
             ICON_FOLDER
         };
-        // The folder glyph itself is blue; the row stays transparent (no grey
-        // band, no border, no tile). Selection also turns the name blue.
-        let name_color = if selected { FOLDER_BLUE } else { TEXT_DARK };
-        let content = row![
-            indent,
-            text(icon).font(LUCIDE).size(16.0).color(FOLDER_BLUE),
-            name_element(&d.name, 14.0, 26, name_color),
-        ]
-        .spacing(10)
-        .align_y(iced::Alignment::Center);
-        return button(content)
-            .style(row_plain)
-            .width(Length::Fill)
-            .padding([5, 6])
-            .on_press(Message::ClickFolder(d.path.clone()))
+        let descendants = descendant_indices(&app.rows, &d.path);
+        let all_checked = !descendants.is_empty()
+            && descendants
+                .iter()
+                .all(|&i| app.checked.contains(&app.rows[i].tunnel.path));
+        let folder_path = d.path.clone();
+        let check = checkbox(all_checked)
+            .size(15)
+            .on_toggle(move |_| Message::ToggleCheckFolder(folder_path.clone()));
+        let label = button(
+            row![
+                text(icon).font(LUCIDE).size(15.0).color(FOLDER_BLUE),
+                name_element(&d.name, 13.0, 24, TEXT_DARK),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center),
+        )
+        .style(row_plain)
+        .width(Length::Fill)
+        .padding([4, 6])
+        .on_press(Message::ClickFolder(d.path.clone()));
+        return row![indent, check, label]
+            .spacing(8)
+            .align_y(iced::Alignment::Center)
             .into();
     };
 
-    // Leaf: clicking the row opens edit; the toggler (sibling) connects/disconnects.
-    let selected = app.selected.as_deref() == Some(d.path.as_str());
-    let label = row![
-        indent,
-        status_dot(d.status),
-        name_element(&d.name, 13.0, 26, TEXT_DARK),
-    ]
-    .spacing(10)
-    .align_y(iced::Alignment::Center);
-    let click = button(label)
-        .style(if selected { row_selected } else { row_plain })
-        .width(Length::Fill)
-        .padding([3, 6])
-        .on_press(Message::StartEdit(idx));
+    // Leaf: [checkbox] [dot + name → edit] [terminal] [toggle].
+    let leaf_path = d.path.clone();
+    let checked = app.checked.contains(&d.path);
+    let check = checkbox(checked)
+        .size(15)
+        .on_toggle(move |_| Message::ToggleCheck(leaf_path.clone()));
+    let name_click = button(
+        row![
+            status_dot(d.status),
+            name_element(&d.name, 13.0, 22, TEXT_DARK)
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center),
+    )
+    .style(if checked { row_selected } else { row_plain })
+    .width(Length::Fill)
+    .padding([3, 6])
+    .on_press(Message::StartEdit(idx));
+    let term = tip(
+        icon_button(ICON_TERMINAL, 15.0, Message::OpenTerminal(idx)),
+        "Open terminal",
+    );
     let switch = tip(
         toggler(d.enabled)
-            .size(18)
+            .size(17)
             .on_toggle(move |_| Message::ToggleTunnel(idx)),
         if d.enabled { "Disconnect" } else { "Connect" },
     );
-    let line = row![click, switch, space().width(Length::Fixed(8.0))]
+    let line = row![indent, check, name_click, term, switch]
         .spacing(8)
         .align_y(iced::Alignment::Center);
 
@@ -1129,7 +1176,7 @@ fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
     if let Some((msg, _)) = &app.rows[idx].notice {
         col = col.push(
             row![
-                space().width(Length::Fixed(d.depth as f32 * 16.0 + 26.0)),
+                space().width(Length::Fixed(d.depth as f32 * 14.0 + 30.0)),
                 text(msg.clone())
                     .size(11)
                     .color(Color::from_rgb(0.80, 0.40, 0.16)),
@@ -1474,21 +1521,14 @@ fn nonempty(s: &str) -> Option<String> {
 fn ssh_list_view(app: &App) -> Element<'_, Message> {
     let header = row![
         tip(
-            icon_button(ICON_CHEVRON_LEFT, 20.0, Message::CloseSshConfigs),
+            icon_button(ICON_CHEVRON_LEFT, 18.0, Message::CloseSshConfigs),
             "Back"
         ),
-        text("SSH configs").size(20).width(Length::Fill),
-        row![
-            tip(
-                icon_button(ICON_PLUS, 19.0, Message::StartAddSsh),
-                "Add SSH config"
-            ),
-            tip(
-                icon_button(ICON_MINUS, 19.0, Message::DeleteSelected),
-                "Delete selected"
-            ),
-        ]
-        .spacing(8),
+        text("SSH configs").size(18).width(Length::Fill),
+        tip(
+            icon_button(ICON_PLUS, 18.0, Message::StartAddSsh),
+            "Add SSH config"
+        ),
     ]
     .spacing(8)
     .align_y(iced::Alignment::Center);
@@ -1507,10 +1547,10 @@ fn ssh_list_view(app: &App) -> Element<'_, Message> {
         ]
         .spacing(2)
         .width(Length::Fill);
-        let selected = app.selected.as_deref() == Some(c.name.as_str());
+        // Click a row to edit; delete lives inside the edit form.
         list = list.push(
             button(content)
-                .style(if selected { row_selected } else { row_plain })
+                .style(row_plain)
                 .width(Length::Fill)
                 .padding([6, 8])
                 .on_press(Message::StartEditSsh(i)),
@@ -1518,7 +1558,7 @@ fn ssh_list_view(app: &App) -> Element<'_, Message> {
     }
 
     container(column![header, scrollable(list).height(Length::Fill)].spacing(12))
-        .padding(14)
+        .padding(12)
         .into()
 }
 
@@ -1610,37 +1650,37 @@ fn ssh_edit_view(form: &SshForm) -> Element<'_, Message> {
     container(col).padding(16).into()
 }
 
-fn confirm_view(c: &ConfirmDelete) -> Element<'_, Message> {
-    let matches = c.typed.trim() == c.name;
+fn confirm_view(paths: &[String]) -> Element<'_, Message> {
     let mut col = column![
-        text("Delete folder").size(18),
-        text(format!(
-            "This permanently deletes “{}” and its {} tunnel(s).",
-            c.path, c.count
-        ))
-        .size(13),
-        text(format!("Type “{}” to confirm:", c.name)).size(13),
-        text_input(&c.name, &c.typed)
-            .size(13)
-            .padding([6, 9])
-            .style(rounded_input)
-            .on_input(Message::ConfirmDeleteInput),
+        text(format!("Delete {} tunnel(s)?", paths.len())).size(18),
+        text("This permanently removes them from sshoal. It can't be undone.").size(13),
     ]
     .spacing(10);
 
-    let mut delete = button(text("Delete").size(13))
-        .style(pill_danger)
-        .padding([5, 16]);
-    if matches {
-        delete = delete.on_press(Message::ConfirmDeleteDo);
+    // Show up to a handful of the paths so it's clear what's going.
+    let mut listing = column![].spacing(2);
+    for p in paths.iter().take(8) {
+        listing = listing.push(text(format!("• {p}")).size(12).color(TEXT_DARK));
     }
+    if paths.len() > 8 {
+        listing = listing.push(
+            text(format!("…and {} more", paths.len() - 8))
+                .size(12)
+                .color(Color::from_rgb(0.5, 0.5, 0.56)),
+        );
+    }
+    col = col.push(listing);
+
     col = col.push(
         row![
-            delete,
+            button(text("Delete").size(13))
+                .style(pill_danger)
+                .padding([5, 16])
+                .on_press(Message::ConfirmBulkDelete),
             button(text("Cancel").size(13))
                 .style(pill_secondary)
                 .padding([5, 16])
-                .on_press(Message::ConfirmDeleteCancel),
+                .on_press(Message::CancelBulkDelete),
         ]
         .spacing(10),
     );
@@ -1666,7 +1706,6 @@ fn subscription(_app: &App) -> Subscription<Message> {
     Subscription::batch([
         iced::time::every(Duration::from_millis(200)).map(|_| Message::Tick),
         iced::window::close_events().map(Message::WindowClosed),
-        iced::keyboard::listen().map(Message::Keyboard),
     ])
 }
 
