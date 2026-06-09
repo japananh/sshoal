@@ -1052,27 +1052,42 @@ fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
     // is shown by an accent border, not by repainting the whole row.
     let Some(idx) = d.row_idx else {
         let expanded = app.expanded.contains(&d.path);
-        // Closed folders get a warm fill so they read as "has hidden contents";
-        // open ones fade to a muted grey.
-        let (icon, icon_color) = if expanded {
-            (ICON_FOLDER_OPEN, Color::from_rgb(0.55, 0.60, 0.68))
-        } else {
-            (ICON_FOLDER, Color::from_rgb(0.93, 0.69, 0.22))
-        };
-        let content = row![
-            indent,
-            text(icon).font(LUCIDE).size(16).color(icon_color),
-            name_element(&d.name, 14.0, 26),
-        ]
-        .spacing(10)
-        .align_y(iced::Alignment::Center);
         let selected = app.selected.as_deref() == Some(d.path.as_str());
+        let icon = if expanded {
+            ICON_FOLDER_OPEN
+        } else {
+            ICON_FOLDER
+        };
+        // The folder glyph sits on a rounded background tile: blue when selected,
+        // warm amber when closed, muted when open. Selection shows here — the row
+        // itself stays transparent (no grey band, no border).
+        let tile_bg = if selected {
+            Color::from_rgb(0.36, 0.56, 0.96)
+        } else if expanded {
+            Color::from_rgb(0.80, 0.84, 0.90)
+        } else {
+            Color::from_rgb(0.98, 0.84, 0.52)
+        };
+        let glyph = if selected {
+            Color::WHITE
+        } else {
+            Color::from_rgb(0.28, 0.30, 0.34)
+        };
+        let icon_tile = container(text(icon).font(LUCIDE).size(13.0).color(glyph))
+            .padding([2, 4])
+            .style(move |_t: &iced::Theme| iced::widget::container::Style {
+                background: Some(iced::Background::Color(tile_bg)),
+                border: iced::Border {
+                    radius: 5.0.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        let content = row![indent, icon_tile, name_element(&d.name, 14.0, 26)]
+            .spacing(10)
+            .align_y(iced::Alignment::Center);
         return button(content)
-            .style(if selected {
-                folder_selected
-            } else {
-                folder_button
-            })
+            .style(row_plain)
             .width(Length::Fill)
             .padding([5, 6])
             .on_press(Message::ClickFolder(d.path.clone()))
@@ -1129,28 +1144,6 @@ fn row_style(bg: Option<Color>, radius: f32) -> iced::widget::button::Style {
         shadow: iced::Shadow::default(),
         snap: true,
     }
-}
-
-/// Folder row: a slightly darker band so folders stand out from leaves.
-fn folder_button(_theme: &iced::Theme, status: button::Status) -> iced::widget::button::Style {
-    let shade = match status {
-        button::Status::Hovered => 0.82,
-        button::Status::Pressed => 0.78,
-        _ => 0.86,
-    };
-    row_style(Some(Color::from_rgb(shade, shade, shade + 0.03)), 0.0)
-}
-
-/// Folder row, selected: keep the band, add a blue accent border (rather than
-/// repainting the whole row a solid colour).
-fn folder_selected(theme: &iced::Theme, status: button::Status) -> iced::widget::button::Style {
-    let mut style = folder_button(theme, status);
-    style.border = iced::Border {
-        color: Color::from_rgb(0.36, 0.56, 0.96),
-        width: 1.5,
-        radius: 5.0.into(),
-    };
-    style
 }
 
 /// Leaf row, not selected: transparent, faint highlight on hover.
