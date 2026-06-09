@@ -114,6 +114,8 @@ enum Message {
     CloseContextMenu,
     // Tunnel dropdown options — act on the current selection.
     MenuEdit,
+    MenuConnect,
+    MenuDisconnect,
     MenuDelete,
     // Folder dropdown options — act on the folder's tunnels.
     FolderConnectAll,
@@ -653,6 +655,20 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             let idxs = checked_indices(app);
             if let [i] = idxs[..] {
                 return update(app, Message::StartEdit(i));
+            }
+            Task::none()
+        }
+        Message::MenuConnect => {
+            app.context_menu = None;
+            for i in checked_indices(app) {
+                set_enabled(app, i, true);
+            }
+            Task::none()
+        }
+        Message::MenuDisconnect => {
+            app.context_menu = None;
+            for i in checked_indices(app) {
+                set_enabled(app, i, false);
             }
             Task::none()
         }
@@ -1372,10 +1388,10 @@ fn menu_panel<'a>(app: &App, menu: &ContextMenu) -> Element<'a, Message> {
         } else {
             TEXT_DARK
         };
-        button(text(label.to_string()).size(12).color(color))
+        button(text(label.to_string()).size(14).color(color))
             .style(row_plain)
             .width(Length::Fill)
-            .padding([5, 10])
+            .padding([7, 12])
             .on_press(msg)
     };
     let mut items = column![].spacing(1);
@@ -1383,13 +1399,15 @@ fn menu_panel<'a>(app: &App, menu: &ContextMenu) -> Element<'a, Message> {
         ContextMenu::Tunnel(_) => {
             let n = app.checked.len();
             if n > 1 {
+                // Multiple selected → bulk actions (no single toggle covers them).
                 items = items.push(
                     text(format!("{n} selected"))
-                        .size(10)
+                        .size(11)
                         .color(Color::from_rgb(0.5, 0.5, 0.56)),
                 );
-            }
-            if n == 1 {
+                items = items.push(item("Connect all", Message::MenuConnect, false));
+                items = items.push(item("Disconnect all", Message::MenuDisconnect, false));
+            } else {
                 items = items.push(item("Edit", Message::MenuEdit, false));
             }
             items = items.push(item("Delete", Message::MenuDelete, true));
@@ -1403,7 +1421,7 @@ fn menu_panel<'a>(app: &App, menu: &ContextMenu) -> Element<'a, Message> {
 
     container(items)
         .padding(4)
-        .width(Length::Fixed(170.0))
+        .width(Length::Fixed(190.0))
         .style(menu_box_style)
         .into()
 }
