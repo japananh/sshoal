@@ -1254,9 +1254,12 @@ fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
         );
     }
     for (i, d) in display.iter().enumerate() {
-        // A line between top-level folder groups.
-        if i != 0 && d.row_idx.is_none() && d.depth == 0 {
-            list = list.push(container(iced::widget::rule::horizontal(1)).padding([4, 2]));
+        // A line between sibling folder groups: before a folder whose previous
+        // row isn't its own parent (i.e. we just finished a sibling's subtree).
+        if d.row_idx.is_none() && i != 0 && display[i - 1].depth >= d.depth {
+            list = list.push(
+                container(iced::widget::rule::horizontal(1).style(rule_style)).padding([3, 4]),
+            );
         }
         list = list.push(tree_row(app, d));
     }
@@ -1297,6 +1300,16 @@ fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
         row![space().width(Length::Fixed(x)), menu_panel(app, menu)],
     ];
     stack![base, backdrop, floating].into()
+}
+
+/// A visible-but-subtle separator line between folder groups.
+fn rule_style(_theme: &iced::Theme) -> iced::widget::rule::Style {
+    iced::widget::rule::Style {
+        color: Color::from_rgb(0.84, 0.84, 0.88),
+        radius: 0.0.into(),
+        fill_mode: iced::widget::rule::FillMode::Full,
+        snap: true,
+    }
 }
 
 /// Padding with only a right inset (the rest zero).
