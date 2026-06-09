@@ -640,7 +640,8 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::WindowOpened(id) => {
             info!(window = ?id, "window opened");
-            Task::none()
+            // Put the cursor in the search box so you can filter by just typing.
+            iced::widget::operation::focus(FILTER_ID)
         }
         Message::WindowClosed(id) => {
             // Forget the window so the next "Open" can spawn a fresh one.
@@ -651,6 +652,10 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         }
     }
 }
+
+/// Widget id for the filter search box, so we can focus it when the window
+/// opens (otherwise typing goes nowhere until you click into it).
+const FILTER_ID: &str = "filter";
 
 /// Is the tunnel filter doing anything right now?
 fn filter_active(app: &App) -> bool {
@@ -1013,7 +1018,8 @@ fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
 
 /// The filter bar: a free-text search (name or folder) plus state chips.
 fn filter_bar(app: &App) -> Element<'_, Message> {
-    let search = text_input("filter…", &app.filter)
+    let search = text_input("Search name or folder (e.g. gc/dev)…", &app.filter)
+        .id(FILTER_ID)
         .size(12)
         .padding([5, 9])
         .style(rounded_input)
