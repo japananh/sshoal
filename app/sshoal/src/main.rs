@@ -638,8 +638,9 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::FolderPress(path) => {
-            // Left-click a folder → open its dropdown (Connect all / Disconnect
-            // all / Delete) at the cursor.
+            // Left-click a folder → select it + open its dropdown at the cursor.
+            app.checked.clear();
+            app.select_anchor = Some(path.clone());
             app.menu_at = app.cursor;
             app.context_menu = Some(ContextMenu::Folder(path));
             Task::none()
@@ -654,11 +655,11 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             {
                 return Task::none();
             }
-            let order: Vec<String> = app
+            // Walk ALL visible rows — folders and tunnels alike.
+            let order: Vec<(String, bool)> = app
                 .display_rows()
                 .into_iter()
-                .filter(|d| d.row_idx.is_some())
-                .map(|d| d.path)
+                .map(|d| (d.path, d.row_idx.is_some()))
                 .collect();
             if order.is_empty() {
                 return Task::none();
@@ -666,15 +667,19 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             let cur = app
                 .select_anchor
                 .as_ref()
-                .and_then(|a| order.iter().position(|p| p == a));
+                .and_then(|a| order.iter().position(|(p, _)| p == a));
             let next = match cur {
                 Some(c) => (c as i32 + delta).rem_euclid(order.len() as i32) as usize,
                 None if delta > 0 => 0,
                 None => order.len() - 1,
             };
-            let path = order[next].clone();
+            let (path, is_leaf) = order[next].clone();
             app.checked.clear();
-            app.checked.insert(path.clone());
+            // A tunnel goes into the selection; a folder is just the cursor (its
+            // highlight keys off `select_anchor`).
+            if is_leaf {
+                app.checked.insert(path.clone());
+            }
             app.select_anchor = Some(path);
             Task::none()
         }
@@ -1340,8 +1345,9 @@ fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
         } else {
             ICON_FOLDER
         };
-        // Folder is "selected" (highlighted) while its dropdown is open.
-        let selected = matches!(&app.context_menu, Some(ContextMenu::Folder(p)) if p == &d.path);
+        // Folder is highlighted while its dropdown is open or it's the cursor.
+        let selected = app.select_anchor.as_deref() == Some(d.path.as_str())
+            || matches!(&app.context_menu, Some(ContextMenu::Folder(p)) if p == &d.path);
         let glyph = button(text(icon).font(LUCIDE).size(15.0).color(FOLDER_BLUE))
             .style(row_plain)
             .padding([2, 4])
@@ -1360,8 +1366,7 @@ fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
                     ..Default::default()
                 }),
         )
-        .on_press(Message::FolderPress(d.path.clone()))
-        .on_right_press(Message::FolderPress(d.path.clone()));
+        .on_press(Message::FolderPress(d.path.clone()));
         return row![indent, glyph, name_area]
             .spacing(6)
             .align_y(iced::Alignment::Center)
