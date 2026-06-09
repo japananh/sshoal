@@ -44,7 +44,7 @@ use sshoal_core::{
 };
 use tracing::info;
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
-use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 #[derive(Debug, Clone, Copy)]
 enum Field {
@@ -383,6 +383,28 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                     for i in 0..app.rows.len() {
                         set_enabled(app, i, true);
                     }
+                }
+            }
+
+            // Left-click the tray icon → toggle the popover window. (Right-click
+            // still opens the menu; the menu's "Open" and ⌃⌘S remain as backups
+            // for when the icon is hidden behind the notch.)
+            let tray_rx = TrayIconEvent::receiver();
+            while let Ok(event) = tray_rx.try_recv() {
+                if matches!(
+                    event,
+                    TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    }
+                ) {
+                    if let Some(id) = app.window {
+                        return window::close(id);
+                    }
+                    let (id, task) = window::open(open_window_settings());
+                    app.window = Some(id);
+                    return Task::batch([task.map(Message::WindowOpened), window::gain_focus(id)]);
                 }
             }
 
@@ -1726,7 +1748,7 @@ fn build_tray() -> (TrayIcon, MenuIds) {
     let tray_menu = Menu::with_items(&[&connect_all, &open, &quit]).expect("build tray menu");
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(tray_menu))
-        .with_menu_on_left_click(true)
+        .with_menu_on_left_click(false)
         .with_icon(make_icon())
         .with_tooltip("sshoal")
         .build();
