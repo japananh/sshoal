@@ -19,8 +19,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use iced::widget::{
-    button, column, container, mouse_area, pick_list, row, scrollable, space, text, text_input,
-    toggler, tooltip,
+    button, column, container, mouse_area, pick_list, row, scrollable, space, stack, text,
+    text_input, toggler, tooltip,
 };
 use iced::{Color, Element, Font, Length, Size, Subscription, Task, Theme, window};
 
@@ -93,9 +93,9 @@ enum Message {
     RowPress(usize),
     RowRightPress(usize),
     ModifiersChanged(iced::keyboard::Modifiers),
+    CursorMoved(iced::Point),
+    CloseContextMenu,
     // Options picked from the dropdown — act on the current selection.
-    MenuConnect,
-    MenuDisconnect,
     MenuEdit,
     MenuDelete,
     ConfirmBulkDelete,
@@ -194,6 +194,10 @@ struct App {
     modifiers: iced::keyboard::Modifiers,
     /// Right-click per-tunnel menu, by row index.
     context_menu: Option<usize>,
+    /// Live cursor position (window coords) for placing the dropdown.
+    cursor: iced::Point,
+    /// Where the dropdown is anchored (cursor at right-click time).
+    menu_at: iced::Point,
     /// Tunnel paths pending a delete confirmation.
     confirm_delete: Option<Vec<String>>,
     /// Free-text filter (matches tunnel name or folder path).
@@ -307,6 +311,8 @@ fn boot(runtime: Arc<tokio::runtime::Runtime>) -> (App, Task<Message>) {
         select_anchor: None,
         modifiers: iced::keyboard::Modifiers::default(),
         context_menu: None,
+        cursor: iced::Point::ORIGIN,
+        menu_at: iced::Point::ORIGIN,
         confirm_delete: None,
         filter: String::new(),
         filter_state: StateFilter::All,
@@ -600,30 +606,25 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::RowRightPress(i) => {
-            // Open the options dropdown. If this row isn't already selected,
-            // select just it first so the menu acts on it.
+            // Open the options dropdown at the cursor. If this row isn't already
+            // selected, select just it first so the menu acts on it.
             if let Some(path) = app.rows.get(i).map(|r| r.tunnel.path.clone()) {
                 if !app.checked.contains(&path) {
                     app.checked.clear();
                     app.checked.insert(path.clone());
                     app.select_anchor = Some(path);
                 }
+                app.menu_at = app.cursor;
                 app.context_menu = Some(i);
             }
             Task::none()
         }
-        Message::MenuConnect => {
-            app.context_menu = None;
-            for i in checked_indices(app) {
-                set_enabled(app, i, true);
-            }
+        Message::CursorMoved(p) => {
+            app.cursor = p;
             Task::none()
         }
-        Message::MenuDisconnect => {
+        Message::CloseContextMenu => {
             app.context_menu = None;
-            for i in checked_indices(app) {
-                set_enabled(app, i, false);
-            }
             Task::none()
         }
         Message::MenuEdit => {
@@ -1130,14 +1131,29 @@ fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
         screen = screen.push(container(chips).padding(pad_r(10.0)));
     }
     screen = screen.push(body);
-    container(screen)
-        .padding(iced::Padding {
-            top: 12.0,
-            right: 2.0,
-            bottom: 12.0,
-            left: 12.0,
-        })
-        .into()
+    let base = container(screen).padding(iced::Padding {
+        top: 12.0,
+        right: 2.0,
+        bottom: 12.0,
+        left: 12.0,
+    });
+
+    // No menu open → just the screen.
+    if app.context_menu.is_none() {
+        return base.into();
+    }
+    // Menu open → float the dropdown over the screen at the cursor, with a
+    // full-window backdrop that dismisses it on any outside click. Nothing in
+    // the base layout shifts.
+    let x = app.menu_at.x.clamp(0.0, 200.0);
+    let y = app.menu_at.y.clamp(0.0, 480.0);
+    let backdrop = mouse_area(space().width(Length::Fill).height(Length::Fill))
+        .on_press(Message::CloseContextMenu);
+    let floating = column![
+        space().height(Length::Fixed(y)),
+        row![space().width(Length::Fixed(x)), menu_panel(app)],
+    ];
+    stack![base, backdrop, floating].into()
 }
 
 /// Padding with only a right inset (the rest zero).
@@ -1249,10 +1265,6 @@ fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
         .align_y(iced::Alignment::Center);
 
     let mut col = column![line].spacing(2);
-    // The options dropdown "drops out" inline under the row that was right-clicked.
-    if app.context_menu == Some(idx) {
-        col = col.push(menu_panel(app, d.depth));
-    }
     if let Some((msg, _)) = &app.rows[idx].notice {
         col = col.push(
             row![
@@ -1267,9 +1279,10 @@ fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
     col.into()
 }
 
-/// The inline options dropdown: connect / disconnect / edit / delete for the
-/// current selection (Edit only when exactly one tunnel is selected).
-fn menu_panel<'a>(app: &App, depth: usize) -> Element<'a, Message> {
+/// The options dropdown: edit / delete for the current selection (Edit only
+/// when exactly one tunnel is selected — connect/disconnect lives on the row's
+/// own toggle). Rendered as a floating overlay positioned at the cursor.
+fn menu_panel<'a>(app: &App) -> Element<'a, Message> {
     let n = app.checked.len();
     let item = |label: &str, msg: Message, danger: bool| {
         let color = if danger {
@@ -1291,22 +1304,16 @@ fn menu_panel<'a>(app: &App, depth: usize) -> Element<'a, Message> {
                 .color(Color::from_rgb(0.5, 0.5, 0.56)),
         );
     }
-    items = items.push(item("Connect", Message::MenuConnect, false));
-    items = items.push(item("Disconnect", Message::MenuDisconnect, false));
     if n == 1 {
         items = items.push(item("Edit", Message::MenuEdit, false));
     }
     items = items.push(item("Delete", Message::MenuDelete, true));
 
-    let panel = container(items)
+    container(items)
         .padding(4)
-        .width(Length::Fixed(180.0))
-        .style(menu_box_style);
-    row![
-        space().width(Length::Fixed(depth as f32 * 14.0 + 20.0)),
-        panel
-    ]
-    .into()
+        .width(Length::Fixed(170.0))
+        .style(menu_box_style)
+        .into()
 }
 
 fn menu_box_style(_theme: &iced::Theme) -> iced::widget::container::Style {
@@ -1846,6 +1853,9 @@ fn subscription(_app: &App) -> Subscription<Message> {
         iced::event::listen_with(|event, _status, _window| match event {
             iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(m)) => {
                 Some(Message::ModifiersChanged(m))
+            }
+            iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
+                Some(Message::CursorMoved(position))
             }
             _ => None,
         }),
