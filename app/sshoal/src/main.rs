@@ -19,8 +19,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use iced::widget::{
-    button, checkbox, column, container, pick_list, row, scrollable, space, text, text_input,
-    toggler, tooltip,
+    button, column, container, mouse_area, pick_list, row, scrollable, space, text, text_input,
+    tooltip,
 };
 use iced::{Color, Element, Font, Length, Size, Subscription, Task, Theme, window};
 
@@ -31,7 +31,6 @@ const ICON_PLUS: &str = "\u{e13d}";
 const ICON_CHEVRON_LEFT: &str = "\u{e06e}";
 const ICON_FOLDER: &str = "\u{e0d7}";
 const ICON_FOLDER_OPEN: &str = "\u{e247}";
-const ICON_TERMINAL: &str = "\u{e181}";
 const ICON_SETTINGS: &str = "\u{e154}";
 const ICON_TRASH: &str = "\u{e18e}";
 const ICON_SEARCH: char = '\u{e151}';
@@ -70,7 +69,6 @@ enum StateFilter {
 enum Message {
     /// Periodic: refresh status dots and poll the tray menu channel.
     Tick,
-    ToggleTunnel(usize),
     ClickFolder(String),
     WindowOpened(window::Id),
     WindowClosed(window::Id),
@@ -89,13 +87,17 @@ enum Message {
     SaveSsh,
     CancelSsh,
     DeleteSsh(usize),
-    // Multi-select (checkboxes) + bulk actions
-    ToggleCheck(String),
-    ToggleCheckFolder(String),
+    // Row interaction: plain click = connect/disconnect, ⌘/Shift-click =
+    // multi-select, right-click = per-tunnel menu.
+    RowPress(usize),
+    RowRightPress(usize),
+    ModifiersChanged(iced::keyboard::Modifiers),
+    CloseContextMenu,
     ClearChecks,
     BulkConnect,
     BulkDisconnect,
     BulkDelete,
+    RowDelete(usize),
     ConfirmBulkDelete,
     CancelBulkDelete,
     OpenTerminal(usize),
@@ -184,9 +186,15 @@ struct App {
     managing_ssh: bool,
     /// In-progress add/edit of an SSH config.
     editing_ssh: Option<SshForm>,
-    /// Checked tunnel paths (leaves) for multi-select bulk actions.
+    /// Multi-selected tunnel paths (⌘/Shift-click) for bulk actions.
     checked: HashSet<String>,
-    /// Tunnel paths pending a bulk-delete confirmation.
+    /// Anchor path for Shift-click range selection.
+    select_anchor: Option<String>,
+    /// Live keyboard modifiers (to interpret clicks).
+    modifiers: iced::keyboard::Modifiers,
+    /// Right-click per-tunnel menu, by row index.
+    context_menu: Option<usize>,
+    /// Tunnel paths pending a delete confirmation.
     confirm_delete: Option<Vec<String>>,
     /// Free-text filter (matches tunnel name or folder path).
     filter: String,
@@ -296,6 +304,9 @@ fn boot(runtime: Arc<tokio::runtime::Runtime>) -> (App, Task<Message>) {
         managing_ssh: false,
         editing_ssh: None,
         checked: HashSet::new(),
+        select_anchor: None,
+        modifiers: iced::keyboard::Modifiers::default(),
+        context_menu: None,
         confirm_delete: None,
         filter: String::new(),
         filter_state: StateFilter::All,
@@ -414,11 +425,6 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             }
             Task::none()
         }
-        Message::ToggleTunnel(i) => {
-            let on = !app.rows.get(i).map(TunnelRow::enabled).unwrap_or(false);
-            set_enabled(app, i, on);
-            Task::none()
-        }
         Message::ClickFolder(path) => {
             if !app.expanded.remove(&path) {
                 app.expanded.insert(path);
@@ -433,6 +439,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::StartEdit(i) => {
+            app.context_menu = None;
             if let Some(row) = app.rows.get(i) {
                 let t = &row.tunnel;
                 app.editing = Some(EditForm {
@@ -541,32 +548,73 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             }
             Task::none()
         }
-        Message::ToggleCheck(path) => {
-            if !app.checked.remove(&path) {
-                app.checked.insert(path);
+        Message::ModifiersChanged(m) => {
+            app.modifiers = m;
+            Task::none()
+        }
+        Message::RowPress(i) => {
+            let Some(path) = app.rows.get(i).map(|r| r.tunnel.path.clone()) else {
+                return Task::none();
+            };
+            if app.modifiers.command() {
+                // ⌘-click: toggle this row in the selection.
+                if !app.checked.remove(&path) {
+                    app.checked.insert(path.clone());
+                }
+                app.select_anchor = Some(path);
+            } else if app.modifiers.shift() {
+                // Shift-click: select the range from the anchor to here.
+                let order: Vec<String> = app
+                    .display_rows()
+                    .into_iter()
+                    .filter(|d| d.row_idx.is_some())
+                    .map(|d| d.path)
+                    .collect();
+                let cur = order.iter().position(|p| p == &path);
+                let anchor = app
+                    .select_anchor
+                    .as_ref()
+                    .and_then(|a| order.iter().position(|p| p == a));
+                match (anchor, cur) {
+                    (Some(a), Some(c)) => {
+                        for p in &order[a.min(c)..=a.max(c)] {
+                            app.checked.insert(p.clone());
+                        }
+                    }
+                    _ => {
+                        app.checked.insert(path.clone());
+                        app.select_anchor = Some(path);
+                    }
+                }
+            } else {
+                // Plain click: clear any multi-selection and toggle the tunnel.
+                app.checked.clear();
+                app.select_anchor = None;
+                let on = !app.rows[i].enabled();
+                set_enabled(app, i, on);
             }
             Task::none()
         }
-        Message::ToggleCheckFolder(path) => {
-            let descendants: Vec<String> = descendant_indices(&app.rows, &path)
-                .into_iter()
-                .map(|i| app.rows[i].tunnel.path.clone())
-                .collect();
-            // If everything under the folder is already checked, uncheck it all;
-            // otherwise check it all.
-            let all_checked =
-                !descendants.is_empty() && descendants.iter().all(|p| app.checked.contains(p));
-            for p in descendants {
-                if all_checked {
-                    app.checked.remove(&p);
-                } else {
-                    app.checked.insert(p);
-                }
+        Message::RowRightPress(i) => {
+            if i < app.rows.len() {
+                app.context_menu = Some(i);
+            }
+            Task::none()
+        }
+        Message::CloseContextMenu => {
+            app.context_menu = None;
+            Task::none()
+        }
+        Message::RowDelete(i) => {
+            app.context_menu = None;
+            if let Some(row) = app.rows.get(i) {
+                app.confirm_delete = Some(vec![row.tunnel.path.clone()]);
             }
             Task::none()
         }
         Message::ClearChecks => {
             app.checked.clear();
+            app.select_anchor = None;
             Task::none()
         }
         Message::BulkConnect => {
@@ -616,6 +664,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::OpenTerminal(i) => {
+            app.context_menu = None;
             if let Some(row) = app.rows.get(i) {
                 let ssh = app.resolve_ssh(&row.tunnel);
                 open_terminal(&ssh);
@@ -831,16 +880,6 @@ fn set_enabled(app: &mut App, i: usize, on: bool) {
     }
 }
 
-/// Row indices whose tunnel sits at or under `folder_path`.
-fn descendant_indices(rows: &[TunnelRow], folder_path: &str) -> Vec<usize> {
-    let prefix = format!("{folder_path}/");
-    rows.iter()
-        .enumerate()
-        .filter(|(_, r)| r.tunnel.path == folder_path || r.tunnel.path.starts_with(&prefix))
-        .map(|(i, _)| i)
-        .collect()
-}
-
 // ---- tree construction ----
 
 #[derive(Default)]
@@ -896,7 +935,6 @@ struct DisplayRow {
     path: String,
     name: String,
     row_idx: Option<usize>, // Some for leaves
-    enabled: bool,
     status: TunnelState,
 }
 
@@ -931,14 +969,12 @@ fn flatten(
         if allowed.is_some() && leaves.is_empty() {
             continue;
         }
-        let enabled = leaves.iter().any(|&i| rows[i].enabled());
         let status = aggregate(leaves.iter().map(|&i| rows[i].status));
         out.push(DisplayRow {
             depth,
             path: path.clone(),
             name: name.clone(),
             row_idx: None,
-            enabled,
             status,
         });
         // A filter forces folders open so matches are always visible.
@@ -956,7 +992,6 @@ fn flatten(
             path: row.tunnel.path.clone(),
             name: row.tunnel.name().to_string(),
             row_idx: Some(idx),
-            enabled: row.enabled(),
             status: row.status,
         });
     }
@@ -1002,6 +1037,11 @@ fn aggregate(states: impl Iterator<Item = TunnelState>) -> TunnelState {
 fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
     if let Some(paths) = &app.confirm_delete {
         return confirm_view(paths);
+    }
+    if let Some(i) = app.context_menu
+        && let Some(row) = app.rows.get(i)
+    {
+        return context_menu_view(i, &row.tunnel);
     }
     if let Some(form) = &app.editing_ssh {
         return ssh_edit_view(form);
@@ -1173,7 +1213,7 @@ fn bulk_bar(app: &App) -> Option<Element<'_, Message>> {
 fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
     let indent = space().width(Length::Fixed(d.depth as f32 * 14.0));
 
-    // Folder: [checkbox over its tunnels] [blue glyph] [name → expand/collapse].
+    // Folder: [blue glyph] [name] — click to expand/collapse.
     let Some(idx) = d.row_idx else {
         let expanded = app.expanded.contains(&d.path);
         let icon = if expanded {
@@ -1181,19 +1221,11 @@ fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
         } else {
             ICON_FOLDER
         };
-        let descendants = descendant_indices(&app.rows, &d.path);
-        let all_checked = !descendants.is_empty()
-            && descendants
-                .iter()
-                .all(|&i| app.checked.contains(&app.rows[i].tunnel.path));
-        let folder_path = d.path.clone();
-        let check = checkbox(all_checked)
-            .size(15)
-            .on_toggle(move |_| Message::ToggleCheckFolder(folder_path.clone()));
-        let label = button(
+        return button(
             row![
+                indent,
                 text(icon).font(LUCIDE).size(15.0).color(FOLDER_BLUE),
-                name_element(&d.name, 13.0, 24, TEXT_DARK),
+                name_element(&d.name, 13.0, 30, TEXT_DARK),
             ]
             .spacing(8)
             .align_y(iced::Alignment::Center),
@@ -1201,50 +1233,41 @@ fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
         .style(row_plain)
         .width(Length::Fill)
         .padding([4, 6])
-        .on_press(Message::ClickFolder(d.path.clone()));
-        return row![indent, check, label]
-            .spacing(8)
-            .align_y(iced::Alignment::Center)
-            .into();
+        .on_press(Message::ClickFolder(d.path.clone()))
+        .into();
     };
 
-    // Leaf: [checkbox] [dot + name → edit] [terminal] [toggle].
-    let leaf_path = d.path.clone();
+    // Leaf: click = connect/disconnect, ⌘/Shift-click = select, right-click =
+    // menu. Selected rows are highlighted; the dot shows connection state.
     let checked = app.checked.contains(&d.path);
-    let check = checkbox(checked)
-        .size(15)
-        .on_toggle(move |_| Message::ToggleCheck(leaf_path.clone()));
-    let name_click = button(
+    let line = container(
         row![
+            indent,
             status_dot(d.status),
-            name_element(&d.name, 13.0, 22, TEXT_DARK)
+            name_element(&d.name, 13.0, 32, TEXT_DARK),
         ]
         .spacing(8)
         .align_y(iced::Alignment::Center),
     )
-    .style(if checked { row_selected } else { row_plain })
     .width(Length::Fill)
-    .padding([3, 6])
-    .on_press(Message::StartEdit(idx));
-    let term = tip(
-        icon_button(ICON_TERMINAL, 15.0, Message::OpenTerminal(idx)),
-        "Open terminal",
-    );
-    let switch = tip(
-        toggler(d.enabled)
-            .size(17)
-            .on_toggle(move |_| Message::ToggleTunnel(idx)),
-        if d.enabled { "Disconnect" } else { "Connect" },
-    );
-    let line = row![indent, check, name_click, term, switch]
-        .spacing(8)
-        .align_y(iced::Alignment::Center);
+    .padding([5, 6])
+    .style(move |_t: &iced::Theme| iced::widget::container::Style {
+        background: checked.then(|| iced::Background::Color(Color::from_rgb(0.80, 0.87, 1.0))),
+        border: iced::Border {
+            radius: 6.0.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let clickable = mouse_area(line)
+        .on_press(Message::RowPress(idx))
+        .on_right_press(Message::RowRightPress(idx));
 
-    let mut col = column![line].spacing(1);
+    let mut col = column![clickable].spacing(1);
     if let Some((msg, _)) = &app.rows[idx].notice {
         col = col.push(
             row![
-                space().width(Length::Fixed(d.depth as f32 * 14.0 + 30.0)),
+                space().width(Length::Fixed(d.depth as f32 * 14.0 + 24.0)),
                 text(msg.clone())
                     .size(11)
                     .color(Color::from_rgb(0.80, 0.40, 0.16)),
@@ -1253,6 +1276,42 @@ fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
         );
     }
     col.into()
+}
+
+/// The right-click per-tunnel menu (rendered as a small action sheet).
+fn context_menu_view(i: usize, tunnel: &Tunnel) -> Element<'_, Message> {
+    let action = |label: &str, msg: Message| {
+        button(text(label.to_string()).size(13))
+            .style(row_plain)
+            .width(Length::Fill)
+            .padding([7, 10])
+            .on_press(msg)
+    };
+    let col = column![
+        text(tunnel.name().to_string()).size(15),
+        text(tunnel.path.clone())
+            .size(11)
+            .color(Color::from_rgb(0.5, 0.5, 0.56)),
+        space().height(Length::Fixed(4.0)),
+        action("Open terminal", Message::OpenTerminal(i)),
+        action("Edit", Message::StartEdit(i)),
+        button(
+            text("Delete")
+                .size(13)
+                .color(Color::from_rgb(0.85, 0.25, 0.25))
+        )
+        .style(row_plain)
+        .width(Length::Fill)
+        .padding([7, 10])
+        .on_press(Message::RowDelete(i)),
+        space().height(Length::Fixed(4.0)),
+        button(text("Cancel").size(13))
+            .style(pill_secondary)
+            .padding([5, 16])
+            .on_press(Message::CloseContextMenu),
+    ]
+    .spacing(4);
+    container(col).padding(16).into()
 }
 
 fn row_style(bg: Option<Color>, radius: f32) -> iced::widget::button::Style {
@@ -1275,11 +1334,6 @@ fn row_plain(_theme: &iced::Theme, status: button::Status) -> iced::widget::butt
         _ => None,
     };
     row_style(bg, 6.0)
-}
-
-/// Leaf row, selected: a light blue highlight.
-fn row_selected(_theme: &iced::Theme, _status: button::Status) -> iced::widget::button::Style {
-    row_style(Some(Color::from_rgb(0.80, 0.87, 1.0)), 6.0)
 }
 
 /// Wrap a control with a hover tooltip.
@@ -1777,6 +1831,12 @@ fn subscription(_app: &App) -> Subscription<Message> {
     Subscription::batch([
         iced::time::every(Duration::from_millis(200)).map(|_| Message::Tick),
         iced::window::close_events().map(Message::WindowClosed),
+        iced::event::listen_with(|event, _status, _window| match event {
+            iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(m)) => {
+                Some(Message::ModifiersChanged(m))
+            }
+            _ => None,
+        }),
     ])
 }
 
