@@ -857,7 +857,7 @@ fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
                 "Delete selected"
             ),
         ]
-        .spacing(2),
+        .spacing(8),
     ]
     .spacing(8)
     .align_y(iced::Alignment::Center);
@@ -1216,11 +1216,8 @@ fn nonempty(s: &str) -> Option<String> {
 fn ssh_list_view(app: &App) -> Element<'_, Message> {
     let header = row![
         tip(
-            button(text(ICON_CHEVRON_LEFT).font(LUCIDE).size(18))
-                .style(button::text)
-                .padding([2, 6])
-                .on_press(Message::CloseSshConfigs),
-            "Back",
+            icon_button(ICON_CHEVRON_LEFT, Message::CloseSshConfigs),
+            "Back"
         ),
         text("SSH configs").size(20).width(Length::Fill),
         row![
@@ -1233,7 +1230,7 @@ fn ssh_list_view(app: &App) -> Element<'_, Message> {
                 "Delete selected"
             ),
         ]
-        .spacing(2),
+        .spacing(8),
     ]
     .spacing(8)
     .align_y(iced::Alignment::Center);
@@ -1267,13 +1264,23 @@ fn ssh_list_view(app: &App) -> Element<'_, Message> {
         .into()
 }
 
-/// A borderless icon button (lucide glyph), e.g. the +/− header actions.
+/// A borderless icon button (lucide glyph) that gets a rounded-square highlight
+/// on hover. Used for the +/− and back header actions.
 fn icon_button<'a>(icon: &'a str, msg: Message) -> Element<'a, Message> {
-    button(text(icon).font(LUCIDE).size(18))
-        .style(button::text)
-        .padding([2, 8])
+    button(text(icon).font(LUCIDE).size(20))
+        .style(icon_btn_style)
+        .padding([4, 7])
         .on_press(msg)
         .into()
+}
+
+fn icon_btn_style(_theme: &iced::Theme, status: button::Status) -> iced::widget::button::Style {
+    let bg = match status {
+        button::Status::Hovered => Some(Color::from_rgb(0.90, 0.90, 0.92)),
+        button::Status::Pressed => Some(Color::from_rgb(0.83, 0.83, 0.86)),
+        _ => None,
+    };
+    row_style(bg, 7.0)
 }
 
 fn ssh_edit_view(form: &SshForm) -> Element<'_, Message> {
