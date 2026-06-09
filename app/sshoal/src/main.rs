@@ -29,8 +29,9 @@ use iced::{Color, Element, Font, Length, Size, Subscription, Task, Theme, window
 const LUCIDE: Font = Font::with_name("lucide");
 const ICON_PLUS: &str = "\u{e13d}";
 const ICON_CHEVRON_LEFT: &str = "\u{e06e}";
+const ICON_CHEVRON_RIGHT: &str = "\u{e06f}";
+const ICON_CHEVRON_DOWN: &str = "\u{e06d}";
 const ICON_FOLDER: &str = "\u{e0d7}";
-const ICON_FOLDER_OPEN: &str = "\u{e247}";
 const ICON_TERMINAL: &str = "\u{e181}";
 const ICON_SETTINGS: &str = "\u{e154}";
 const ICON_SEARCH: char = '\u{e151}';
@@ -1295,39 +1296,51 @@ fn scroll_style(
 fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
     let indent = space().width(Length::Fixed(d.depth as f32 * 14.0));
 
-    // Folder: the glyph toggles expand/collapse; clicking the NAME opens the
-    // folder dropdown (Connect all / Disconnect all / Delete).
+    // Folder: a chevron toggles expand/collapse; left-clicking ANYWHERE else on
+    // the row selects the folder and opens its dropdown.
     let Some(idx) = d.row_idx else {
         let expanded = app.expanded.contains(&d.path);
-        let icon = if expanded {
-            ICON_FOLDER_OPEN
+        let chevron_icon = if expanded {
+            ICON_CHEVRON_DOWN
         } else {
-            ICON_FOLDER
+            ICON_CHEVRON_RIGHT
         };
         // Folder is "selected" (highlighted) while its dropdown is open.
         let selected = matches!(&app.context_menu, Some(ContextMenu::Folder(p)) if p == &d.path);
-        let glyph = button(text(icon).font(LUCIDE).size(15.0).color(FOLDER_BLUE))
-            .style(row_plain)
-            .padding([2, 4])
-            .on_press(Message::ClickFolder(d.path.clone()));
-        let name_area = mouse_area(
-            container(name_element(&d.name, 13.0, 28, TEXT_DARK))
-                .width(Length::Fill)
-                .padding([4, 4])
-                .style(move |_t: &iced::Theme| iced::widget::container::Style {
-                    background: selected
-                        .then(|| iced::Background::Color(Color::from_rgb(0.80, 0.87, 1.0))),
-                    border: iced::Border {
-                        radius: 6.0.into(),
-                        ..Default::default()
-                    },
+        let chevron = button(
+            text(chevron_icon)
+                .font(LUCIDE)
+                .size(13.0)
+                .color(Color::from_rgb(0.45, 0.45, 0.52)),
+        )
+        .style(row_plain)
+        .padding([2, 3])
+        .on_press(Message::ClickFolder(d.path.clone()));
+        let body = mouse_area(
+            container(
+                row![
+                    text(ICON_FOLDER).font(LUCIDE).size(15.0).color(FOLDER_BLUE),
+                    name_element(&d.name, 13.0, 28, TEXT_DARK),
+                ]
+                .spacing(8)
+                .align_y(iced::Alignment::Center),
+            )
+            .width(Length::Fill)
+            .padding([4, 4])
+            .style(move |_t: &iced::Theme| iced::widget::container::Style {
+                background: selected
+                    .then(|| iced::Background::Color(Color::from_rgb(0.80, 0.87, 1.0))),
+                border: iced::Border {
+                    radius: 6.0.into(),
                     ..Default::default()
-                }),
+                },
+                ..Default::default()
+            }),
         )
         .on_press(Message::FolderPress(d.path.clone()))
         .on_right_press(Message::FolderPress(d.path.clone()));
-        return row![indent, glyph, name_area]
-            .spacing(6)
+        return row![indent, chevron, body]
+            .spacing(4)
             .align_y(iced::Alignment::Center)
             .into();
     };
