@@ -213,8 +213,10 @@ struct App {
     editing_ssh: Option<SshForm>,
     /// Multi-selected tunnel paths (⌘/Shift-click) for bulk actions.
     checked: HashSet<String>,
-    /// Anchor path for Shift-click range selection.
+    /// Fixed anchor for Shift range selection (click or arrow).
     select_anchor: Option<String>,
+    /// Moving end of a Shift+arrow range (the row the cursor is on).
+    select_cursor: Option<String>,
     /// Live keyboard modifiers (to interpret clicks).
     modifiers: iced::keyboard::Modifiers,
     /// The open options dropdown (tunnel selection or folder).
@@ -335,6 +337,7 @@ fn boot(runtime: Arc<tokio::runtime::Runtime>) -> (App, Task<Message>) {
         editing_ssh: None,
         checked: HashSet::new(),
         select_anchor: None,
+        select_cursor: None,
         modifiers: iced::keyboard::Modifiers::default(),
         context_menu: None,
         cursor: iced::Point::ORIGIN,
@@ -593,7 +596,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 if !app.checked.remove(&path) {
                     app.checked.insert(path.clone());
                 }
-                app.select_anchor = Some(path);
+                app.select_anchor = Some(path.clone());
             } else if app.modifiers.shift() {
                 let order: Vec<String> = app
                     .display_rows()
@@ -614,14 +617,15 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                     }
                     _ => {
                         app.checked.insert(path.clone());
-                        app.select_anchor = Some(path);
+                        app.select_anchor = Some(path.clone());
                     }
                 }
             } else {
                 app.checked.clear();
                 app.checked.insert(path.clone());
-                app.select_anchor = Some(path);
+                app.select_anchor = Some(path.clone());
             }
+            app.select_cursor = Some(path);
             Task::none()
         }
         Message::RowRightPress(i) => {
@@ -642,6 +646,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             // Left-click a folder → select it + open its dropdown at the cursor.
             app.checked.clear();
             app.select_anchor = Some(path.clone());
+            app.select_cursor = Some(path.clone());
             app.menu_at = app.cursor;
             app.context_menu = Some(ContextMenu::Folder(path));
             Task::none()
@@ -665,23 +670,42 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             if order.is_empty() {
                 return Task::none();
             }
-            let cur = app
-                .select_anchor
-                .as_ref()
-                .and_then(|a| order.iter().position(|(p, _)| p == a));
-            let next = match cur {
-                Some(c) => (c as i32 + delta).rem_euclid(order.len() as i32) as usize,
+            let pos = |p: &Option<String>| {
+                p.as_ref()
+                    .and_then(|x| order.iter().position(|(q, _)| q == x))
+            };
+            // The moving end starts from the current cursor (or anchor).
+            let end = pos(&app.select_cursor).or_else(|| pos(&app.select_anchor));
+            let next = match end {
+                Some(e) => (e as i32 + delta).clamp(0, order.len() as i32 - 1) as usize,
                 None if delta > 0 => 0,
                 None => order.len() - 1,
             };
-            let (path, is_leaf) = order[next].clone();
-            app.checked.clear();
-            // A tunnel goes into the selection; a folder is just the cursor (its
-            // highlight keys off `select_anchor`).
-            if is_leaf {
-                app.checked.insert(path.clone());
+
+            if app.modifiers.shift() {
+                // Extend: select every tunnel between the anchor and the new end.
+                let anchor = pos(&app.select_anchor).unwrap_or(next);
+                if app.select_anchor.is_none() {
+                    app.select_anchor = Some(order[anchor].0.clone());
+                }
+                app.checked.clear();
+                let (lo, hi) = (anchor.min(next), anchor.max(next));
+                for (p, is_leaf) in order.iter().take(hi + 1).skip(lo) {
+                    if *is_leaf {
+                        app.checked.insert(p.clone());
+                    }
+                }
+                app.select_cursor = Some(order[next].0.clone());
+            } else {
+                // Plain move: single selection; reset the anchor here.
+                let (path, is_leaf) = order[next].clone();
+                app.checked.clear();
+                if is_leaf {
+                    app.checked.insert(path.clone());
+                }
+                app.select_anchor = Some(path.clone());
+                app.select_cursor = Some(path);
             }
-            app.select_anchor = Some(path);
             Task::none()
         }
         Message::CursorMoved(p) => {
