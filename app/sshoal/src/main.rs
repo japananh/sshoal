@@ -65,6 +65,22 @@ enum StateFilter {
     Disconnected,
 }
 
+/// The open dropdown: a tunnel's row (acts on the selection) or a folder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ContextMenu {
+    Tunnel(usize),
+    Folder(String),
+}
+
+/// What a pending delete-confirmation will remove.
+#[derive(Debug, Clone)]
+enum PendingDelete {
+    /// Tunnels by `path`.
+    Tunnels(Vec<String>),
+    /// An SSH config by `name`.
+    Ssh(String),
+}
+
 #[derive(Debug, Clone)]
 enum Message {
     /// Periodic: refresh status dots and poll the tray menu channel.
@@ -92,14 +108,20 @@ enum Message {
     // right-click = inline options dropdown.
     RowPress(usize),
     RowRightPress(usize),
+    FolderPress(String),
     ModifiersChanged(iced::keyboard::Modifiers),
     CursorMoved(iced::Point),
     CloseContextMenu,
-    // Options picked from the dropdown — act on the current selection.
+    // Tunnel dropdown options — act on the current selection.
     MenuEdit,
     MenuDelete,
-    ConfirmBulkDelete,
-    CancelBulkDelete,
+    // Folder dropdown options — act on the folder's tunnels.
+    FolderConnectAll,
+    FolderDisconnectAll,
+    FolderDelete,
+    // Delete confirmation (every delete is confirmed).
+    ConfirmDelete,
+    CancelDelete,
     OpenTerminal(usize),
     // Filter bar (tunnels screen)
     FilterInput(String),
@@ -192,14 +214,14 @@ struct App {
     select_anchor: Option<String>,
     /// Live keyboard modifiers (to interpret clicks).
     modifiers: iced::keyboard::Modifiers,
-    /// Right-click per-tunnel menu, by row index.
-    context_menu: Option<usize>,
+    /// The open options dropdown (tunnel selection or folder).
+    context_menu: Option<ContextMenu>,
     /// Live cursor position (window coords) for placing the dropdown.
     cursor: iced::Point,
-    /// Where the dropdown is anchored (cursor at right-click time).
+    /// Where the dropdown is anchored (cursor when it opened).
     menu_at: iced::Point,
-    /// Tunnel paths pending a delete confirmation.
-    confirm_delete: Option<Vec<String>>,
+    /// A delete awaiting confirmation (every delete is confirmed).
+    confirm_delete: Option<PendingDelete>,
     /// Free-text filter (matches tunnel name or folder path).
     filter: String,
     /// Connection-state filter.
@@ -481,16 +503,10 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::DeleteTunnel(i) => {
-            app.editing = None;
-            if i < app.rows.len() {
-                let mut row = app.rows.remove(i);
-                if let Some(sup) = row.supervisor.take() {
-                    sup.cancel();
-                }
-                info!(tunnel = %row.tunnel.path, "delete");
-                app.checked.remove(&row.tunnel.path);
-                app.expanded = all_folder_paths(&app.rows);
-                persist(&app.rows, &app.ssh_configs);
+            // Ask first — every delete is confirmed.
+            if let Some(row) = app.rows.get(i) {
+                app.editing = None;
+                app.confirm_delete = Some(PendingDelete::Tunnels(vec![row.tunnel.path.clone()]));
             }
             Task::none()
         }
@@ -546,11 +562,9 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::DeleteSsh(i) => {
-            app.editing_ssh = None;
-            if i < app.ssh_configs.len() {
-                let removed = app.ssh_configs.remove(i);
-                info!(ssh = %removed.name, "delete ssh config");
-                persist(&app.rows, &app.ssh_configs);
+            if let Some(c) = app.ssh_configs.get(i) {
+                app.editing_ssh = None;
+                app.confirm_delete = Some(PendingDelete::Ssh(c.name.clone()));
             }
             Task::none()
         }
@@ -615,8 +629,15 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                     app.select_anchor = Some(path);
                 }
                 app.menu_at = app.cursor;
-                app.context_menu = Some(i);
+                app.context_menu = Some(ContextMenu::Tunnel(i));
             }
+            Task::none()
+        }
+        Message::FolderPress(path) => {
+            // Left-click a folder → open its dropdown (Connect all / Disconnect
+            // all / Delete) at the cursor.
+            app.menu_at = app.cursor;
+            app.context_menu = Some(ContextMenu::Folder(path));
             Task::none()
         }
         Message::CursorMoved(p) => {
@@ -642,31 +663,73 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 .map(|i| app.rows[i].tunnel.path.clone())
                 .collect();
             if !paths.is_empty() {
-                app.confirm_delete = Some(paths);
+                app.confirm_delete = Some(PendingDelete::Tunnels(paths));
             }
             Task::none()
         }
-        Message::CancelBulkDelete => {
+        Message::FolderConnectAll => {
+            let folder = context_folder(app);
+            app.context_menu = None;
+            if let Some(path) = folder {
+                for i in descendant_indices(&app.rows, &path) {
+                    set_enabled(app, i, true);
+                }
+            }
+            Task::none()
+        }
+        Message::FolderDisconnectAll => {
+            let folder = context_folder(app);
+            app.context_menu = None;
+            if let Some(path) = folder {
+                for i in descendant_indices(&app.rows, &path) {
+                    set_enabled(app, i, false);
+                }
+            }
+            Task::none()
+        }
+        Message::FolderDelete => {
+            let folder = context_folder(app);
+            app.context_menu = None;
+            if let Some(path) = folder {
+                let paths: Vec<String> = descendant_indices(&app.rows, &path)
+                    .into_iter()
+                    .map(|i| app.rows[i].tunnel.path.clone())
+                    .collect();
+                if !paths.is_empty() {
+                    app.confirm_delete = Some(PendingDelete::Tunnels(paths));
+                }
+            }
+            Task::none()
+        }
+        Message::CancelDelete => {
             app.confirm_delete = None;
             Task::none()
         }
-        Message::ConfirmBulkDelete => {
-            if let Some(paths) = app.confirm_delete.take() {
-                let doomed: HashSet<String> = paths.into_iter().collect();
-                for row in &mut app.rows {
-                    if doomed.contains(&row.tunnel.path)
-                        && let Some(sup) = row.supervisor.take()
-                    {
-                        sup.cancel();
+        Message::ConfirmDelete => {
+            match app.confirm_delete.take() {
+                Some(PendingDelete::Tunnels(paths)) => {
+                    let doomed: HashSet<String> = paths.into_iter().collect();
+                    for row in &mut app.rows {
+                        if doomed.contains(&row.tunnel.path)
+                            && let Some(sup) = row.supervisor.take()
+                        {
+                            sup.cancel();
+                        }
                     }
+                    app.rows.retain(|r| !doomed.contains(&r.tunnel.path));
+                    for p in &doomed {
+                        app.checked.remove(p);
+                    }
+                    info!(count = doomed.len(), "delete tunnels");
+                    app.expanded = all_folder_paths(&app.rows);
+                    persist(&app.rows, &app.ssh_configs);
                 }
-                app.rows.retain(|r| !doomed.contains(&r.tunnel.path));
-                for p in &doomed {
-                    app.checked.remove(p);
+                Some(PendingDelete::Ssh(name)) => {
+                    app.ssh_configs.retain(|c| c.name != name);
+                    info!(ssh = %name, "delete ssh config");
+                    persist(&app.rows, &app.ssh_configs);
                 }
-                info!(count = doomed.len(), "bulk delete");
-                app.expanded = all_folder_paths(&app.rows);
-                persist(&app.rows, &app.ssh_configs);
+                None => {}
             }
             Task::none()
         }
@@ -711,6 +774,24 @@ fn checked_indices(app: &App) -> Vec<usize> {
         .iter()
         .enumerate()
         .filter(|(_, r)| app.checked.contains(&r.tunnel.path))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// The folder path of the open folder dropdown, if any.
+fn context_folder(app: &App) -> Option<String> {
+    match &app.context_menu {
+        Some(ContextMenu::Folder(p)) => Some(p.clone()),
+        _ => None,
+    }
+}
+
+/// Row indices whose tunnel sits at or under `folder_path`.
+fn descendant_indices(rows: &[TunnelRow], folder_path: &str) -> Vec<usize> {
+    let prefix = format!("{folder_path}/");
+    rows.iter()
+        .enumerate()
+        .filter(|(_, r)| r.tunnel.path == folder_path || r.tunnel.path.starts_with(&prefix))
         .map(|(i, _)| i)
         .collect()
 }
@@ -1046,8 +1127,8 @@ fn aggregate(states: impl Iterator<Item = TunnelState>) -> TunnelState {
 // ---- view ----
 
 fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
-    if let Some(paths) = &app.confirm_delete {
-        return confirm_view(paths);
+    if let Some(pending) = &app.confirm_delete {
+        return confirm_view(pending);
     }
     if let Some(form) = &app.editing_ssh {
         return ssh_edit_view(form);
@@ -1139,9 +1220,9 @@ fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
     });
 
     // No menu open → just the screen.
-    if app.context_menu.is_none() {
+    let Some(menu) = &app.context_menu else {
         return base.into();
-    }
+    };
     // Menu open → float the dropdown over the screen at the cursor, with a
     // full-window backdrop that dismisses it on any outside click. Nothing in
     // the base layout shifts.
@@ -1151,7 +1232,7 @@ fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
         .on_press(Message::CloseContextMenu);
     let floating = column![
         space().height(Length::Fixed(y)),
-        row![space().width(Length::Fixed(x)), menu_panel(app)],
+        row![space().width(Length::Fixed(x)), menu_panel(app, menu)],
     ];
     stack![base, backdrop, floating].into()
 }
@@ -1198,7 +1279,8 @@ fn scroll_style(
 fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
     let indent = space().width(Length::Fixed(d.depth as f32 * 14.0));
 
-    // Folder: [blue glyph] [name] — click to expand/collapse.
+    // Folder: the glyph toggles expand/collapse; clicking the NAME opens the
+    // folder dropdown (Connect all / Disconnect all / Delete).
     let Some(idx) = d.row_idx else {
         let expanded = app.expanded.contains(&d.path);
         let icon = if expanded {
@@ -1206,20 +1288,21 @@ fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
         } else {
             ICON_FOLDER
         };
-        return button(
-            row![
-                indent,
-                text(icon).font(LUCIDE).size(15.0).color(FOLDER_BLUE),
-                name_element(&d.name, 13.0, 30, TEXT_DARK),
-            ]
-            .spacing(8)
-            .align_y(iced::Alignment::Center),
+        let glyph = button(text(icon).font(LUCIDE).size(15.0).color(FOLDER_BLUE))
+            .style(row_plain)
+            .padding([2, 4])
+            .on_press(Message::ClickFolder(d.path.clone()));
+        let name_area = mouse_area(
+            container(name_element(&d.name, 13.0, 28, TEXT_DARK))
+                .width(Length::Fill)
+                .padding([4, 4]),
         )
-        .style(row_plain)
-        .width(Length::Fill)
-        .padding([4, 6])
-        .on_press(Message::ClickFolder(d.path.clone()))
-        .into();
+        .on_press(Message::FolderPress(d.path.clone()))
+        .on_right_press(Message::FolderPress(d.path.clone()));
+        return row![indent, glyph, name_area]
+            .spacing(6)
+            .align_y(iced::Alignment::Center)
+            .into();
     };
 
     // Leaf: the name area SELECTS on click (⌘/Shift to multi-select) and opens
@@ -1279,11 +1362,10 @@ fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
     col.into()
 }
 
-/// The options dropdown: edit / delete for the current selection (Edit only
-/// when exactly one tunnel is selected — connect/disconnect lives on the row's
-/// own toggle). Rendered as a floating overlay positioned at the cursor.
-fn menu_panel<'a>(app: &App) -> Element<'a, Message> {
-    let n = app.checked.len();
+/// The floating options dropdown. For a tunnel selection: Edit (only when
+/// exactly one is selected) + Delete (connect/disconnect lives on the row
+/// toggle). For a folder: Connect all / Disconnect all / Delete.
+fn menu_panel<'a>(app: &App, menu: &ContextMenu) -> Element<'a, Message> {
     let item = |label: &str, msg: Message, danger: bool| {
         let color = if danger {
             Color::from_rgb(0.85, 0.25, 0.25)
@@ -1297,17 +1379,27 @@ fn menu_panel<'a>(app: &App) -> Element<'a, Message> {
             .on_press(msg)
     };
     let mut items = column![].spacing(1);
-    if n > 1 {
-        items = items.push(
-            text(format!("{n} selected"))
-                .size(10)
-                .color(Color::from_rgb(0.5, 0.5, 0.56)),
-        );
+    match menu {
+        ContextMenu::Tunnel(_) => {
+            let n = app.checked.len();
+            if n > 1 {
+                items = items.push(
+                    text(format!("{n} selected"))
+                        .size(10)
+                        .color(Color::from_rgb(0.5, 0.5, 0.56)),
+                );
+            }
+            if n == 1 {
+                items = items.push(item("Edit", Message::MenuEdit, false));
+            }
+            items = items.push(item("Delete", Message::MenuDelete, true));
+        }
+        ContextMenu::Folder(_) => {
+            items = items.push(item("Connect all", Message::FolderConnectAll, false));
+            items = items.push(item("Disconnect all", Message::FolderDisconnectAll, false));
+            items = items.push(item("Delete", Message::FolderDelete, true));
+        }
     }
-    if n == 1 {
-        items = items.push(item("Edit", Message::MenuEdit, false));
-    }
-    items = items.push(item("Delete", Message::MenuDelete, true));
 
     container(items)
         .padding(4)
@@ -1795,40 +1887,45 @@ fn ssh_edit_view(form: &SshForm) -> Element<'_, Message> {
     container(col).padding(16).into()
 }
 
-fn confirm_view(paths: &[String]) -> Element<'_, Message> {
-    let mut col = column![
-        text(format!("Delete {} tunnel(s)?", paths.len())).size(18),
-        text("This permanently removes them from sshoal. It can't be undone.").size(13),
-    ]
-    .spacing(10);
+fn confirm_view(pending: &PendingDelete) -> Element<'_, Message> {
+    let (title, listing): (String, Element<Message>) = match pending {
+        PendingDelete::Tunnels(paths) => {
+            let mut items = column![].spacing(2);
+            for p in paths.iter().take(8) {
+                items = items.push(text(format!("• {p}")).size(12).color(TEXT_DARK));
+            }
+            if paths.len() > 8 {
+                items = items.push(
+                    text(format!("…and {} more", paths.len() - 8))
+                        .size(12)
+                        .color(Color::from_rgb(0.5, 0.5, 0.56)),
+                );
+            }
+            (format!("Delete {} tunnel(s)?", paths.len()), items.into())
+        }
+        PendingDelete::Ssh(name) => (
+            "Delete SSH config?".to_string(),
+            text(format!("• {name}")).size(12).color(TEXT_DARK).into(),
+        ),
+    };
 
-    // Show up to a handful of the paths so it's clear what's going.
-    let mut listing = column![].spacing(2);
-    for p in paths.iter().take(8) {
-        listing = listing.push(text(format!("• {p}")).size(12).color(TEXT_DARK));
-    }
-    if paths.len() > 8 {
-        listing = listing.push(
-            text(format!("…and {} more", paths.len() - 8))
-                .size(12)
-                .color(Color::from_rgb(0.5, 0.5, 0.56)),
-        );
-    }
-    col = col.push(listing);
-
-    col = col.push(
+    let col = column![
+        text(title).size(18),
+        text("This can't be undone.").size(13),
+        listing,
         row![
             button(text("Delete").size(13))
                 .style(pill_danger)
                 .padding([5, 16])
-                .on_press(Message::ConfirmBulkDelete),
+                .on_press(Message::ConfirmDelete),
             button(text("Cancel").size(13))
                 .style(pill_secondary)
                 .padding([5, 16])
-                .on_press(Message::CancelBulkDelete),
+                .on_press(Message::CancelDelete),
         ]
         .spacing(10),
-    );
+    ]
+    .spacing(10);
     container(col).padding(16).into()
 }
 
