@@ -1524,12 +1524,19 @@ fn name_element<'a>(name: &str, size: f32, max: usize, color: Color) -> Element<
 }
 
 fn tooltip_bubble(_theme: &iced::Theme) -> iced::widget::container::Style {
+    // Light bubble (the default near-black one was hard to read).
     iced::widget::container::Style {
-        background: Some(iced::Background::Color(Color::from_rgb(0.15, 0.15, 0.18))),
-        text_color: Some(Color::from_rgb(0.96, 0.96, 0.98)),
+        background: Some(iced::Background::Color(Color::from_rgb(0.99, 0.99, 1.0))),
+        text_color: Some(TEXT_DARK),
         border: iced::Border {
+            color: Color::from_rgb(0.78, 0.78, 0.82),
+            width: 1.0,
             radius: 6.0.into(),
-            ..Default::default()
+        },
+        shadow: iced::Shadow {
+            color: Color::from_rgba(0.0, 0.0, 0.0, 0.12),
+            offset: iced::Vector::new(0.0, 2.0),
+            blur_radius: 6.0,
         },
         ..Default::default()
     }
