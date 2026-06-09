@@ -621,9 +621,9 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                     }
                 }
             } else {
-                app.checked.clear();
-                app.checked.insert(path.clone());
-                app.select_anchor = Some(path.clone());
+                // Plain click → open the edit screen. (⌘/Shift-click select; the
+                // right-click menu handles bulk actions.)
+                return update(app, Message::StartEdit(i));
             }
             app.select_cursor = Some(path);
             Task::none()
