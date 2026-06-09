@@ -263,7 +263,8 @@ impl App {
             .filter(|(_, r)| {
                 let name_ok = q.is_empty()
                     || r.tunnel.path.to_lowercase().contains(&q)
-                    || r.tunnel.name().to_lowercase().contains(&q);
+                    || r.tunnel.name().to_lowercase().contains(&q)
+                    || r.tunnel.local_port.to_string().contains(&q);
                 let state_ok = match self.filter_state {
                     StateFilter::All => true,
                     StateFilter::Connected => r.enabled(),
@@ -1198,7 +1199,7 @@ fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
     }
 
     // Compact header: search box (with a leading magnifier) + settings + add.
-    let search = text_input("Search name or folder (e.g. gc/dev)…", &app.filter)
+    let search = text_input("Search name, folder or port…", &app.filter)
         .id(FILTER_ID)
         .size(13)
         .padding([6, 9])
@@ -1252,7 +1253,11 @@ fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
                 .color(Color::from_rgb(0.5, 0.5, 0.56)),
         );
     }
-    for d in &display {
+    for (i, d) in display.iter().enumerate() {
+        // A line between top-level folder groups.
+        if i != 0 && d.row_idx.is_none() && d.depth == 0 {
+            list = list.push(container(iced::widget::rule::horizontal(1)).padding([4, 2]));
+        }
         list = list.push(tree_row(app, d));
     }
 
@@ -1334,7 +1339,7 @@ fn scroll_style(
 }
 
 fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
-    let indent = space().width(Length::Fixed(d.depth as f32 * 14.0));
+    let indent = space().width(Length::Fixed(d.depth as f32 * 10.0));
 
     // Folder: clicking the glyph 📁/📂 expands/collapses (as before); left-click
     // the name opens the folder dropdown.
@@ -1377,12 +1382,16 @@ fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
     // the options dropdown on right-click — it never connects. The terminal icon
     // and the toggle (which does connect/disconnect) are separate controls.
     let checked = app.checked.contains(&d.path);
+    let port = app.rows[idx].tunnel.local_port;
     let name_area = mouse_area(
         container(
             row![
                 indent,
                 status_dot(d.status),
-                name_element(&d.name, 13.0, 26, TEXT_DARK),
+                name_element(&d.name, 13.0, 22, TEXT_DARK),
+                text(format!(":{port}"))
+                    .size(11)
+                    .color(Color::from_rgb(0.5, 0.5, 0.56)),
             ]
             .spacing(8)
             .align_y(iced::Alignment::Center),
@@ -1419,7 +1428,7 @@ fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
     if let Some((msg, _)) = &app.rows[idx].notice {
         col = col.push(
             row![
-                space().width(Length::Fixed(d.depth as f32 * 14.0 + 24.0)),
+                space().width(Length::Fixed(d.depth as f32 * 10.0 + 24.0)),
                 text(msg.clone())
                     .size(11)
                     .color(Color::from_rgb(0.80, 0.40, 0.16)),
