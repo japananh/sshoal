@@ -1304,6 +1304,8 @@ fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
         } else {
             ICON_FOLDER
         };
+        // Folder is "selected" (highlighted) while its dropdown is open.
+        let selected = matches!(&app.context_menu, Some(ContextMenu::Folder(p)) if p == &d.path);
         let glyph = button(text(icon).font(LUCIDE).size(15.0).color(FOLDER_BLUE))
             .style(row_plain)
             .padding([2, 4])
@@ -1311,7 +1313,16 @@ fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
         let name_area = mouse_area(
             container(name_element(&d.name, 13.0, 28, TEXT_DARK))
                 .width(Length::Fill)
-                .padding([4, 4]),
+                .padding([4, 4])
+                .style(move |_t: &iced::Theme| iced::widget::container::Style {
+                    background: selected
+                        .then(|| iced::Background::Color(Color::from_rgb(0.80, 0.87, 1.0))),
+                    border: iced::Border {
+                        radius: 6.0.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
         )
         .on_press(Message::FolderPress(d.path.clone()))
         .on_right_press(Message::FolderPress(d.path.clone()));
