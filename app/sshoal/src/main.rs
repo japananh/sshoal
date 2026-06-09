@@ -609,7 +609,22 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 return match key {
                     Key::Named(Named::ArrowUp) => update(app, Message::SelectDelta(-1)),
                     Key::Named(Named::ArrowDown) => update(app, Message::SelectDelta(1)),
-                    Key::Named(Named::Enter) => activate_selected(app),
+                    Key::Named(Named::Enter) => {
+                        // While filtering (e.g. typing "gc/dev"), Enter just
+                        // commits the search: keep the filtered list visible and
+                        // move the cursor to the first match — never open an edit
+                        // form (click a row to edit a filtered tunnel).
+                        if filter_active(app) {
+                            let items = app.selectable();
+                            let keep = app.selected.as_ref().is_some_and(|s| items.contains(s));
+                            if !keep {
+                                app.selected = items.into_iter().next();
+                            }
+                            Task::none()
+                        } else {
+                            activate_selected(app)
+                        }
+                    }
                     _ => Task::none(),
                 };
             }
@@ -635,6 +650,11 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
     }
+}
+
+/// Is the tunnel filter doing anything right now?
+fn filter_active(app: &App) -> bool {
+    !app.filter.trim().is_empty() || app.filter_state != StateFilter::All
 }
 
 /// Enter on the current selection: edit an ssh config / leaf tunnel, or
