@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use iced::widget::{
     button, column, container, mouse_area, pick_list, row, scrollable, space, text, text_input,
-    tooltip,
+    toggler, tooltip,
 };
 use iced::{Color, Element, Font, Length, Size, Subscription, Task, Theme, window};
 
@@ -31,8 +31,8 @@ const ICON_PLUS: &str = "\u{e13d}";
 const ICON_CHEVRON_LEFT: &str = "\u{e06e}";
 const ICON_FOLDER: &str = "\u{e0d7}";
 const ICON_FOLDER_OPEN: &str = "\u{e247}";
+const ICON_TERMINAL: &str = "\u{e181}";
 const ICON_SETTINGS: &str = "\u{e154}";
-const ICON_TRASH: &str = "\u{e18e}";
 const ICON_SEARCH: char = '\u{e151}';
 /// Blue used for the folder glyph (and a selected folder's name).
 const FOLDER_BLUE: Color = Color::from_rgb(0.20, 0.50, 0.95);
@@ -87,17 +87,17 @@ enum Message {
     SaveSsh,
     CancelSsh,
     DeleteSsh(usize),
-    // Row interaction: plain click = connect/disconnect, ⌘/Shift-click =
-    // multi-select, right-click = per-tunnel menu.
+    ToggleTunnel(usize),
+    // Row interaction: click = select (never connect), ⌘/Shift-click = multi,
+    // right-click = inline options dropdown.
     RowPress(usize),
     RowRightPress(usize),
     ModifiersChanged(iced::keyboard::Modifiers),
-    CloseContextMenu,
-    ClearChecks,
-    BulkConnect,
-    BulkDisconnect,
-    BulkDelete,
-    RowDelete(usize),
+    // Options picked from the dropdown — act on the current selection.
+    MenuConnect,
+    MenuDisconnect,
+    MenuEdit,
+    MenuDelete,
     ConfirmBulkDelete,
     CancelBulkDelete,
     OpenTerminal(usize),
@@ -552,18 +552,24 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.modifiers = m;
             Task::none()
         }
+        Message::ToggleTunnel(i) => {
+            let on = !app.rows.get(i).map(TunnelRow::enabled).unwrap_or(false);
+            set_enabled(app, i, on);
+            Task::none()
+        }
         Message::RowPress(i) => {
+            // Click SELECTS (never connects). ⌘ toggles one in/out; Shift extends
+            // a range; a plain click selects just this row.
+            app.context_menu = None;
             let Some(path) = app.rows.get(i).map(|r| r.tunnel.path.clone()) else {
                 return Task::none();
             };
             if app.modifiers.command() {
-                // ⌘-click: toggle this row in the selection.
                 if !app.checked.remove(&path) {
                     app.checked.insert(path.clone());
                 }
                 app.select_anchor = Some(path);
             } else if app.modifiers.shift() {
-                // Shift-click: select the range from the anchor to here.
                 let order: Vec<String> = app
                     .display_rows()
                     .into_iter()
@@ -587,49 +593,49 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                     }
                 }
             } else {
-                // Plain click: clear any multi-selection and toggle the tunnel.
                 app.checked.clear();
-                app.select_anchor = None;
-                let on = !app.rows[i].enabled();
-                set_enabled(app, i, on);
+                app.checked.insert(path.clone());
+                app.select_anchor = Some(path);
             }
             Task::none()
         }
         Message::RowRightPress(i) => {
-            if i < app.rows.len() {
+            // Open the options dropdown. If this row isn't already selected,
+            // select just it first so the menu acts on it.
+            if let Some(path) = app.rows.get(i).map(|r| r.tunnel.path.clone()) {
+                if !app.checked.contains(&path) {
+                    app.checked.clear();
+                    app.checked.insert(path.clone());
+                    app.select_anchor = Some(path);
+                }
                 app.context_menu = Some(i);
             }
             Task::none()
         }
-        Message::CloseContextMenu => {
+        Message::MenuConnect => {
             app.context_menu = None;
-            Task::none()
-        }
-        Message::RowDelete(i) => {
-            app.context_menu = None;
-            if let Some(row) = app.rows.get(i) {
-                app.confirm_delete = Some(vec![row.tunnel.path.clone()]);
-            }
-            Task::none()
-        }
-        Message::ClearChecks => {
-            app.checked.clear();
-            app.select_anchor = None;
-            Task::none()
-        }
-        Message::BulkConnect => {
             for i in checked_indices(app) {
                 set_enabled(app, i, true);
             }
             Task::none()
         }
-        Message::BulkDisconnect => {
+        Message::MenuDisconnect => {
+            app.context_menu = None;
             for i in checked_indices(app) {
                 set_enabled(app, i, false);
             }
             Task::none()
         }
-        Message::BulkDelete => {
+        Message::MenuEdit => {
+            app.context_menu = None;
+            let idxs = checked_indices(app);
+            if let [i] = idxs[..] {
+                return update(app, Message::StartEdit(i));
+            }
+            Task::none()
+        }
+        Message::MenuDelete => {
+            app.context_menu = None;
             let paths: Vec<String> = checked_indices(app)
                 .into_iter()
                 .map(|i| app.rows[i].tunnel.path.clone())
@@ -935,6 +941,7 @@ struct DisplayRow {
     path: String,
     name: String,
     row_idx: Option<usize>, // Some for leaves
+    enabled: bool,
     status: TunnelState,
 }
 
@@ -969,12 +976,14 @@ fn flatten(
         if allowed.is_some() && leaves.is_empty() {
             continue;
         }
+        let enabled = leaves.iter().any(|&i| rows[i].enabled());
         let status = aggregate(leaves.iter().map(|&i| rows[i].status));
         out.push(DisplayRow {
             depth,
             path: path.clone(),
             name: name.clone(),
             row_idx: None,
+            enabled,
             status,
         });
         // A filter forces folders open so matches are always visible.
@@ -992,6 +1001,7 @@ fn flatten(
             path: row.tunnel.path.clone(),
             name: row.tunnel.name().to_string(),
             row_idx: Some(idx),
+            enabled: row.enabled(),
             status: row.status,
         });
     }
@@ -1037,11 +1047,6 @@ fn aggregate(states: impl Iterator<Item = TunnelState>) -> TunnelState {
 fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
     if let Some(paths) = &app.confirm_delete {
         return confirm_view(paths);
-    }
-    if let Some(i) = app.context_menu
-        && let Some(row) = app.rows.get(i)
-    {
-        return context_menu_view(i, &row.tunnel);
     }
     if let Some(form) = &app.editing_ssh {
         return ssh_edit_view(form);
@@ -1125,9 +1130,6 @@ fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
         screen = screen.push(container(chips).padding(pad_r(10.0)));
     }
     screen = screen.push(body);
-    if let Some(bar) = bulk_bar(app) {
-        screen = screen.push(container(bar).padding(pad_r(10.0)));
-    }
     container(screen)
         .padding(iced::Padding {
             top: 12.0,
@@ -1177,39 +1179,6 @@ fn scroll_style(
     style
 }
 
-/// The bulk-action bar shown at the bottom while ≥1 tunnel is checked.
-fn bulk_bar(app: &App) -> Option<Element<'_, Message>> {
-    let n = app.checked.len();
-    if n == 0 {
-        return None;
-    }
-    let bar = container(
-        row![
-            button(text(format!("{n} selected")).size(12))
-                .style(pill_secondary)
-                .padding([4, 10])
-                .on_press(Message::ClearChecks),
-            space().width(Length::Fill),
-            button(text("Connect").size(12))
-                .style(pill_button)
-                .padding([4, 12])
-                .on_press(Message::BulkConnect),
-            button(text("Disconnect").size(12))
-                .style(pill_secondary)
-                .padding([4, 12])
-                .on_press(Message::BulkDisconnect),
-            tip(
-                icon_button(ICON_TRASH, 16.0, Message::BulkDelete),
-                "Delete selected"
-            ),
-        ]
-        .spacing(8)
-        .align_y(iced::Alignment::Center),
-    )
-    .padding([6, 4]);
-    Some(bar.into())
-}
-
 fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
     let indent = space().width(Length::Fixed(d.depth as f32 * 14.0));
 
@@ -1237,33 +1206,53 @@ fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
         .into();
     };
 
-    // Leaf: click = connect/disconnect, ⌘/Shift-click = select, right-click =
-    // menu. Selected rows are highlighted; the dot shows connection state.
+    // Leaf: the name area SELECTS on click (⌘/Shift to multi-select) and opens
+    // the options dropdown on right-click — it never connects. The terminal icon
+    // and the toggle (which does connect/disconnect) are separate controls.
     let checked = app.checked.contains(&d.path);
-    let line = container(
-        row![
-            indent,
-            status_dot(d.status),
-            name_element(&d.name, 13.0, 32, TEXT_DARK),
-        ]
-        .spacing(8)
-        .align_y(iced::Alignment::Center),
-    )
-    .width(Length::Fill)
-    .padding([5, 6])
-    .style(move |_t: &iced::Theme| iced::widget::container::Style {
-        background: checked.then(|| iced::Background::Color(Color::from_rgb(0.80, 0.87, 1.0))),
-        border: iced::Border {
-            radius: 6.0.into(),
+    let name_area = mouse_area(
+        container(
+            row![
+                indent,
+                status_dot(d.status),
+                name_element(&d.name, 13.0, 26, TEXT_DARK),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center),
+        )
+        .width(Length::Fill)
+        .padding([4, 6])
+        .style(move |_t: &iced::Theme| iced::widget::container::Style {
+            background: checked.then(|| iced::Background::Color(Color::from_rgb(0.80, 0.87, 1.0))),
+            border: iced::Border {
+                radius: 6.0.into(),
+                ..Default::default()
+            },
             ..Default::default()
-        },
-        ..Default::default()
-    });
-    let clickable = mouse_area(line)
-        .on_press(Message::RowPress(idx))
-        .on_right_press(Message::RowRightPress(idx));
+        }),
+    )
+    .on_press(Message::RowPress(idx))
+    .on_right_press(Message::RowRightPress(idx));
 
-    let mut col = column![clickable].spacing(1);
+    let term = tip(
+        icon_button(ICON_TERMINAL, 15.0, Message::OpenTerminal(idx)),
+        "Open terminal",
+    );
+    let switch = tip(
+        toggler(d.enabled)
+            .size(17)
+            .on_toggle(move |_| Message::ToggleTunnel(idx)),
+        if d.enabled { "Disconnect" } else { "Connect" },
+    );
+    let line = row![name_area, term, switch]
+        .spacing(8)
+        .align_y(iced::Alignment::Center);
+
+    let mut col = column![line].spacing(2);
+    // The options dropdown "drops out" inline under the row that was right-clicked.
+    if app.context_menu == Some(idx) {
+        col = col.push(menu_panel(app, d.depth));
+    }
     if let Some((msg, _)) = &app.rows[idx].notice {
         col = col.push(
             row![
@@ -1278,40 +1267,63 @@ fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
     col.into()
 }
 
-/// The right-click per-tunnel menu (rendered as a small action sheet).
-fn context_menu_view(i: usize, tunnel: &Tunnel) -> Element<'_, Message> {
-    let action = |label: &str, msg: Message| {
-        button(text(label.to_string()).size(13))
+/// The inline options dropdown: connect / disconnect / edit / delete for the
+/// current selection (Edit only when exactly one tunnel is selected).
+fn menu_panel<'a>(app: &App, depth: usize) -> Element<'a, Message> {
+    let n = app.checked.len();
+    let item = |label: &str, msg: Message, danger: bool| {
+        let color = if danger {
+            Color::from_rgb(0.85, 0.25, 0.25)
+        } else {
+            TEXT_DARK
+        };
+        button(text(label.to_string()).size(12).color(color))
             .style(row_plain)
             .width(Length::Fill)
-            .padding([7, 10])
+            .padding([5, 10])
             .on_press(msg)
     };
-    let col = column![
-        text(tunnel.name().to_string()).size(15),
-        text(tunnel.path.clone())
-            .size(11)
-            .color(Color::from_rgb(0.5, 0.5, 0.56)),
-        space().height(Length::Fixed(4.0)),
-        action("Open terminal", Message::OpenTerminal(i)),
-        action("Edit", Message::StartEdit(i)),
-        button(
-            text("Delete")
-                .size(13)
-                .color(Color::from_rgb(0.85, 0.25, 0.25))
-        )
-        .style(row_plain)
-        .width(Length::Fill)
-        .padding([7, 10])
-        .on_press(Message::RowDelete(i)),
-        space().height(Length::Fixed(4.0)),
-        button(text("Cancel").size(13))
-            .style(pill_secondary)
-            .padding([5, 16])
-            .on_press(Message::CloseContextMenu),
+    let mut items = column![].spacing(1);
+    if n > 1 {
+        items = items.push(
+            text(format!("{n} selected"))
+                .size(10)
+                .color(Color::from_rgb(0.5, 0.5, 0.56)),
+        );
+    }
+    items = items.push(item("Connect", Message::MenuConnect, false));
+    items = items.push(item("Disconnect", Message::MenuDisconnect, false));
+    if n == 1 {
+        items = items.push(item("Edit", Message::MenuEdit, false));
+    }
+    items = items.push(item("Delete", Message::MenuDelete, true));
+
+    let panel = container(items)
+        .padding(4)
+        .width(Length::Fixed(180.0))
+        .style(menu_box_style);
+    row![
+        space().width(Length::Fixed(depth as f32 * 14.0 + 20.0)),
+        panel
     ]
-    .spacing(4);
-    container(col).padding(16).into()
+    .into()
+}
+
+fn menu_box_style(_theme: &iced::Theme) -> iced::widget::container::Style {
+    iced::widget::container::Style {
+        background: Some(iced::Background::Color(Color::from_rgb(0.99, 0.99, 1.0))),
+        border: iced::Border {
+            color: Color::from_rgb(0.80, 0.80, 0.84),
+            width: 1.0,
+            radius: 8.0.into(),
+        },
+        shadow: iced::Shadow {
+            color: Color::from_rgba(0.0, 0.0, 0.0, 0.12),
+            offset: iced::Vector::new(0.0, 2.0),
+            blur_radius: 8.0,
+        },
+        ..Default::default()
+    }
 }
 
 fn row_style(bg: Option<Color>, radius: f32) -> iced::widget::button::Style {
