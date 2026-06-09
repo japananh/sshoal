@@ -1057,7 +1057,15 @@ fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
         list = list.push(tree_row(app, d));
     }
 
-    let body = scrollable(list).height(Length::Fill);
+    // Reserve room on the right so the scrollbar doesn't sit on top of the
+    // toggles.
+    let body = scrollable(container(list).padding(iced::Padding {
+        top: 0.0,
+        right: 12.0,
+        bottom: 0.0,
+        left: 0.0,
+    }))
+    .height(Length::Fill);
     let mut screen = column![header].spacing(8);
     if !app.rows.is_empty() {
         screen = screen.push(chips);
