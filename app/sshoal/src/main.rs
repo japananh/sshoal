@@ -1057,24 +1057,37 @@ fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
         list = list.push(tree_row(app, d));
     }
 
-    // Reserve room on the right so the scrollbar doesn't sit on top of the
-    // toggles.
-    let body = scrollable(container(list).padding(iced::Padding {
-        top: 0.0,
-        right: 12.0,
-        bottom: 0.0,
-        left: 0.0,
-    }))
-    .height(Length::Fill);
-    let mut screen = column![header].spacing(8);
+    // The scrollable runs nearly to the window's right edge (so the scrollbar
+    // sits close to the edge), while the list content keeps a wider right inset
+    // so the toggles stay well clear of the scrollbar. The non-scrolling
+    // sections get their own right padding to line up.
+    let body = scrollable(container(list).padding(pad_r(16.0))).height(Length::Fill);
+    let mut screen = column![container(header).padding(pad_r(10.0))].spacing(8);
     if !app.rows.is_empty() {
-        screen = screen.push(chips);
+        screen = screen.push(container(chips).padding(pad_r(10.0)));
     }
     screen = screen.push(body);
     if let Some(bar) = bulk_bar(app) {
-        screen = screen.push(bar);
+        screen = screen.push(container(bar).padding(pad_r(10.0)));
     }
-    container(screen).padding(12).into()
+    container(screen)
+        .padding(iced::Padding {
+            top: 12.0,
+            right: 2.0,
+            bottom: 12.0,
+            left: 12.0,
+        })
+        .into()
+}
+
+/// Padding with only a right inset (the rest zero).
+fn pad_r(right: f32) -> iced::Padding {
+    iced::Padding {
+        top: 0.0,
+        right,
+        bottom: 0.0,
+        left: 0.0,
+    }
 }
 
 /// The bulk-action bar shown at the bottom while ≥1 tunnel is checked.
@@ -1696,18 +1709,17 @@ fn confirm_view(paths: &[String]) -> Element<'_, Message> {
 }
 
 fn status_dot(state: TunnelState) -> Element<'static, Message> {
+    // No dot when idle/disconnected — only show one once the tunnel is doing
+    // something. Keep the slot width so names stay aligned either way.
+    if state == TunnelState::Idle {
+        return space().width(Length::Fixed(9.0)).into();
+    }
     let color = match state {
         TunnelState::Up => Color::from_rgb(0.18, 0.80, 0.44),
         TunnelState::Connecting => Color::from_rgb(0.95, 0.77, 0.06),
-        TunnelState::Reconnecting | TunnelState::Failed => Color::from_rgb(0.90, 0.42, 0.20),
-        TunnelState::Idle => Color::from_rgb(0.55, 0.55, 0.60),
+        _ => Color::from_rgb(0.90, 0.42, 0.20), // reconnecting / failed
     };
-    let glyph = if state == TunnelState::Idle {
-        "○"
-    } else {
-        "●"
-    };
-    text(glyph).size(15).color(color).into()
+    text("●").size(15).color(color).into()
 }
 
 fn subscription(_app: &App) -> Subscription<Message> {
