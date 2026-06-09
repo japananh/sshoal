@@ -29,9 +29,8 @@ use iced::{Color, Element, Font, Length, Size, Subscription, Task, Theme, window
 const LUCIDE: Font = Font::with_name("lucide");
 const ICON_PLUS: &str = "\u{e13d}";
 const ICON_CHEVRON_LEFT: &str = "\u{e06e}";
-const ICON_CHEVRON_RIGHT: &str = "\u{e06f}";
-const ICON_CHEVRON_DOWN: &str = "\u{e06d}";
 const ICON_FOLDER: &str = "\u{e0d7}";
+const ICON_FOLDER_OPEN: &str = "\u{e247}";
 const ICON_TERMINAL: &str = "\u{e181}";
 const ICON_SETTINGS: &str = "\u{e154}";
 const ICON_SEARCH: char = '\u{e151}';
@@ -457,6 +456,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::ClickFolder(path) => {
+            app.context_menu = None;
             if !app.expanded.remove(&path) {
                 app.expanded.insert(path);
             }
@@ -1296,37 +1296,30 @@ fn scroll_style(
 fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
     let indent = space().width(Length::Fixed(d.depth as f32 * 14.0));
 
-    // Folder: a chevron toggles expand/collapse; left-clicking ANYWHERE else on
-    // the row selects the folder and opens its dropdown.
+    // Folder: glyph 📁/📂 + name, exactly as before. Left-click ANYWHERE on the
+    // row selects the folder and opens its dropdown (expand/collapse lives in
+    // that dropdown).
     let Some(idx) = d.row_idx else {
         let expanded = app.expanded.contains(&d.path);
-        let chevron_icon = if expanded {
-            ICON_CHEVRON_DOWN
+        let icon = if expanded {
+            ICON_FOLDER_OPEN
         } else {
-            ICON_CHEVRON_RIGHT
+            ICON_FOLDER
         };
         // Folder is "selected" (highlighted) while its dropdown is open.
         let selected = matches!(&app.context_menu, Some(ContextMenu::Folder(p)) if p == &d.path);
-        let chevron = button(
-            text(chevron_icon)
-                .font(LUCIDE)
-                .size(13.0)
-                .color(Color::from_rgb(0.45, 0.45, 0.52)),
-        )
-        .style(row_plain)
-        .padding([2, 3])
-        .on_press(Message::ClickFolder(d.path.clone()));
-        let body = mouse_area(
+        return mouse_area(
             container(
                 row![
-                    text(ICON_FOLDER).font(LUCIDE).size(15.0).color(FOLDER_BLUE),
-                    name_element(&d.name, 13.0, 28, TEXT_DARK),
+                    indent,
+                    text(icon).font(LUCIDE).size(15.0).color(FOLDER_BLUE),
+                    name_element(&d.name, 13.0, 30, TEXT_DARK),
                 ]
                 .spacing(8)
                 .align_y(iced::Alignment::Center),
             )
             .width(Length::Fill)
-            .padding([4, 4])
+            .padding([5, 6])
             .style(move |_t: &iced::Theme| iced::widget::container::Style {
                 background: selected
                     .then(|| iced::Background::Color(Color::from_rgb(0.80, 0.87, 1.0))),
@@ -1338,11 +1331,8 @@ fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
             }),
         )
         .on_press(Message::FolderPress(d.path.clone()))
-        .on_right_press(Message::FolderPress(d.path.clone()));
-        return row![indent, chevron, body]
-            .spacing(4)
-            .align_y(iced::Alignment::Center)
-            .into();
+        .on_right_press(Message::FolderPress(d.path.clone()))
+        .into();
     };
 
     // Leaf: the name area SELECTS on click (⌘/Shift to multi-select) and opens
@@ -1436,7 +1426,17 @@ fn menu_panel<'a>(app: &App, menu: &ContextMenu) -> Element<'a, Message> {
             }
             items = items.push(item("Delete", Message::MenuDelete, true));
         }
-        ContextMenu::Folder(_) => {
+        ContextMenu::Folder(path) => {
+            let expand_label = if app.expanded.contains(path) {
+                "Collapse"
+            } else {
+                "Expand"
+            };
+            items = items.push(item(
+                expand_label,
+                Message::ClickFolder(path.clone()),
+                false,
+            ));
             items = items.push(item("Connect all", Message::FolderConnectAll, false));
             items = items.push(item("Disconnect all", Message::FolderDisconnectAll, false));
             items = items.push(item("Delete", Message::FolderDelete, true));
