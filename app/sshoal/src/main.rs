@@ -857,6 +857,17 @@ fn build_tree(rows: &[TunnelRow]) -> Folder {
     root
 }
 
+/// Sort priority for environment-like folder names (lower sorts first).
+/// Everything else ranks last and falls back to alphabetical.
+fn env_rank(name: &str) -> u8 {
+    match name.to_ascii_lowercase().as_str() {
+        "dev" | "develop" | "development" => 0,
+        "stg" | "stag" | "stage" | "staging" => 1,
+        "prod" | "pro" | "prd" | "production" => 2,
+        _ => 3,
+    }
+}
+
 fn insert_leaf(folder: &mut Folder, segments: &[&str], row_idx: usize) {
     match segments {
         [] => {}
@@ -898,7 +909,11 @@ fn flatten(
     allowed: Option<&HashSet<usize>>,
     out: &mut Vec<DisplayRow>,
 ) {
-    for (name, sub) in &folder.subfolders {
+    // Order subfolders by environment (dev → staging → prod) then name, so the
+    // tree reads dev-first regardless of alphabetical order.
+    let mut subs: Vec<(&String, &Folder)> = folder.subfolders.iter().collect();
+    subs.sort_by(|(a, _), (b, _)| env_rank(a).cmp(&env_rank(b)).then_with(|| a.cmp(b)));
+    for (name, sub) in subs {
         let path = if prefix.is_empty() {
             name.clone()
         } else {
@@ -1061,7 +1076,10 @@ fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
     // sits close to the edge), while the list content keeps a wider right inset
     // so the toggles stay well clear of the scrollbar. The non-scrolling
     // sections get their own right padding to line up.
-    let body = scrollable(container(list).padding(pad_r(16.0))).height(Length::Fill);
+    let body = scrollable(container(list).padding(pad_r(16.0)))
+        .direction(thin_scrollbar())
+        .style(scroll_style)
+        .height(Length::Fill);
     let mut screen = column![container(header).padding(pad_r(10.0))].spacing(8);
     if !app.rows.is_empty() {
         screen = screen.push(container(chips).padding(pad_r(10.0)));
@@ -1088,6 +1106,35 @@ fn pad_r(right: f32) -> iced::Padding {
         bottom: 0.0,
         left: 0.0,
     }
+}
+
+/// A thin vertical scrollbar.
+fn thin_scrollbar() -> iced::widget::scrollable::Direction {
+    iced::widget::scrollable::Direction::Vertical(
+        iced::widget::scrollable::Scrollbar::new()
+            .width(6.0)
+            .scroller_width(6.0)
+            .margin(2.0),
+    )
+}
+
+/// Rounded scrollbar rails + scroller.
+fn scroll_style(
+    theme: &iced::Theme,
+    status: iced::widget::scrollable::Status,
+) -> iced::widget::scrollable::Style {
+    let mut style = iced::widget::scrollable::default(theme, status);
+    for rail in [&mut style.vertical_rail, &mut style.horizontal_rail] {
+        rail.border = iced::Border {
+            radius: 4.0.into(),
+            ..rail.border
+        };
+        rail.scroller.border = iced::Border {
+            radius: 4.0.into(),
+            ..rail.scroller.border
+        };
+    }
+    style
 }
 
 /// The bulk-action bar shown at the bottom while ≥1 tunnel is checked.
@@ -1578,7 +1625,11 @@ fn ssh_list_view(app: &App) -> Element<'_, Message> {
         );
     }
 
-    container(column![header, scrollable(list).height(Length::Fill)].spacing(12))
+    let body = scrollable(container(list).padding(pad_r(16.0)))
+        .direction(thin_scrollbar())
+        .style(scroll_style)
+        .height(Length::Fill);
+    container(column![header, body].spacing(12))
         .padding(12)
         .into()
 }
