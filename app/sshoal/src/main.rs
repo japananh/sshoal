@@ -51,6 +51,14 @@ enum Field {
     RemotePort,
 }
 
+/// Which tunnels the list shows — the state half of the filter bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StateFilter {
+    All,
+    Connected,
+    Disconnected,
+}
+
 #[derive(Debug, Clone)]
 enum Message {
     /// Periodic: refresh status dots and poll the tray menu channel.
@@ -81,6 +89,9 @@ enum Message {
     ConfirmDeleteDo,
     ConfirmDeleteCancel,
     Keyboard(iced::keyboard::Event),
+    // Filter bar (tunnels screen)
+    FilterInput(String),
+    SetFilter(StateFilter),
 }
 
 struct MenuIds {
@@ -168,6 +179,10 @@ struct App {
     selected: Option<String>,
     /// Pending folder deletion awaiting type-to-confirm.
     confirm_delete: Option<ConfirmDelete>,
+    /// Free-text filter (matches tunnel name or folder path).
+    filter: String,
+    /// Connection-state filter.
+    filter_state: StateFilter,
 }
 
 /// Type-the-name confirmation for deleting a whole folder of tunnels.
@@ -184,17 +199,52 @@ impl App {
         if self.managing_ssh {
             self.ssh_configs.iter().map(|c| c.name.clone()).collect()
         } else {
-            let mut disp = Vec::new();
-            flatten(
-                &build_tree(&self.rows),
-                "",
-                0,
-                &self.rows,
-                &self.expanded,
-                &mut disp,
-            );
-            disp.into_iter().map(|d| d.path).collect()
+            self.display_rows().into_iter().map(|d| d.path).collect()
         }
+    }
+
+    /// The tree rows currently visible (after the filter), in display order.
+    /// Shared by the view and keyboard nav so they never disagree.
+    fn display_rows(&self) -> Vec<DisplayRow> {
+        let allowed = self.filtered_indices();
+        let mut out = Vec::new();
+        flatten(
+            &build_tree(&self.rows),
+            "",
+            0,
+            &self.rows,
+            &self.expanded,
+            allowed.as_ref(),
+            &mut out,
+        );
+        out
+    }
+
+    /// Row indices passing the filter, or `None` when no filter is active (show
+    /// everything, honouring the manual expand/collapse state).
+    fn filtered_indices(&self) -> Option<HashSet<usize>> {
+        let q = self.filter.trim().to_lowercase();
+        if q.is_empty() && self.filter_state == StateFilter::All {
+            return None;
+        }
+        let set = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| {
+                let name_ok = q.is_empty()
+                    || r.tunnel.path.to_lowercase().contains(&q)
+                    || r.tunnel.name().to_lowercase().contains(&q);
+                let state_ok = match self.filter_state {
+                    StateFilter::All => true,
+                    StateFilter::Connected => r.enabled(),
+                    StateFilter::Disconnected => !r.enabled(),
+                };
+                name_ok && state_ok
+            })
+            .map(|(i, _)| i)
+            .collect();
+        Some(set)
     }
 }
 
@@ -255,6 +305,8 @@ fn boot(runtime: Arc<tokio::runtime::Runtime>) -> (App, Task<Message>) {
         editing_ssh: None,
         selected: None,
         confirm_delete: None,
+        filter: String::new(),
+        filter_state: StateFilter::All,
     };
 
     // Show the window on launch so opening the app always surfaces it (the tray
@@ -546,7 +598,9 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::Keyboard(event) => {
             use iced::keyboard::{Event, Key, key::Named};
-            // Only navigate the list when not typing in a form.
+            // Only navigate the list when not typing in a form. (Backspace/Delete
+            // are NOT bound to deletion here — the filter box would capture them;
+            // use the − button instead.)
             if app.editing.is_none()
                 && app.editing_ssh.is_none()
                 && app.confirm_delete.is_none()
@@ -555,12 +609,18 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 return match key {
                     Key::Named(Named::ArrowUp) => update(app, Message::SelectDelta(-1)),
                     Key::Named(Named::ArrowDown) => update(app, Message::SelectDelta(1)),
-                    Key::Named(Named::Backspace | Named::Delete) => {
-                        update(app, Message::DeleteSelected)
-                    }
+                    Key::Named(Named::Enter) => activate_selected(app),
                     _ => Task::none(),
                 };
             }
+            Task::none()
+        }
+        Message::FilterInput(value) => {
+            app.filter = value;
+            Task::none()
+        }
+        Message::SetFilter(state) => {
+            app.filter_state = state;
             Task::none()
         }
         Message::WindowOpened(id) => {
@@ -577,12 +637,38 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
     }
 }
 
+/// Enter on the current selection: edit an ssh config / leaf tunnel, or
+/// expand/collapse a folder.
+fn activate_selected(app: &mut App) -> Task<Message> {
+    let Some(sel) = app.selected.clone() else {
+        return Task::none();
+    };
+    if app.managing_ssh {
+        if let Some(i) = app.ssh_configs.iter().position(|c| c.name == sel) {
+            return update(app, Message::StartEditSsh(i));
+        }
+        return Task::none();
+    }
+    if let Some(i) = app.rows.iter().position(|r| r.tunnel.path == sel) {
+        return update(app, Message::StartEdit(i));
+    }
+    update(app, Message::ClickFolder(sel))
+}
+
 /// Validate the edit form and apply it (replace or append a tunnel), then save.
 fn save_edit(app: &mut App) {
     let Some(form) = &app.editing else { return };
 
     let parse_port = |s: &str| s.trim().parse::<u16>().ok();
-    let path = form.path.trim().to_string();
+    // Trim each path segment so " gc / dev / app-api " becomes "gc/dev/app-api"
+    // and the leaf name has no stray leading/trailing spaces.
+    let path = form
+        .path
+        .split('/')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("/");
     let ssh = form.ssh.trim().to_string();
     let remote_host = form.remote_host.trim().to_string();
 
@@ -757,6 +843,7 @@ fn flatten(
     depth: usize,
     rows: &[TunnelRow],
     expanded: &HashSet<String>,
+    allowed: Option<&HashSet<usize>>,
     out: &mut Vec<DisplayRow>,
 ) {
     for (name, sub) in &folder.subfolders {
@@ -765,7 +852,18 @@ fn flatten(
         } else {
             format!("{prefix}/{name}")
         };
-        let leaves = collect_leaves(sub);
+        // When filtering, drop folders with no matching descendant and aggregate
+        // only over the matching leaves.
+        let leaves: Vec<usize> = match allowed {
+            Some(allow) => collect_leaves(sub)
+                .into_iter()
+                .filter(|i| allow.contains(i))
+                .collect(),
+            None => collect_leaves(sub),
+        };
+        if allowed.is_some() && leaves.is_empty() {
+            continue;
+        }
         let enabled = leaves.iter().any(|&i| rows[i].enabled());
         let status = aggregate(leaves.iter().map(|&i| rows[i].status));
         out.push(DisplayRow {
@@ -776,11 +874,15 @@ fn flatten(
             enabled,
             status,
         });
-        if expanded.contains(&path) {
-            flatten(sub, &path, depth + 1, rows, expanded, out);
+        // A filter forces folders open so matches are always visible.
+        if allowed.is_some() || expanded.contains(&path) {
+            flatten(sub, &path, depth + 1, rows, expanded, allowed, out);
         }
     }
     for &idx in &folder.leaves {
+        if allowed.is_some_and(|allow| !allow.contains(&idx)) {
+            continue;
+        }
         let row = &rows[idx];
         out.push(DisplayRow {
             depth,
@@ -851,9 +953,12 @@ fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
             .padding([4, 10])
             .on_press(Message::OpenSshConfigs),
         row![
-            tip(icon_button(ICON_PLUS, Message::StartAdd), "Add tunnel"),
             tip(
-                icon_button(ICON_MINUS, Message::DeleteSelected),
+                icon_button(ICON_PLUS, 19.0, Message::StartAdd),
+                "Add tunnel"
+            ),
+            tip(
+                icon_button(ICON_MINUS, 19.0, Message::DeleteSelected),
                 "Delete selected"
             ),
         ]
@@ -862,47 +967,83 @@ fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
     .spacing(8)
     .align_y(iced::Alignment::Center);
 
+    let display = app.display_rows();
     let mut list = column![].spacing(2);
     if app.rows.is_empty() {
         list = list.push(text("No tunnels yet. Click + Add, or run `sshoal import-ssh`.").size(13));
+    } else if display.is_empty() {
+        list = list.push(
+            text("No tunnels match the filter.")
+                .size(13)
+                .color(Color::from_rgb(0.5, 0.5, 0.56)),
+        );
     }
-
-    let tree = build_tree(&app.rows);
-    let mut display = Vec::new();
-    flatten(&tree, "", 0, &app.rows, &app.expanded, &mut display);
-
     for d in &display {
         list = list.push(tree_row(app, d));
     }
 
     let body = scrollable(list).height(Length::Fill);
-    container(column![header, body].spacing(10))
-        .padding(14)
-        .into()
+    let mut screen = column![header].spacing(10);
+    if !app.rows.is_empty() {
+        screen = screen.push(filter_bar(app));
+    }
+    screen = screen.push(body);
+    container(screen).padding(14).into()
+}
+
+/// The filter bar: a free-text search (name or folder) plus state chips.
+fn filter_bar(app: &App) -> Element<'_, Message> {
+    let search = text_input("filter…", &app.filter)
+        .size(12)
+        .padding([5, 9])
+        .style(rounded_input)
+        .on_input(Message::FilterInput)
+        .width(Length::Fill);
+
+    let chip = |label: &'static str, state: StateFilter| {
+        let active = app.filter_state == state;
+        button(text(label).size(11))
+            .style(move |_t: &iced::Theme, status| chip_style(active, status))
+            .padding([4, 10])
+            .on_press(Message::SetFilter(state))
+    };
+
+    row![
+        search,
+        chip("All", StateFilter::All),
+        chip("Connected", StateFilter::Connected),
+        chip("Disconnected", StateFilter::Disconnected),
+    ]
+    .spacing(6)
+    .align_y(iced::Alignment::Center)
+    .into()
 }
 
 fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
     let indent = space().width(Length::Fixed(d.depth as f32 * 16.0));
 
-    // Folder: a full-width band you click to expand/collapse. No toggle/status.
+    // Folder: a band you click to expand/collapse. No toggle/status. Selection
+    // is shown by an accent border, not by repainting the whole row.
     let Some(idx) = d.row_idx else {
         let expanded = app.expanded.contains(&d.path);
-        let icon = if expanded {
-            ICON_FOLDER_OPEN
+        // Closed folders get a warm fill so they read as "has hidden contents";
+        // open ones fade to a muted grey.
+        let (icon, icon_color) = if expanded {
+            (ICON_FOLDER_OPEN, Color::from_rgb(0.55, 0.60, 0.68))
         } else {
-            ICON_FOLDER
+            (ICON_FOLDER, Color::from_rgb(0.93, 0.69, 0.22))
         };
         let content = row![
             indent,
-            text(icon).font(LUCIDE).size(15),
-            text(d.name.clone()).size(14).width(Length::Fill),
+            text(icon).font(LUCIDE).size(16).color(icon_color),
+            name_element(&d.name, 14.0, 26),
         ]
         .spacing(10)
         .align_y(iced::Alignment::Center);
         let selected = app.selected.as_deref() == Some(d.path.as_str());
         return button(content)
             .style(if selected {
-                row_selected
+                folder_selected
             } else {
                 folder_button
             })
@@ -917,7 +1058,7 @@ fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
     let label = row![
         indent,
         status_dot(d.status),
-        text(d.name.clone()).size(13).width(Length::Fill),
+        name_element(&d.name, 13.0, 26),
     ]
     .spacing(10)
     .align_y(iced::Alignment::Center);
@@ -974,6 +1115,18 @@ fn folder_button(_theme: &iced::Theme, status: button::Status) -> iced::widget::
     row_style(Some(Color::from_rgb(shade, shade, shade + 0.03)), 0.0)
 }
 
+/// Folder row, selected: keep the band, add a blue accent border (rather than
+/// repainting the whole row a solid colour).
+fn folder_selected(theme: &iced::Theme, status: button::Status) -> iced::widget::button::Style {
+    let mut style = folder_button(theme, status);
+    style.border = iced::Border {
+        color: Color::from_rgb(0.36, 0.56, 0.96),
+        width: 1.5,
+        radius: 5.0.into(),
+    };
+    style
+}
+
 /// Leaf row, not selected: transparent, faint highlight on hover.
 fn row_plain(_theme: &iced::Theme, status: button::Status) -> iced::widget::button::Style {
     let bg = match status {
@@ -990,6 +1143,11 @@ fn row_selected(_theme: &iced::Theme, _status: button::Status) -> iced::widget::
 
 /// Wrap a control with a hover tooltip.
 fn tip<'a>(content: impl Into<Element<'a, Message>>, label: &'a str) -> Element<'a, Message> {
+    tip_text(content, label.to_string())
+}
+
+/// Like [`tip`] but takes an owned label (so it can outlive a borrowed source).
+fn tip_text<'a>(content: impl Into<Element<'a, Message>>, label: String) -> Element<'a, Message> {
     tooltip(
         content,
         container(text(label).size(12))
@@ -999,6 +1157,31 @@ fn tip<'a>(content: impl Into<Element<'a, Message>>, label: &'a str) -> Element<
     )
     .gap(6)
     .into()
+}
+
+/// Truncate to `max` characters with an ellipsis (counted in `char`s, so it
+/// never splits a multi-byte glyph).
+fn truncate(name: &str, max: usize) -> String {
+    if name.chars().count() > max {
+        let kept: String = name.chars().take(max.saturating_sub(1)).collect();
+        format!("{kept}…")
+    } else {
+        name.to_string()
+    }
+}
+
+/// A row label that truncates long names to `max` chars and, when truncated,
+/// reveals the full name in a hover tooltip.
+fn name_element<'a>(name: &str, size: f32, max: usize) -> Element<'a, Message> {
+    let shown = truncate(name, max);
+    if shown == name {
+        text(shown).size(size).width(Length::Fill).into()
+    } else {
+        tip_text(
+            container(text(shown).size(size)).width(Length::Fill),
+            name.to_string(),
+        )
+    }
 }
 
 fn tooltip_bubble(_theme: &iced::Theme) -> iced::widget::container::Style {
@@ -1043,12 +1226,54 @@ fn pill_secondary(_theme: &iced::Theme, status: button::Status) -> iced::widget:
     }
 }
 
+/// Filter-bar chip: filled blue when active, light bordered pill otherwise.
+fn chip_style(active: bool, status: button::Status) -> iced::widget::button::Style {
+    let (bg, fg, border_w) = if active {
+        (Color::from_rgb(0.36, 0.56, 0.96), Color::WHITE, 0.0)
+    } else {
+        let shade = match status {
+            button::Status::Hovered => 0.90,
+            button::Status::Pressed => 0.84,
+            _ => 0.95,
+        };
+        (
+            Color::from_rgb(shade, shade, shade + 0.01),
+            Color::from_rgb(0.30, 0.30, 0.36),
+            1.0,
+        )
+    };
+    iced::widget::button::Style {
+        background: Some(iced::Background::Color(bg)),
+        text_color: fg,
+        border: iced::Border {
+            color: Color::from_rgb(0.76, 0.76, 0.80),
+            width: border_w,
+            radius: 11.0.into(),
+        },
+        shadow: iced::Shadow::default(),
+        snap: true,
+    }
+}
+
 /// Rounded text-input style (Tahoe-ish).
 fn rounded_input(
     theme: &iced::Theme,
     status: iced::widget::text_input::Status,
 ) -> iced::widget::text_input::Style {
     let mut style = iced::widget::text_input::default(theme, status);
+    style.border = iced::Border {
+        radius: 9.0.into(),
+        ..style.border
+    };
+    style
+}
+
+/// Rounded pick_list (dropdown) field — matches the rounded text inputs.
+fn rounded_pick(
+    theme: &iced::Theme,
+    status: iced::widget::pick_list::Status,
+) -> iced::widget::pick_list::Style {
+    let mut style = iced::widget::pick_list::default(theme, status);
     style.border = iced::Border {
         radius: 9.0.into(),
         ..style.border
@@ -1104,7 +1329,10 @@ fn edit_view<'a>(form: &'a EditForm, ssh_names: &[String]) -> Element<'a, Messag
             Message::EditField(Field::Ssh, name)
         })
         .placeholder("choose an SSH config")
-        .text_size(13),
+        .padding([6, 9])
+        .text_size(13)
+        .style(rounded_pick)
+        .width(Length::Fill),
     ]
     .spacing(8)
     .align_y(iced::Alignment::Center)
@@ -1216,17 +1444,17 @@ fn nonempty(s: &str) -> Option<String> {
 fn ssh_list_view(app: &App) -> Element<'_, Message> {
     let header = row![
         tip(
-            icon_button(ICON_CHEVRON_LEFT, Message::CloseSshConfigs),
+            icon_button(ICON_CHEVRON_LEFT, 20.0, Message::CloseSshConfigs),
             "Back"
         ),
         text("SSH configs").size(20).width(Length::Fill),
         row![
             tip(
-                icon_button(ICON_PLUS, Message::StartAddSsh),
+                icon_button(ICON_PLUS, 19.0, Message::StartAddSsh),
                 "Add SSH config"
             ),
             tip(
-                icon_button(ICON_MINUS, Message::DeleteSelected),
+                icon_button(ICON_MINUS, 19.0, Message::DeleteSelected),
                 "Delete selected"
             ),
         ]
@@ -1266,8 +1494,8 @@ fn ssh_list_view(app: &App) -> Element<'_, Message> {
 
 /// A borderless icon button (lucide glyph) that gets a rounded-square highlight
 /// on hover. Used for the +/− and back header actions.
-fn icon_button<'a>(icon: &'a str, msg: Message) -> Element<'a, Message> {
-    button(text(icon).font(LUCIDE).size(20))
+fn icon_button<'a>(icon: &'a str, size: f32, msg: Message) -> Element<'a, Message> {
+    button(text(icon).font(LUCIDE).size(size))
         .style(icon_btn_style)
         .padding([4, 7])
         .on_press(msg)
@@ -1472,8 +1700,8 @@ fn register_hotkey() -> Option<GlobalHotKeyManager> {
 
 fn open_window_settings() -> window::Settings {
     window::Settings {
-        size: Size::new(420.0, 620.0),
-        min_size: Some(Size::new(340.0, 380.0)),
+        size: Size::new(380.0, 620.0),
+        min_size: Some(Size::new(320.0, 380.0)),
         ..window::Settings::default()
     }
 }
