@@ -109,6 +109,7 @@ enum Message {
     RowPress(usize),
     RowRightPress(usize),
     FolderPress(String),
+    SelectDelta(i32),
     ModifiersChanged(iced::keyboard::Modifiers),
     CursorMoved(iced::Point),
     CloseContextMenu,
@@ -641,6 +642,40 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             // all / Delete) at the cursor.
             app.menu_at = app.cursor;
             app.context_menu = Some(ContextMenu::Folder(path));
+            Task::none()
+        }
+        Message::SelectDelta(delta) => {
+            // Arrow-key navigation: move the single selection through the visible
+            // tunnels. Ignored while a form/menu is up.
+            if app.editing.is_some()
+                || app.editing_ssh.is_some()
+                || app.confirm_delete.is_some()
+                || app.managing_ssh
+            {
+                return Task::none();
+            }
+            let order: Vec<String> = app
+                .display_rows()
+                .into_iter()
+                .filter(|d| d.row_idx.is_some())
+                .map(|d| d.path)
+                .collect();
+            if order.is_empty() {
+                return Task::none();
+            }
+            let cur = app
+                .select_anchor
+                .as_ref()
+                .and_then(|a| order.iter().position(|p| p == a));
+            let next = match cur {
+                Some(c) => (c as i32 + delta).rem_euclid(order.len() as i32) as usize,
+                None if delta > 0 => 0,
+                None => order.len() - 1,
+            };
+            let path = order[next].clone();
+            app.checked.clear();
+            app.checked.insert(path.clone());
+            app.select_anchor = Some(path);
             Task::none()
         }
         Message::CursorMoved(p) => {
@@ -1296,9 +1331,8 @@ fn scroll_style(
 fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
     let indent = space().width(Length::Fixed(d.depth as f32 * 14.0));
 
-    // Folder: glyph 📁/📂 + name, exactly as before. Left-click ANYWHERE on the
-    // row selects the folder and opens its dropdown (expand/collapse lives in
-    // that dropdown).
+    // Folder: clicking the glyph 📁/📂 expands/collapses (as before); left-click
+    // the name opens the folder dropdown.
     let Some(idx) = d.row_idx else {
         let expanded = app.expanded.contains(&d.path);
         let icon = if expanded {
@@ -1308,31 +1342,30 @@ fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
         };
         // Folder is "selected" (highlighted) while its dropdown is open.
         let selected = matches!(&app.context_menu, Some(ContextMenu::Folder(p)) if p == &d.path);
-        return mouse_area(
-            container(
-                row![
-                    indent,
-                    text(icon).font(LUCIDE).size(15.0).color(FOLDER_BLUE),
-                    name_element(&d.name, 13.0, 30, TEXT_DARK),
-                ]
-                .spacing(8)
-                .align_y(iced::Alignment::Center),
-            )
-            .width(Length::Fill)
-            .padding([5, 6])
-            .style(move |_t: &iced::Theme| iced::widget::container::Style {
-                background: selected
-                    .then(|| iced::Background::Color(Color::from_rgb(0.80, 0.87, 1.0))),
-                border: iced::Border {
-                    radius: 6.0.into(),
+        let glyph = button(text(icon).font(LUCIDE).size(15.0).color(FOLDER_BLUE))
+            .style(row_plain)
+            .padding([2, 4])
+            .on_press(Message::ClickFolder(d.path.clone()));
+        let name_area = mouse_area(
+            container(name_element(&d.name, 13.0, 28, TEXT_DARK))
+                .width(Length::Fill)
+                .padding([5, 4])
+                .style(move |_t: &iced::Theme| iced::widget::container::Style {
+                    background: selected
+                        .then(|| iced::Background::Color(Color::from_rgb(0.80, 0.87, 1.0))),
+                    border: iced::Border {
+                        radius: 6.0.into(),
+                        ..Default::default()
+                    },
                     ..Default::default()
-                },
-                ..Default::default()
-            }),
+                }),
         )
         .on_press(Message::FolderPress(d.path.clone()))
-        .on_right_press(Message::FolderPress(d.path.clone()))
-        .into();
+        .on_right_press(Message::FolderPress(d.path.clone()));
+        return row![indent, glyph, name_area]
+            .spacing(6)
+            .align_y(iced::Alignment::Center)
+            .into();
     };
 
     // Leaf: the name area SELECTS on click (⌘/Shift to multi-select) and opens
@@ -1426,17 +1459,7 @@ fn menu_panel<'a>(app: &App, menu: &ContextMenu) -> Element<'a, Message> {
             }
             items = items.push(item("Delete", Message::MenuDelete, true));
         }
-        ContextMenu::Folder(path) => {
-            let expand_label = if app.expanded.contains(path) {
-                "Collapse"
-            } else {
-                "Expand"
-            };
-            items = items.push(item(
-                expand_label,
-                Message::ClickFolder(path.clone()),
-                false,
-            ));
+        ContextMenu::Folder(_) => {
             items = items.push(item("Connect all", Message::FolderConnectAll, false));
             items = items.push(item("Disconnect all", Message::FolderDisconnectAll, false));
             items = items.push(item("Delete", Message::FolderDelete, true));
@@ -1996,14 +2019,25 @@ fn subscription(_app: &App) -> Subscription<Message> {
     Subscription::batch([
         iced::time::every(Duration::from_millis(200)).map(|_| Message::Tick),
         iced::window::close_events().map(Message::WindowClosed),
-        iced::event::listen_with(|event, _status, _window| match event {
-            iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(m)) => {
-                Some(Message::ModifiersChanged(m))
+        iced::event::listen_with(|event, _status, _window| {
+            use iced::keyboard::{Event as Kbd, Key, key::Named};
+            match event {
+                iced::Event::Keyboard(Kbd::ModifiersChanged(m)) => {
+                    Some(Message::ModifiersChanged(m))
+                }
+                iced::Event::Keyboard(Kbd::KeyPressed {
+                    key: Key::Named(Named::ArrowUp),
+                    ..
+                }) => Some(Message::SelectDelta(-1)),
+                iced::Event::Keyboard(Kbd::KeyPressed {
+                    key: Key::Named(Named::ArrowDown),
+                    ..
+                }) => Some(Message::SelectDelta(1)),
+                iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
+                    Some(Message::CursorMoved(position))
+                }
+                _ => None,
             }
-            iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
-                Some(Message::CursorMoved(position))
-            }
-            _ => None,
         }),
     ])
 }
