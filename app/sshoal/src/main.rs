@@ -682,27 +682,37 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 None => order.len() - 1,
             };
 
+            // Selecting a folder selects the folder AND all its tunnels (so it
+            // highlights and bulk actions apply); a tunnel selects just itself.
+            let select_paths = |idx: usize, rows: &[TunnelRow]| -> Vec<String> {
+                let (p, is_leaf) = &order[idx];
+                if *is_leaf {
+                    vec![p.clone()]
+                } else {
+                    folder_and_descendants(rows, p)
+                }
+            };
+
             if app.modifiers.shift() {
-                // Extend: select every tunnel between the anchor and the new end.
+                // Extend: select everything between the anchor and the new end.
                 let anchor = pos(&app.select_anchor).unwrap_or(next);
                 if app.select_anchor.is_none() {
                     app.select_anchor = Some(order[anchor].0.clone());
                 }
-                app.checked.clear();
                 let (lo, hi) = (anchor.min(next), anchor.max(next));
-                for (p, is_leaf) in order.iter().take(hi + 1).skip(lo) {
-                    if *is_leaf {
-                        app.checked.insert(p.clone());
-                    }
+                let mut add = Vec::new();
+                for k in lo..=hi {
+                    add.extend(select_paths(k, &app.rows));
                 }
+                app.checked.clear();
+                app.checked.extend(add);
                 app.select_cursor = Some(order[next].0.clone());
             } else {
-                // Plain move: single selection; reset the anchor here.
-                let (path, is_leaf) = order[next].clone();
+                // Plain move: clear everything, select just this row.
+                let add = select_paths(next, &app.rows);
+                let path = order[next].0.clone();
                 app.checked.clear();
-                if is_leaf {
-                    app.checked.insert(path.clone());
-                }
+                app.checked.extend(add);
                 app.select_anchor = Some(path.clone());
                 app.select_cursor = Some(path);
             }
@@ -866,6 +876,15 @@ fn context_folder(app: &App) -> Option<String> {
         Some(ContextMenu::Folder(p)) => Some(p.clone()),
         _ => None,
     }
+}
+
+/// A folder's own path plus the paths of every tunnel under it.
+fn folder_and_descendants(rows: &[TunnelRow], folder_path: &str) -> Vec<String> {
+    let mut paths = vec![folder_path.to_string()];
+    for i in descendant_indices(rows, folder_path) {
+        paths.push(rows[i].tunnel.path.clone());
+    }
+    paths
 }
 
 /// Row indices whose tunnel sits at or under `folder_path`.
@@ -1387,8 +1406,8 @@ fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
         } else {
             ICON_FOLDER
         };
-        // Folder is highlighted while its dropdown is open or it's the cursor.
-        let selected = app.select_anchor.as_deref() == Some(d.path.as_str())
+        // Folder is highlighted when it's in the selection or its dropdown is open.
+        let selected = app.checked.contains(&d.path)
             || matches!(&app.context_menu, Some(ContextMenu::Folder(p)) if p == &d.path);
         let glyph = button(text(icon).font(LUCIDE).size(15.0).color(FOLDER_BLUE))
             .style(row_plain)
@@ -1495,7 +1514,8 @@ fn menu_panel<'a>(app: &App, menu: &ContextMenu) -> Element<'a, Message> {
     let mut items = column![].spacing(1);
     match menu {
         ContextMenu::Tunnel(_) => {
-            let n = app.checked.len();
+            // Count actual tunnels (the selection may include folder paths).
+            let n = checked_indices(app).len();
             if n > 1 {
                 // Multiple selected → bulk actions (no single toggle covers them).
                 items = items.push(
