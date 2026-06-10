@@ -1672,11 +1672,18 @@ fn name_element<'a>(name: &str, size: f32, max: usize, color: Color) -> Element<
         text(shown)
             .size(size)
             .color(color)
+            .wrapping(text::Wrapping::None)
             .width(Length::Fill)
             .into()
     } else {
         tip_text(
-            container(text(shown).size(size).color(color)).width(Length::Fill),
+            container(
+                text(shown)
+                    .size(size)
+                    .color(color)
+                    .wrapping(text::Wrapping::None),
+            )
+            .width(Length::Fill),
             name.to_string(),
         )
     }
@@ -2238,8 +2245,8 @@ fn register_hotkey() -> Option<GlobalHotKeyManager> {
 
 fn open_window_settings() -> window::Settings {
     window::Settings {
-        size: Size::new(320.0, 620.0),
-        min_size: Some(Size::new(280.0, 380.0)),
+        size: Size::new(340.0, 620.0),
+        min_size: Some(Size::new(300.0, 380.0)),
         ..window::Settings::default()
     }
 }
