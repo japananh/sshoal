@@ -1502,10 +1502,10 @@ fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
     // Fit the name to the actual column width so the ellipsis is always visible.
     // Reserve space for indent, dot, the :port label, the terminal + toggle, the
     // paddings/spacings and the scrollbar; the rest is ~6.6px per character.
-    let port_w = format!(":{port}").len() as f32 * 6.6;
+    let port_w = format!(":{port}").len() as f32 * 6.0;
     let reserved =
-        12.0 + 2.0 + 16.0 + (d.depth as f32 * 10.0) + 9.0 + 12.0 + port_w + 29.0 + 40.0 + 40.0;
-    let name_max = ((app.window_width - reserved) / 6.6)
+        12.0 + 2.0 + 16.0 + (d.depth as f32 * 10.0) + 9.0 + 12.0 + port_w + 29.0 + 40.0 + 44.0;
+    let name_max = ((app.window_width - reserved) / 7.3)
         .floor()
         .clamp(4.0, 60.0) as usize;
     let name_area = mouse_area(
@@ -1685,15 +1685,12 @@ fn truncate(name: &str, max: usize) -> String {
 /// reveals the full name in a hover tooltip.
 fn name_element<'a>(name: &str, size: f32, max: usize, color: Color) -> Element<'a, Message> {
     let shown = truncate(name, max);
-    // One line, clipped to its box so a long name never bleeds over the port.
-    let label = container(
-        text(shown.clone())
-            .size(size)
-            .color(color)
-            .wrapping(text::Wrapping::None),
-    )
-    .width(Length::Fill)
-    .clip(true);
+    // Shrink to the (already width-fitted) text, one line — so the ellipsis is
+    // always fully rendered, never clipped.
+    let label = text(shown.clone())
+        .size(size)
+        .color(color)
+        .wrapping(text::Wrapping::None);
     if shown == name {
         label.into()
     } else {
