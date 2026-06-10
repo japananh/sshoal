@@ -1514,6 +1514,7 @@ fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
                 indent,
                 status_dot(d.status),
                 name_element(&d.name, 13.0, name_max, TEXT_DARK),
+                space().width(Length::Fill),
                 text(format!(":{port}"))
                     .size(11)
                     .color(Color::from_rgb(0.5, 0.5, 0.56)),
