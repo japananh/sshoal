@@ -850,9 +850,14 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             iced::widget::operation::focus(FILTER_ID)
         }
         Message::WindowClosed(id) => {
-            // Forget the window so the next "Open" can spawn a fresh one.
+            // Forget the window so the next "Open" can spawn a fresh one, and
+            // drop any selection so reopening starts clean.
             if app.window == Some(id) {
                 app.window = None;
+                app.checked.clear();
+                app.select_anchor = None;
+                app.select_cursor = None;
+                app.context_menu = None;
             }
             Task::none()
         }
