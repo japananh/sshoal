@@ -1396,6 +1396,18 @@ fn tunnels_base(app: &App) -> Element<'_, Message> {
         .into()
 }
 
+/// Solid blue rounded chip behind a folder glyph (so it looks filled).
+fn folder_chip_style(_theme: &iced::Theme) -> iced::widget::container::Style {
+    iced::widget::container::Style {
+        background: Some(iced::Background::Color(FOLDER_BLUE)),
+        border: iced::Border {
+            radius: 4.0.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
 /// A visible-but-subtle separator line between folder groups.
 fn rule_style(_theme: &iced::Theme) -> iced::widget::rule::Style {
     iced::widget::rule::Style {
@@ -1460,10 +1472,16 @@ fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
         // Folder is highlighted when it's in the selection or its dropdown is open.
         let selected = app.checked.contains(&d.path)
             || matches!(&app.context_menu, Some(ContextMenu::Folder(p)) if p == &d.path);
-        let glyph = button(text(icon).font(LUCIDE).size(15.0).color(FOLDER_BLUE))
-            .style(row_plain)
-            .padding([2, 4])
-            .on_press(Message::ClickFolder(d.path.clone()));
+        // Lucide folders are outline-only (look pale); render the glyph white on
+        // a solid blue rounded chip so it reads as a filled, coloured folder.
+        let glyph = button(
+            container(text(icon).font(LUCIDE).size(12.0).color(Color::WHITE))
+                .padding([1, 3])
+                .style(folder_chip_style),
+        )
+        .style(row_plain)
+        .padding([2, 2])
+        .on_press(Message::ClickFolder(d.path.clone()));
         let name_area = mouse_area(
             container(name_element(&d.name, 13.0, 28, TEXT_DARK))
                 .width(Length::Fill)
