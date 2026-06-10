@@ -1668,24 +1668,19 @@ fn truncate(name: &str, max: usize) -> String {
 /// reveals the full name in a hover tooltip.
 fn name_element<'a>(name: &str, size: f32, max: usize, color: Color) -> Element<'a, Message> {
     let shown = truncate(name, max);
-    if shown == name {
-        text(shown)
+    // One line, clipped to its box so a long name never bleeds over the port.
+    let label = container(
+        text(shown.clone())
             .size(size)
             .color(color)
-            .wrapping(text::Wrapping::None)
-            .width(Length::Fill)
-            .into()
+            .wrapping(text::Wrapping::None),
+    )
+    .width(Length::Fill)
+    .clip(true);
+    if shown == name {
+        label.into()
     } else {
-        tip_text(
-            container(
-                text(shown)
-                    .size(size)
-                    .color(color)
-                    .wrapping(text::Wrapping::None),
-            )
-            .width(Length::Fill),
-            name.to_string(),
-        )
+        tip_text(label, name.to_string())
     }
 }
 
