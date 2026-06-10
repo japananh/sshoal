@@ -112,6 +112,7 @@ enum Message {
     FolderMenu(String),
     ActivateSelected,
     Escape,
+    Resized(f32),
     SelectDelta(i32),
     ModifiersChanged(iced::keyboard::Modifiers),
     CursorMoved(iced::Point),
@@ -234,6 +235,8 @@ struct App {
     filter: String,
     /// Connection-state filter.
     filter_state: StateFilter,
+    /// Current window width (for fitting tunnel names with an ellipsis).
+    window_width: f32,
 }
 
 impl App {
@@ -348,6 +351,7 @@ fn boot(runtime: Arc<tokio::runtime::Runtime>) -> (App, Task<Message>) {
         confirm_delete: None,
         filter: String::new(),
         filter_state: StateFilter::All,
+        window_width: 360.0,
     };
 
     // Show the window on launch so opening the app always surfaces it (the tray
@@ -723,6 +727,10 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::CursorMoved(p) => {
             app.cursor = p;
+            Task::none()
+        }
+        Message::Resized(w) => {
+            app.window_width = w;
             Task::none()
         }
         Message::CloseContextMenu => {
@@ -1491,12 +1499,21 @@ fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
     // and the toggle (which does connect/disconnect) are separate controls.
     let checked = app.checked.contains(&d.path);
     let port = app.rows[idx].tunnel.local_port;
+    // Fit the name to the actual column width so the ellipsis is always visible.
+    // Reserve space for indent, dot, the :port label, the terminal + toggle, the
+    // paddings/spacings and the scrollbar; the rest is ~6.6px per character.
+    let port_w = format!(":{port}").len() as f32 * 6.6;
+    let reserved =
+        12.0 + 2.0 + 16.0 + (d.depth as f32 * 10.0) + 9.0 + 12.0 + port_w + 29.0 + 40.0 + 40.0;
+    let name_max = ((app.window_width - reserved) / 6.6)
+        .floor()
+        .clamp(4.0, 60.0) as usize;
     let name_area = mouse_area(
         container(
             row![
                 indent,
                 status_dot(d.status),
-                name_element(&d.name, 13.0, 25, TEXT_DARK),
+                name_element(&d.name, 13.0, name_max, TEXT_DARK),
                 text(format!(":{port}"))
                     .size(11)
                     .color(Color::from_rgb(0.5, 0.5, 0.56)),
@@ -2173,6 +2190,9 @@ fn subscription(_app: &App) -> Subscription<Message> {
                 }) => Some(Message::Escape),
                 iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
                     Some(Message::CursorMoved(position))
+                }
+                iced::Event::Window(iced::window::Event::Resized(size)) => {
+                    Some(Message::Resized(size.width))
                 }
                 _ => None,
             }
