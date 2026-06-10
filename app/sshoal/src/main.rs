@@ -111,6 +111,7 @@ enum Message {
     FolderPress(String),
     FolderMenu(String),
     ActivateSelected,
+    Escape,
     SelectDelta(i32),
     ModifiersChanged(iced::keyboard::Modifiers),
     CursorMoved(iced::Point),
@@ -625,6 +626,25 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             }
             app.menu_at = app.cursor;
             app.context_menu = Some(ContextMenu::Folder(path));
+            Task::none()
+        }
+        Message::Escape => {
+            // Back out one level; if nothing is open, hide the window (the app
+            // keeps running in the tray — reopen with ⌃⌘S or the tray icon).
+            if app.confirm_delete.take().is_some()
+                || app.context_menu.take().is_some()
+                || app.editing.take().is_some()
+                || app.editing_ssh.take().is_some()
+            {
+                return Task::none();
+            }
+            if app.managing_ssh {
+                app.managing_ssh = false;
+                return Task::none();
+            }
+            if let Some(id) = app.window {
+                return window::close(id);
+            }
             Task::none()
         }
         Message::ActivateSelected => {
@@ -2140,6 +2160,10 @@ fn subscription(_app: &App) -> Subscription<Message> {
                     key: Key::Named(Named::Enter),
                     ..
                 }) => Some(Message::ActivateSelected),
+                iced::Event::Keyboard(Kbd::KeyPressed {
+                    key: Key::Named(Named::Escape),
+                    ..
+                }) => Some(Message::Escape),
                 iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
                     Some(Message::CursorMoved(position))
                 }
