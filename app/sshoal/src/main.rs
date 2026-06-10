@@ -109,6 +109,8 @@ enum Message {
     RowPress(usize),
     RowRightPress(usize),
     FolderPress(String),
+    FolderMenu(String),
+    ActivateSelected,
     SelectDelta(i32),
     ModifiersChanged(iced::keyboard::Modifiers),
     CursorMoved(iced::Point),
@@ -588,44 +590,10 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::RowPress(i) => {
             // Click SELECTS (never connects). ⌘ toggles one in/out; Shift extends
             // a range; a plain click selects just this row.
-            app.context_menu = None;
-            let Some(path) = app.rows.get(i).map(|r| r.tunnel.path.clone()) else {
-                return Task::none();
-            };
-            if app.modifiers.command() {
-                if !app.checked.remove(&path) {
-                    app.checked.insert(path.clone());
-                }
-                app.select_anchor = Some(path.clone());
-            } else if app.modifiers.shift() {
-                let order: Vec<String> = app
-                    .display_rows()
-                    .into_iter()
-                    .filter(|d| d.row_idx.is_some())
-                    .map(|d| d.path)
-                    .collect();
-                let cur = order.iter().position(|p| p == &path);
-                let anchor = app
-                    .select_anchor
-                    .as_ref()
-                    .and_then(|a| order.iter().position(|p| p == a));
-                match (anchor, cur) {
-                    (Some(a), Some(c)) => {
-                        for p in &order[a.min(c)..=a.max(c)] {
-                            app.checked.insert(p.clone());
-                        }
-                    }
-                    _ => {
-                        app.checked.insert(path.clone());
-                        app.select_anchor = Some(path.clone());
-                    }
-                }
-            } else {
-                // Plain click → open the edit screen. (⌘/Shift-click select; the
-                // right-click menu handles bulk actions.)
-                return update(app, Message::StartEdit(i));
+            // Left-click = select (plain/⌘/Shift). Edit is via the menu or Enter.
+            if let Some(path) = app.rows.get(i).map(|r| r.tunnel.path.clone()) {
+                apply_select(app, path);
             }
-            app.select_cursor = Some(path);
             Task::none()
         }
         Message::RowRightPress(i) => {
@@ -643,12 +611,40 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::FolderPress(path) => {
-            // Left-click a folder → select it + open its dropdown at the cursor.
-            app.checked.clear();
-            app.select_anchor = Some(path.clone());
-            app.select_cursor = Some(path.clone());
+            // Left-click a folder → select it (same as a tunnel).
+            apply_select(app, path);
+            Task::none()
+        }
+        Message::FolderMenu(path) => {
+            // Right-click a folder → open its dropdown at the cursor.
+            if !app.checked.contains(&path) {
+                app.checked.clear();
+                app.checked.insert(path.clone());
+                app.select_anchor = Some(path.clone());
+                app.select_cursor = Some(path.clone());
+            }
             app.menu_at = app.cursor;
             app.context_menu = Some(ContextMenu::Folder(path));
+            Task::none()
+        }
+        Message::ActivateSelected => {
+            // Enter on the selection: edit a single tunnel, or toggle a single
+            // folder. Ignored while a form/menu is up.
+            if app.editing.is_some()
+                || app.editing_ssh.is_some()
+                || app.confirm_delete.is_some()
+                || app.managing_ssh
+                || app.context_menu.is_some()
+            {
+                return Task::none();
+            }
+            if app.checked.len() == 1 {
+                let p = app.checked.iter().next().cloned().unwrap();
+                if let Some(i) = app.rows.iter().position(|r| r.tunnel.path == p) {
+                    return update(app, Message::StartEdit(i));
+                }
+                return update(app, Message::ClickFolder(p));
+            }
             Task::none()
         }
         Message::SelectDelta(delta) => {
@@ -682,37 +678,24 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 None => order.len() - 1,
             };
 
-            // Selecting a folder selects the folder AND all its tunnels (so it
-            // highlights and bulk actions apply); a tunnel selects just itself.
-            let select_paths = |idx: usize, rows: &[TunnelRow]| -> Vec<String> {
-                let (p, is_leaf) = &order[idx];
-                if *is_leaf {
-                    vec![p.clone()]
-                } else {
-                    folder_and_descendants(rows, p)
-                }
-            };
-
             if app.modifiers.shift() {
-                // Extend: select everything between the anchor and the new end.
+                // Extend: select every row (folder or tunnel) between the anchor
+                // and the new end.
                 let anchor = pos(&app.select_anchor).unwrap_or(next);
                 if app.select_anchor.is_none() {
                     app.select_anchor = Some(order[anchor].0.clone());
                 }
                 let (lo, hi) = (anchor.min(next), anchor.max(next));
-                let mut add = Vec::new();
-                for k in lo..=hi {
-                    add.extend(select_paths(k, &app.rows));
-                }
                 app.checked.clear();
-                app.checked.extend(add);
+                for (p, _) in order.iter().take(hi + 1).skip(lo) {
+                    app.checked.insert(p.clone());
+                }
                 app.select_cursor = Some(order[next].0.clone());
             } else {
                 // Plain move: clear everything, select just this row.
-                let add = select_paths(next, &app.rows);
                 let path = order[next].0.clone();
                 app.checked.clear();
-                app.checked.extend(add);
+                app.checked.insert(path.clone());
                 app.select_anchor = Some(path.clone());
                 app.select_cursor = Some(path);
             }
@@ -860,14 +843,53 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
 /// opens (otherwise typing goes nowhere until you click into it).
 const FILTER_ID: &str = "filter";
 
-/// Row indices of the currently checked tunnels.
+/// Row indices the selection resolves to: tunnels checked directly, plus every
+/// tunnel under a checked folder path.
 fn checked_indices(app: &App) -> Vec<usize> {
     app.rows
         .iter()
         .enumerate()
-        .filter(|(_, r)| app.checked.contains(&r.tunnel.path))
+        .filter(|(_, r)| {
+            let p = &r.tunnel.path;
+            app.checked.contains(p) || app.checked.iter().any(|c| p.starts_with(&format!("{c}/")))
+        })
         .map(|(i, _)| i)
         .collect()
+}
+
+/// Apply a click selection (⌘ toggles, Shift extends a range, plain replaces)
+/// for `path` — works for both folder and tunnel paths.
+fn apply_select(app: &mut App, path: String) {
+    app.context_menu = None;
+    if app.modifiers.command() {
+        if !app.checked.remove(&path) {
+            app.checked.insert(path.clone());
+        }
+        app.select_anchor = Some(path.clone());
+    } else if app.modifiers.shift() {
+        let order: Vec<String> = app.display_rows().into_iter().map(|d| d.path).collect();
+        let cur = order.iter().position(|p| p == &path);
+        let anchor = app
+            .select_anchor
+            .as_ref()
+            .and_then(|a| order.iter().position(|p| p == a));
+        match (anchor, cur) {
+            (Some(a), Some(c)) => {
+                for p in &order[a.min(c)..=a.max(c)] {
+                    app.checked.insert(p.clone());
+                }
+            }
+            _ => {
+                app.checked.insert(path.clone());
+                app.select_anchor = Some(path.clone());
+            }
+        }
+    } else {
+        app.checked.clear();
+        app.checked.insert(path.clone());
+        app.select_anchor = Some(path.clone());
+    }
+    app.select_cursor = Some(path);
 }
 
 /// The folder path of the open folder dropdown, if any.
@@ -876,15 +898,6 @@ fn context_folder(app: &App) -> Option<String> {
         Some(ContextMenu::Folder(p)) => Some(p.clone()),
         _ => None,
     }
-}
-
-/// A folder's own path plus the paths of every tunnel under it.
-fn folder_and_descendants(rows: &[TunnelRow], folder_path: &str) -> Vec<String> {
-    let mut paths = vec![folder_path.to_string()];
-    for i in descendant_indices(rows, folder_path) {
-        paths.push(rows[i].tunnel.path.clone());
-    }
-    paths
 }
 
 /// Row indices whose tunnel sits at or under `folder_path`.
@@ -1228,19 +1241,47 @@ fn aggregate(states: impl Iterator<Item = TunnelState>) -> TunnelState {
 // ---- view ----
 
 fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
-    if let Some(pending) = &app.confirm_delete {
-        return confirm_view(pending);
-    }
     if let Some(form) = &app.editing_ssh {
         return ssh_edit_view(form);
-    }
-    if app.managing_ssh {
-        return ssh_list_view(app);
     }
     if let Some(form) = &app.editing {
         return edit_view(form, &app.ssh_names());
     }
 
+    // The base screen: SSH-config list or the tunnel tree.
+    let base: Element<Message> = if app.managing_ssh {
+        ssh_list_view(app)
+    } else {
+        tunnels_base(app)
+    };
+
+    // Delete confirmation floats centered over whatever screen is showing.
+    if let Some(pending) = &app.confirm_delete {
+        let backdrop = mouse_area(space().width(Length::Fill).height(Length::Fill))
+            .on_press(Message::CancelDelete);
+        let centered = container(confirm_view(pending))
+            .center_x(Length::Fill)
+            .center_y(Length::Fill);
+        return stack![base, backdrop, centered].into();
+    }
+    // The options dropdown floats at the cursor (tunnels screen only).
+    if !app.managing_ssh
+        && let Some(menu) = &app.context_menu
+    {
+        let x = app.menu_at.x.clamp(0.0, 200.0);
+        let y = app.menu_at.y.clamp(0.0, 480.0);
+        let backdrop = mouse_area(space().width(Length::Fill).height(Length::Fill))
+            .on_press(Message::CloseContextMenu);
+        let floating = column![
+            space().height(Length::Fixed(y)),
+            row![space().width(Length::Fixed(x)), menu_panel(app, menu)],
+        ];
+        return stack![base, backdrop, floating].into();
+    }
+    base
+}
+
+fn tunnels_base(app: &App) -> Element<'_, Message> {
     // Compact header: search box (with a leading magnifier) + settings + add.
     let search = text_input("Search name, folder or port…", &app.filter)
         .id(FILTER_ID)
@@ -1320,29 +1361,14 @@ fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
         screen = screen.push(container(chips).padding(pad_r(10.0)));
     }
     screen = screen.push(body);
-    let base = container(screen).padding(iced::Padding {
-        top: 12.0,
-        right: 2.0,
-        bottom: 12.0,
-        left: 12.0,
-    });
-
-    // No menu open → just the screen.
-    let Some(menu) = &app.context_menu else {
-        return base.into();
-    };
-    // Menu open → float the dropdown over the screen at the cursor, with a
-    // full-window backdrop that dismisses it on any outside click. Nothing in
-    // the base layout shifts.
-    let x = app.menu_at.x.clamp(0.0, 200.0);
-    let y = app.menu_at.y.clamp(0.0, 480.0);
-    let backdrop = mouse_area(space().width(Length::Fill).height(Length::Fill))
-        .on_press(Message::CloseContextMenu);
-    let floating = column![
-        space().height(Length::Fixed(y)),
-        row![space().width(Length::Fixed(x)), menu_panel(app, menu)],
-    ];
-    stack![base, backdrop, floating].into()
+    container(screen)
+        .padding(iced::Padding {
+            top: 12.0,
+            right: 2.0,
+            bottom: 12.0,
+            left: 12.0,
+        })
+        .into()
 }
 
 /// A visible-but-subtle separator line between folder groups.
@@ -1427,7 +1453,8 @@ fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
                     ..Default::default()
                 }),
         )
-        .on_press(Message::FolderPress(d.path.clone()));
+        .on_press(Message::FolderPress(d.path.clone()))
+        .on_right_press(Message::FolderMenu(d.path.clone()));
         return row![indent, glyph, name_area]
             .spacing(6)
             .align_y(iced::Alignment::Center)
@@ -2069,7 +2096,12 @@ fn confirm_view(pending: &PendingDelete) -> Element<'_, Message> {
         .spacing(10),
     ]
     .spacing(10);
-    container(col).padding(16).into()
+    // A floating popover (not a full screen).
+    container(col)
+        .padding(16)
+        .width(Length::Fixed(300.0))
+        .style(menu_box_style)
+        .into()
 }
 
 fn status_dot(state: TunnelState) -> Element<'static, Message> {
@@ -2104,6 +2136,10 @@ fn subscription(_app: &App) -> Subscription<Message> {
                     key: Key::Named(Named::ArrowDown),
                     ..
                 }) => Some(Message::SelectDelta(1)),
+                iced::Event::Keyboard(Kbd::KeyPressed {
+                    key: Key::Named(Named::Enter),
+                    ..
+                }) => Some(Message::ActivateSelected),
                 iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
                     Some(Message::CursorMoved(position))
                 }
