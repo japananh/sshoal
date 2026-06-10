@@ -1496,7 +1496,7 @@ fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
             row![
                 indent,
                 status_dot(d.status),
-                name_element(&d.name, 13.0, 16, TEXT_DARK),
+                name_element(&d.name, 13.0, 20, TEXT_DARK),
                 text(format!(":{port}"))
                     .size(11)
                     .color(Color::from_rgb(0.5, 0.5, 0.56)),
@@ -2240,7 +2240,7 @@ fn register_hotkey() -> Option<GlobalHotKeyManager> {
 
 fn open_window_settings() -> window::Settings {
     window::Settings {
-        size: Size::new(340.0, 620.0),
+        size: Size::new(360.0, 620.0),
         min_size: Some(Size::new(300.0, 380.0)),
         ..window::Settings::default()
     }
