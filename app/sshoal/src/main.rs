@@ -2238,8 +2238,8 @@ fn register_hotkey() -> Option<GlobalHotKeyManager> {
 
 fn open_window_settings() -> window::Settings {
     window::Settings {
-        size: Size::new(380.0, 620.0),
-        min_size: Some(Size::new(320.0, 380.0)),
+        size: Size::new(320.0, 620.0),
+        min_size: Some(Size::new(280.0, 380.0)),
         ..window::Settings::default()
     }
 }
