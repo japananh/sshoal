@@ -1548,6 +1548,7 @@ fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
     );
     let line = row![name_area, term, switch]
         .spacing(8)
+        .height(Length::Fixed(30.0))
         .align_y(iced::Alignment::Center);
 
     let mut col = column![line].spacing(2);
