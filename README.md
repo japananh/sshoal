@@ -44,7 +44,13 @@ cargo run -p sshoal
 # …or build a proper macOS .app (no Dock icon) into target/release/sshoal.app
 ./scripts/package-macos.sh
 open target/release/sshoal.app
+
+# …or build a drag-to-Applications disk image: target/sshoal-<version>.dmg
+./scripts/make-dmg.sh
 ```
+
+The `.app`/`.dmg` aren't code-signed yet, so on first launch right-click → **Open**
+(or `xattr -dr com.apple.quarantine /Applications/sshoal.app`).
 
 Requires the stable Rust toolchain ([rustup](https://rustup.rs)). On Ubuntu you'll
 also need the GUI / tray system libraries:
