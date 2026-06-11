@@ -1,0 +1,46 @@
+name: release
+
+# Build artifacts and attach them to the GitHub Release when a version tag is
+# pushed (e.g. v0.0.1-beta.2). Pre-release tags (anything with a "-") are marked
+# as pre-releases.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build .dmg
+        run: ./scripts/make-dmg.sh
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/sshoal-*.dmg
+          prerelease: ${{ contains(github.ref_name, '-') }}
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install GUI deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev libxdo-dev libxkbcommon-dev
+      - name: Build binary
+        run: cargo build --release -p sshoal
+      - name: Package tarball
+        run: |
+          tar -C target/release -czf "sshoal-${GITHUB_REF_NAME}-linux-x86_64.tar.gz" sshoal
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: sshoal-*-linux-x86_64.tar.gz
+          prerelease: ${{ contains(github.ref_name, '-') }}

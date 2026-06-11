@@ -6,7 +6,7 @@
 
 [![CI](https://github.com/japananh/sshoal/actions/workflows/ci.yml/badge.svg)](https://github.com/japananh/sshoal/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Status: beta](https://img.shields.io/badge/status-beta-yellow.svg)](#)
+[![Release](https://img.shields.io/github/v/release/japananh/sshoal?include_prereleases&sort=semver)](https://github.com/japananh/sshoal/releases)
 
 macOS (Tahoe+) · Ubuntu (22.04+)
 
@@ -23,16 +23,23 @@ macOS (Tahoe+) · Ubuntu (22.04+)
 
 ## Install
 
-Build from source (stable [Rust](https://rustup.rs)):
+**macOS** — one line (downloads the latest [release](https://github.com/japananh/sshoal/releases) `.dmg`, installs to /Applications, clears Gatekeeper):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/japananh/sshoal/main/packaging/macos/install.sh | bash
+```
+
+Or grab the `.dmg` from [Releases](https://github.com/japananh/sshoal/releases) and drag **sshoal.app** to Applications. Not notarized yet → on first launch right-click → **Open**.
+
+**From source** (stable [Rust](https://rustup.rs)):
 
 ```sh
 git clone https://github.com/japananh/sshoal.git && cd sshoal
 cargo run -p sshoal      # run the tray app
-./scripts/make-dmg.sh    # …or build target/sshoal-<ver>.dmg (drag to /Applications)
+./scripts/make-dmg.sh    # …or build a .dmg locally
 ```
 
 Ubuntu also needs `libgtk-3-dev libayatana-appindicator3-dev libxdo-dev libxkbcommon-dev`.
-Not signed yet → on first launch right-click → **Open**.
 
 ## Use
 
