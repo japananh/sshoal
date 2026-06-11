@@ -7,10 +7,15 @@
 [![CI](https://github.com/japananh/sshoal/actions/workflows/ci.yml/badge.svg)](https://github.com/japananh/sshoal/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](https://www.rust-lang.org)
+[![Status: beta](https://img.shields.io/badge/status-beta-yellow.svg)](#)
 
 For macOS (Tahoe+) and Ubuntu (22.04+).
 
 </div>
+
+> [!NOTE]
+> **Beta (`0.0.1-beta`).** Solid for daily use, but the UX and the
+> `servers.yaml` format may still change between betas.
 
 No more `ssh -N -L …` in a terminal you can't close. sshoal sits in the menu bar,
 keeps every tunnel up in the background with live health, and your whole setup is
