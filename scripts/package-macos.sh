@@ -12,6 +12,8 @@ cd "$(dirname "$0")/.."
 
 APP="target/release/sshoal.app"
 VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+# CFBundleShortVersionString must be numeric x.y.z — drop any -beta/-rc suffix.
+SHORT_VERSION="${VERSION%%-*}"
 
 echo "==> building release binary"
 cargo build --release -p sshoal
@@ -45,7 +47,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleVersion</key>
     <string>${VERSION}</string>
     <key>CFBundleShortVersionString</key>
-    <string>${VERSION}</string>
+    <string>${SHORT_VERSION}</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>LSMinimumSystemVersion</key>

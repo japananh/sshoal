@@ -4219,7 +4219,7 @@ dependencies = [
 
 [[package]]
 name = "sshoal"
-version = "0.1.0"
+version = "0.0.1-beta.1"
 dependencies = [
  "chrono",
  "global-hotkey",
@@ -4235,7 +4235,7 @@ dependencies = [
 
 [[package]]
 name = "sshoal-core"
-version = "0.1.0"
+version = "0.0.1-beta.1"
 dependencies = [
  "age",
  "anyhow",
