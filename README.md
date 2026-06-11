@@ -12,9 +12,6 @@ macOS (Tahoe+) · Ubuntu (22.04+)
 
 </div>
 
-> [!NOTE]
-> Beta (`0.0.1-beta`) — the UX and the `servers.yaml` format may still change.
-
 ## Features
 
 - 🔌 **Auto-reconnecting tunnels** with live health — a backoff supervisor keeps each one up and surfaces failures inline.
