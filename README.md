@@ -31,6 +31,14 @@ curl -fsSL https://raw.githubusercontent.com/japananh/sshoal/main/packaging/maco
 
 Or grab the `.dmg` from [Releases](https://github.com/japananh/sshoal/releases) and drag **sshoal.app** to Applications. Not notarized yet → on first launch right-click → **Open**.
 
+**Linux** (x86_64) — drops the `sshoal` binary into `~/.local/bin`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/japananh/sshoal/main/packaging/linux/install.sh | sh
+```
+
+Needs a system tray (on GNOME, the AppIndicator extension) plus the runtime libs above.
+
 **From source** (stable [Rust](https://rustup.rs)):
 
 ```sh
