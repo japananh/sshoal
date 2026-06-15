@@ -21,17 +21,19 @@ if [ -z "${DMG_URL:-}" ]; then
 fi
 
 TMP=$(mktemp -d)
+MNT="$TMP/mnt"
 trap 'hdiutil detach "$MNT" -quiet 2>/dev/null || true; rm -rf "$TMP"' EXIT
 
 echo "==> downloading $(basename "$DMG_URL")"
 curl -fsSL "$DMG_URL" -o "$TMP/sshoal.dmg"
 
 echo "==> installing to /Applications"
-MNT=$(hdiutil attach "$TMP/sshoal.dmg" -nobrowse -quiet | grep -o '/Volumes/.*' | head -1)
+# Mount at our own path so we never parse hdiutil output (-quiet hides it).
+mkdir -p "$MNT"
+hdiutil attach "$TMP/sshoal.dmg" -nobrowse -quiet -mountpoint "$MNT"
 rm -rf /Applications/sshoal.app
 cp -R "$MNT/sshoal.app" /Applications/
 hdiutil detach "$MNT" -quiet
-MNT=""
 xattr -dr com.apple.quarantine /Applications/sshoal.app 2>/dev/null || true
 
 echo "==> done. Launch from Spotlight, or:  open -a sshoal"

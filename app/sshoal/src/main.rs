@@ -157,6 +157,14 @@ enum Message {
     ReportBug,
     /// Hide the update banner and remember not to show this version again.
     DismissUpdate,
+    /// Open the confirm-to-update popover.
+    PromptUpdate,
+    /// Close the update popover without doing anything.
+    CloseUpdatePrompt,
+    /// Download + install the latest release, then relaunch.
+    InstallUpdate,
+    /// Result of the install — Ok(()) (about to relaunch) or a failure.
+    UpdateInstalled(Result<(), String>),
 }
 
 struct MenuIds {
@@ -272,6 +280,10 @@ struct App {
     update_checking: bool,
     /// Transient result of the last manual check, shown in Preferences.
     update_status: Option<String>,
+    /// The confirm-to-update popover is open.
+    update_prompt: bool,
+    /// An install (download + replace) is in flight.
+    update_installing: bool,
 }
 
 impl App {
@@ -393,6 +405,8 @@ fn boot(runtime: Arc<tokio::runtime::Runtime>) -> (App, Task<Message>) {
         update_info: None,
         update_checking: false,
         update_status: None,
+        update_prompt: false,
+        update_installing: false,
     };
 
     // Show the window on launch so opening the app always surfaces it (the tray
@@ -1014,6 +1028,50 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             }
             Task::none()
         }
+        Message::PromptUpdate => {
+            if app.update_info.is_some() {
+                app.update_prompt = true;
+            }
+            Task::none()
+        }
+        Message::CloseUpdatePrompt => {
+            if !app.update_installing {
+                app.update_prompt = false;
+            }
+            Task::none()
+        }
+        Message::InstallUpdate => {
+            if app.update_installing {
+                return Task::none();
+            }
+            app.update_installing = true;
+            app.update_status = Some("Downloading and installing…".to_string());
+            let runtime = app.runtime.clone();
+            Task::perform(
+                async move {
+                    runtime
+                        .spawn_blocking(updater::install_latest)
+                        .await
+                        .map_err(|e| e.to_string())
+                        .and_then(|r| r.map_err(|e| e.to_string()))
+                },
+                Message::UpdateInstalled,
+            )
+        }
+        Message::UpdateInstalled(result) => {
+            app.update_installing = false;
+            match result {
+                Ok(()) => {
+                    info!("update installed; relaunching");
+                    relaunch_app();
+                    return iced::exit();
+                }
+                Err(e) => {
+                    app.update_status = Some(format!("Update failed: {e}"));
+                }
+            }
+            Task::none()
+        }
         Message::WindowOpened(id) => {
             info!(window = ?id, "window opened");
             // Put the cursor in the search box so you can filter by just typing.
@@ -1443,12 +1501,11 @@ fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
     if let Some(form) = &app.editing {
         return edit_view(form, &app.ssh_names());
     }
-    if app.managing_prefs {
-        return prefs_view(app);
-    }
 
-    // The base screen: SSH-config list or the tunnel tree.
-    let base: Element<Message> = if app.managing_ssh {
+    // The base screen: Preferences, SSH-config list, or the tunnel tree.
+    let base: Element<Message> = if app.managing_prefs {
+        prefs_view(app)
+    } else if app.managing_ssh {
         ssh_list_view(app)
     } else {
         tunnels_base(app)
@@ -1463,8 +1520,20 @@ fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
             .center_y(Length::Fill);
         return stack![base, backdrop, centered].into();
     }
+    // Confirm-to-update popover, centered over whatever screen is showing.
+    if app.update_prompt
+        && let Some(info) = &app.update_info
+    {
+        let backdrop = mouse_area(space().width(Length::Fill).height(Length::Fill))
+            .on_press(Message::CloseUpdatePrompt);
+        let centered = container(update_prompt_view(info, app.update_installing))
+            .center_x(Length::Fill)
+            .center_y(Length::Fill);
+        return stack![base, backdrop, centered].into();
+    }
     // The options dropdown floats at the cursor (tunnels screen only).
     if !app.managing_ssh
+        && !app.managing_prefs
         && let Some(menu) = &app.context_menu
     {
         let x = app.menu_at.x.clamp(0.0, 200.0);
@@ -1595,15 +1664,15 @@ fn update_banner<'a>(info: &UpdateInfo) -> Element<'a, Message> {
         info.current, info.latest
     ))
     .size(12);
-    let view = button(text("View").size(12))
+    let update = button(text("Update").size(12))
         .style(pill_button)
         .padding([3, 12])
-        .on_press(Message::OpenReleasePage);
+        .on_press(Message::PromptUpdate);
     let dismiss = button(text("✕").size(12))
         .style(pill_secondary)
         .padding([3, 9])
         .on_press(Message::DismissUpdate);
-    let bar = row![label, space().width(Length::Fill), view, dismiss]
+    let bar = row![label, space().width(Length::Fill), update, dismiss]
         .spacing(8)
         .align_y(iced::Alignment::Center);
     container(bar)
@@ -1617,6 +1686,50 @@ fn update_banner<'a>(info: &UpdateInfo) -> Element<'a, Message> {
             },
             ..Default::default()
         })
+        .into()
+}
+
+/// Confirm-to-update popover: shows the version jump and downloads + installs +
+/// relaunches on "Update now". Buttons disable while the install runs.
+fn update_prompt_view<'a>(info: &UpdateInfo, installing: bool) -> Element<'a, Message> {
+    let mut col = column![
+        text("Update available").size(16),
+        text(format!("v{} → {}", info.current, info.latest))
+            .size(13)
+            .color(TEXT_DARK),
+        caption("Downloads the new version and relaunches sshoal."),
+    ]
+    .spacing(8);
+    if installing {
+        col = col.push(caption("Downloading and installing…"));
+    }
+
+    let mut update_now = button(text("Update now").size(13))
+        .style(pill_button)
+        .padding([5, 16]);
+    if !installing {
+        update_now = update_now.on_press(Message::InstallUpdate);
+    }
+    let actions = row![
+        update_now,
+        button(text("View").size(13))
+            .style(pill_secondary)
+            .padding([5, 16])
+            .on_press(Message::OpenReleasePage),
+        space().width(Length::Fill),
+        button(text("Later").size(13))
+            .style(pill_secondary)
+            .padding([5, 16])
+            .on_press(Message::CloseUpdatePrompt),
+    ]
+    .spacing(8)
+    .align_y(iced::Alignment::Center);
+    col = col.push(actions);
+
+    container(col)
+        .padding(16)
+        .width(Length::Fixed(320.0))
+        .style(menu_box_style)
         .into()
 }
 
@@ -1665,6 +1778,9 @@ fn prefs_view(app: &App) -> Element<'_, Message> {
     .spacing(10);
     if let Some(status) = &app.update_status {
         updates = updates.push(caption(status.clone()));
+    }
+    if app.update_info.is_some() {
+        updates = updates.push(primary_button("Update now", Message::PromptUpdate));
     }
 
     let about = column![
@@ -1736,6 +1852,27 @@ fn open_url(url: &str) {
     if let Err(e) = std::process::Command::new(prog).arg(url).spawn() {
         tracing::warn!(error = %e, url, "failed to open url");
     }
+}
+
+/// Relaunch sshoal after an in-place update. We detach a tiny shell that waits a
+/// beat (so this process has fully exited and released LaunchServices) and then
+/// reopens the freshly-installed app.
+fn relaunch_app() {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    #[cfg(target_os = "macos")]
+    let cmd = match exe
+        .ancestors()
+        .find(|p| p.extension().is_some_and(|e| e == "app"))
+    {
+        Some(app) => format!("sleep 1; open '{}'", app.display()),
+        None => format!("sleep 1; '{}' &", exe.display()),
+    };
+    #[cfg(not(target_os = "macos"))]
+    let cmd = format!("sleep 1; '{}' &", exe.display());
+
+    let _ = std::process::Command::new("sh").arg("-c").arg(cmd).spawn();
 }
 
 /// A visible-but-subtle separator line between folder groups.

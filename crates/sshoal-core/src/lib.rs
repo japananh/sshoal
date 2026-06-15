@@ -20,4 +20,4 @@ pub use import::{SshHost, parse_ssh_config, parse_tunnel_file, ssh_configs_for};
 pub use supervisor::{Backoff, TunnelState, TunnelSupervisor};
 pub use transfer::{ExportError, ImportError, export, import};
 pub use transport::{OpenSshTransport, Transport, TunnelHandle, build_ssh_args};
-pub use updater::{UpdateError, UpdateInfo, check_latest};
+pub use updater::{UpdateError, UpdateInfo, check_latest, install_latest};

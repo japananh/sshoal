@@ -53,6 +53,8 @@ pub enum UpdateError {
     Curl(String),
     #[error("parsing GitHub response: {0}")]
     Parse(#[from] serde_json::Error),
+    #[error("installing update: {0}")]
+    Install(String),
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -63,6 +65,16 @@ struct GhRelease {
     html_url: String,
     #[serde(default)]
     draft: bool,
+    #[serde(default)]
+    assets: Vec<GhAsset>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GhAsset {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    browser_download_url: String,
 }
 
 /// Check whether a release newer than `current` exists. `current` is the running
@@ -70,6 +82,12 @@ struct GhRelease {
 /// is optional, and an unparseable value sorts below any release so a dev build
 /// still sees that a release exists. Blocking — call it off the UI thread.
 pub fn check_latest(current: &str) -> Result<UpdateInfo, UpdateError> {
+    Ok(info_from_releases(current, &fetch_releases()?))
+}
+
+/// Fetch the recent releases from the GitHub API (via `curl`). Shared by the
+/// check and the installer.
+fn fetch_releases() -> Result<Vec<GhRelease>, UpdateError> {
     let output = Command::new("curl")
         .args([
             "-fsSL",
@@ -90,8 +108,139 @@ pub fn check_latest(current: &str) -> Result<UpdateInfo, UpdateError> {
             .unwrap_or_else(|| "signal".into());
         return Err(UpdateError::Curl(code));
     }
-    let releases: Vec<GhRelease> = serde_json::from_slice(&output.stdout)?;
-    Ok(info_from_releases(current, &releases))
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+/// Download the newest release's artifact for this platform and install it over
+/// the running app, then return. Blocking — call off the UI thread. The caller
+/// relaunches afterwards. (macOS: replaces the running `.app` from the `.dmg`;
+/// Linux: replaces the running binary from the tarball.)
+pub fn install_latest() -> Result<(), UpdateError> {
+    let releases = fetch_releases()?;
+    let latest = newest_published(&releases)
+        .ok_or_else(|| UpdateError::Install("no published release to install".into()))?;
+    let suffix = asset_suffix();
+    let asset = latest
+        .assets
+        .iter()
+        .find(|a| a.name.ends_with(suffix))
+        .ok_or_else(|| {
+            UpdateError::Install(format!("release {} has no {suffix} asset", latest.tag_name))
+        })?;
+    install_asset(&asset.browser_download_url)
+}
+
+/// The release-asset filename suffix for the current platform.
+fn asset_suffix() -> &'static str {
+    if cfg!(target_os = "macos") {
+        ".dmg"
+    } else {
+        "linux-x86_64.tar.gz"
+    }
+}
+
+/// A scratch dir under the system temp, removed on drop.
+struct ScratchDir(std::path::PathBuf);
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+fn scratch_dir() -> Result<ScratchDir, UpdateError> {
+    let dir = std::env::temp_dir().join(format!("sshoal-update-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).map_err(|e| UpdateError::Install(format!("temp dir: {e}")))?;
+    Ok(ScratchDir(dir))
+}
+
+fn run(cmd: &str, args: &[&str]) -> Result<std::process::Output, UpdateError> {
+    let out = Command::new(cmd).args(args).output()?;
+    if !out.status.success() {
+        return Err(UpdateError::Install(format!(
+            "{cmd} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(out)
+}
+
+/// The path of the running app bundle we should replace, derived from the
+/// executable: `.../sshoal.app/Contents/MacOS/sshoal` → `.../sshoal.app`.
+#[cfg(target_os = "macos")]
+fn running_app_bundle() -> Result<std::path::PathBuf, UpdateError> {
+    let exe = std::env::current_exe()?;
+    exe.ancestors()
+        .find(|p| p.extension().is_some_and(|e| e == "app"))
+        .map(|p| p.to_path_buf())
+        .ok_or_else(|| UpdateError::Install("not running from a .app bundle".into()))
+}
+
+#[cfg(target_os = "macos")]
+fn install_asset(url: &str) -> Result<(), UpdateError> {
+    let app = running_app_bundle()?;
+    let app_str = app.to_string_lossy().to_string();
+    let scratch = scratch_dir()?;
+    let dmg_str = scratch.0.join("sshoal.dmg").to_string_lossy().to_string();
+    // Mount at our own path so we never have to parse `hdiutil` output (and so
+    // `-quiet`, which suppresses that output, is safe).
+    let mnt = scratch.0.join("mnt");
+    std::fs::create_dir_all(&mnt).map_err(|e| UpdateError::Install(format!("mount dir: {e}")))?;
+    let mnt_str = mnt.to_string_lossy().to_string();
+
+    run("curl", &["-fsSL", url, "-o", &dmg_str])?;
+    run(
+        "hdiutil",
+        &[
+            "attach",
+            &dmg_str,
+            "-nobrowse",
+            "-quiet",
+            "-mountpoint",
+            &mnt_str,
+        ],
+    )?;
+
+    let result = (|| {
+        let src = mnt.join("sshoal.app").to_string_lossy().to_string();
+        // Replace the bundle in place. macOS lets you remove a running bundle —
+        // the live process keeps its executable inode until it exits.
+        let _ = std::fs::remove_dir_all(&app);
+        run("cp", &["-R", &src, &app_str])?;
+        let _ = Command::new("xattr")
+            .args(["-dr", "com.apple.quarantine", &app_str])
+            .status();
+        Ok(())
+    })();
+
+    let _ = Command::new("hdiutil")
+        .args(["detach", &mnt_str, "-quiet"])
+        .status();
+    result
+}
+
+#[cfg(not(target_os = "macos"))]
+fn install_asset(url: &str) -> Result<(), UpdateError> {
+    let exe = std::env::current_exe()?;
+    let scratch = scratch_dir()?;
+    let tarball = scratch.0.join("sshoal.tar.gz");
+    let tar_str = tarball.to_string_lossy().to_string();
+    let dir_str = scratch.0.to_string_lossy().to_string();
+
+    run("curl", &["-fsSL", url, "-o", &tar_str])?;
+    run("tar", &["-C", &dir_str, "-xzf", &tar_str])?;
+
+    // Atomically replace the running binary: write the new one beside it, then
+    // rename over (Linux keeps the old inode for the live process).
+    let new_bin = scratch.0.join("sshoal");
+    let staged = exe.with_extension("new");
+    std::fs::copy(&new_bin, &staged).map_err(|e| UpdateError::Install(format!("copy: {e}")))?;
+    let mut perms = std::fs::metadata(&staged)
+        .map_err(|e| UpdateError::Install(format!("stat: {e}")))?
+        .permissions();
+    use std::os::unix::fs::PermissionsExt;
+    perms.set_mode(0o755);
+    let _ = std::fs::set_permissions(&staged, perms);
+    std::fs::rename(&staged, &exe).map_err(|e| UpdateError::Install(format!("replace: {e}")))?;
+    Ok(())
 }
 
 /// The pure half of a check: given the running version and the fetched
@@ -223,6 +372,7 @@ mod tests {
             tag_name: tag.into(),
             html_url: format!("https://example.test/{tag}"),
             draft: false,
+            assets: vec![],
         }
     }
 
@@ -257,6 +407,7 @@ mod tests {
                 tag_name: "v9.9.9".into(),
                 html_url: String::new(),
                 draft: true, // a draft must never win
+                assets: vec![],
             },
             rel("v0.0.1-beta.3"),
             rel("v0.0.1-beta.2"),
