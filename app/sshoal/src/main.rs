@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use iced::widget::{
-    button, column, container, mouse_area, pick_list, row, scrollable, space, stack, text,
+    Text, button, column, container, mouse_area, pick_list, row, scrollable, space, stack, text,
     text_input, toggler, tooltip,
 };
 use iced::{Color, Element, Font, Length, Size, Subscription, Task, Theme, window};
@@ -33,13 +33,20 @@ const ICON_FOLDER: &str = "\u{e0d7}";
 const ICON_FOLDER_OPEN: &str = "\u{e247}";
 const ICON_TERMINAL: &str = "\u{e181}";
 const ICON_SETTINGS: &str = "\u{e154}";
+const ICON_SLIDERS: &str = "\u{e29a}";
 const ICON_SEARCH: char = '\u{e151}';
 /// The running version, compared against the newest GitHub release tag.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Where the "Report a bug" button sends the user.
+const ISSUES_URL: &str = "https://github.com/japananh/sshoal/issues/new";
 /// Blue used for the folder glyph (and a selected folder's name).
 const FOLDER_BLUE: Color = Color::from_rgb(0.20, 0.50, 0.95);
 /// Default dark row text.
 const TEXT_DARK: Color = Color::from_rgb(0.13, 0.13, 0.18);
+/// Secondary text: captions, sub-labels, section headings, status lines.
+const TEXT_MUTED: Color = Color::from_rgb(0.5, 0.5, 0.56);
+/// Error / destructive text.
+const TEXT_DANGER: Color = Color::from_rgb(0.9, 0.3, 0.3);
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use sshoal_core::updater::{self, RELEASES_URL, UpdateInfo};
@@ -137,6 +144,7 @@ enum Message {
     FilterInput(String),
     SetFilter(StateFilter),
     // Preferences screen + auto-update.
+    OpenPrefs,
     ClosePrefs,
     ToggleAutoUpdate(bool),
     /// Run an update check now (from launch or the "Check now" button).
@@ -145,6 +153,8 @@ enum Message {
     UpdateChecked(Result<UpdateInfo, String>),
     /// Open the release page (or the releases list) in the browser.
     OpenReleasePage,
+    /// Open the GitHub "new issue" page in the browser.
+    ReportBug,
     /// Hide the update banner and remember not to show this version again.
     DismissUpdate,
 }
@@ -931,6 +941,15 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             app.filter_state = state;
             Task::none()
         }
+        Message::OpenPrefs => {
+            // A clean top-level screen: drop any other screen/form first.
+            app.managing_prefs = true;
+            app.managing_ssh = false;
+            app.editing = None;
+            app.editing_ssh = None;
+            app.context_menu = None;
+            Task::none()
+        }
         Message::ClosePrefs => {
             app.managing_prefs = false;
             Task::none()
@@ -982,6 +1001,10 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 .map(|i| i.url.clone())
                 .unwrap_or_else(|| RELEASES_URL.to_string());
             open_url(&url);
+            Task::none()
+        }
+        Message::ReportBug => {
+            open_url(ISSUES_URL);
             Task::none()
         }
         Message::DismissUpdate => {
@@ -1480,6 +1503,10 @@ fn tunnels_base(app: &App) -> Element<'_, Message> {
     let header = row![
         search,
         tip(
+            icon_button(ICON_SLIDERS, 18.0, Message::OpenPrefs),
+            "Preferences"
+        ),
+        tip(
             icon_button(ICON_SETTINGS, 18.0, Message::OpenSshConfigs),
             "SSH configs"
         ),
@@ -1602,12 +1629,10 @@ fn prefs_view(app: &App) -> Element<'_, Message> {
             icon_button(ICON_CHEVRON_LEFT, 18.0, Message::ClosePrefs),
             "Back"
         ),
-        text("Preferences").size(18).width(Length::Fill),
+        screen_title("Preferences").width(Length::Fill),
     ]
     .spacing(8)
     .align_y(iced::Alignment::Center);
-
-    let muted = Color::from_rgb(0.5, 0.5, 0.56);
 
     let auto_row = row![
         text("Automatically check for updates")
@@ -1624,44 +1649,81 @@ fn prefs_view(app: &App) -> Element<'_, Message> {
     } else {
         "Check now"
     };
-    let mut check = button(text(check_label).size(13))
-        .style(pill_secondary)
-        .padding([5, 16]);
-    if !app.update_checking {
-        check = check.on_press(Message::CheckUpdates);
-    }
+    // Disabled (no on_press) while a check is in flight.
+    let check = secondary_button(
+        check_label,
+        (!app.update_checking).then_some(Message::CheckUpdates),
+    );
 
     let mut updates = column![
-        text("Updates").size(12).color(muted),
         auto_row,
-        text("Checks GitHub for new releases on launch and notifies you. Updates are never installed automatically.")
-            .size(11)
-            .color(muted),
+        caption(
+            "Checks GitHub for new releases on launch and notifies you. Updates are never installed automatically."
+        ),
         check,
     ]
     .spacing(10);
     if let Some(status) = &app.update_status {
-        updates = updates.push(text(status.clone()).size(11).color(muted));
+        updates = updates.push(caption(status.clone()));
     }
 
     let about = column![
-        text("About").size(12).color(muted),
         text(format!("sshoal v{VERSION}")).size(13),
-        button(text("View on GitHub").size(12))
-            .style(pill_secondary)
-            .padding([5, 16])
-            .on_press(Message::OpenReleasePage),
+        row![
+            secondary_button("View on GitHub", Some(Message::OpenReleasePage)),
+            secondary_button("Report a bug", Some(Message::ReportBug)),
+        ]
+        .spacing(8),
     ]
-    .spacing(8);
+    .spacing(10);
 
-    let body = scrollable(container(column![updates, about].spacing(20)).padding(pad_r(16.0)))
-        .direction(thin_scrollbar())
-        .style(scroll_style)
-        .height(Length::Fill);
+    // No right-only inset here (that's the tunnel list's trick to clear its
+    // scrollbar): the cards should sit with equal left/right margins from the
+    // window, governed solely by the symmetric outer padding below.
+    let body = scrollable(
+        column![
+            pref_section("Updates", updates),
+            pref_section("About", about),
+        ]
+        .spacing(18),
+    )
+    .direction(thin_scrollbar())
+    .style(scroll_style)
+    .height(Length::Fill);
 
+    // Same white backdrop as the main screen — sections are set apart by the
+    // white cards' border + soft shadow, not by a different screen colour.
     container(column![header, body].spacing(12))
-        .padding(12)
+        .padding(14)
         .into()
+}
+
+/// One Preferences section: an uppercase, semibold heading sitting above a light
+/// "card" that groups the section's controls — so the heading reads clearly as a
+/// heading, set apart from its contents.
+fn pref_section<'a>(title: &str, content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    let heading = section_title(title);
+    // White card on the grey Preferences backdrop (set in `prefs_view`): the card
+    // reads as a distinct group, and the secondary buttons inside — which are grey
+    // — sit on white so they no longer blend into the section background.
+    let card = container(content)
+        .width(Length::Fill)
+        .padding(12)
+        .style(|_t: &iced::Theme| iced::widget::container::Style {
+            background: Some(iced::Background::Color(Color::WHITE)),
+            border: iced::Border {
+                radius: 10.0.into(),
+                width: 1.0,
+                color: Color::from_rgb(0.88, 0.88, 0.91),
+            },
+            shadow: iced::Shadow {
+                color: Color::from_rgba(0.0, 0.0, 0.0, 0.05),
+                offset: iced::Vector::new(0.0, 1.0),
+                blur_radius: 3.0,
+            },
+            ..Default::default()
+        });
+    column![heading, card].spacing(6).into()
 }
 
 /// Open a URL in the user's default browser (shelling out, like the rest of the
@@ -2021,6 +2083,114 @@ fn pill_secondary(_theme: &iced::Theme, status: button::Status) -> iced::widget:
     }
 }
 
+// ---- reusable view components ----
+//
+// One definition per UI primitive (title, caption, label, button, input,
+// dropdown) so every screen renders them identically and a style tweak lands in
+// a single place. Prefer these over hand-rolling `text(...).size(...).color(...)`
+// or `button(...).style(...)` inline.
+
+/// A screen / dialog title — the large heading at the top of a screen.
+fn screen_title<'a>(s: impl iced::widget::text::IntoFragment<'a>) -> Text<'a> {
+    text(s).size(18)
+}
+
+/// A section heading: uppercase + semibold, set clearly apart from the body
+/// below it (used by [`pref_section`]).
+fn section_title<'a>(s: &str) -> Text<'a> {
+    text(s.to_uppercase())
+        .size(11)
+        .font(Font {
+            weight: iced::font::Weight::Bold,
+            ..Font::default()
+        })
+        .color(TEXT_DARK)
+}
+
+/// Small, muted helper text: captions, sub-labels, status lines.
+fn caption<'a>(s: impl iced::widget::text::IntoFragment<'a>) -> Text<'a> {
+    text(s).size(11).color(TEXT_MUTED)
+}
+
+/// Inline error / validation text (red).
+fn error_text<'a>(s: impl iced::widget::text::IntoFragment<'a>) -> Text<'a> {
+    text(s).size(12).color(TEXT_DANGER)
+}
+
+/// Primary call-to-action button (filled).
+fn primary_button<'a>(label: &'a str, on_press: Message) -> Element<'a, Message> {
+    button(text(label).size(13))
+        .style(pill_button)
+        .padding([5, 16])
+        .on_press(on_press)
+        .into()
+}
+
+/// Secondary button (light, bordered). `on_press: None` renders it disabled
+/// (e.g. "Checking…" while an update check is in flight).
+fn secondary_button<'a>(label: &'a str, on_press: Option<Message>) -> Element<'a, Message> {
+    let mut b = button(text(label).size(13))
+        .style(pill_secondary)
+        .padding([5, 16]);
+    if let Some(msg) = on_press {
+        b = b.on_press(msg);
+    }
+    b.into()
+}
+
+/// Destructive button (red) for deletes.
+fn danger_button<'a>(label: &'a str, on_press: Message) -> Element<'a, Message> {
+    button(text(label).size(13))
+        .style(pill_danger)
+        .padding([5, 16])
+        .on_press(on_press)
+        .into()
+}
+
+/// A labelled form row: a fixed-width label, then the control filling the rest.
+fn labeled_field<'a>(
+    label: &'a str,
+    control: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    row![
+        text(label).size(13).width(Length::Fixed(110.0)),
+        control.into(),
+    ]
+    .spacing(8)
+    .align_y(iced::Alignment::Center)
+    .into()
+}
+
+/// A rounded single-line text input matching the app's form style.
+fn text_field<'a>(
+    placeholder: &'a str,
+    value: &'a str,
+    on_input: impl Fn(String) -> Message + 'a,
+) -> Element<'a, Message> {
+    text_input(placeholder, value)
+        .size(13)
+        .padding([6, 9])
+        .style(rounded_input)
+        .on_input(on_input)
+        .into()
+}
+
+/// A rounded dropdown (pick_list) matching the app's form style.
+fn dropdown<'a>(
+    options: Vec<String>,
+    selected: Option<String>,
+    placeholder: &'a str,
+    on_select: impl Fn(String) -> Message + 'a,
+) -> Element<'a, Message> {
+    pick_list(options, selected, on_select)
+        .placeholder(placeholder)
+        .padding([6, 9])
+        .text_size(13)
+        .style(rounded_pick)
+        .width(Length::Fill)
+        .into()
+}
+
 /// Filter-bar chip: filled blue when active, light bordered pill otherwise.
 fn chip_style(active: bool, status: button::Status) -> iced::widget::button::Style {
     let (bg, fg, border_w) = if active {
@@ -2097,18 +2267,11 @@ fn edit_view<'a>(form: &'a EditForm, ssh_names: &[String]) -> Element<'a, Messag
         "New tunnel"
     };
 
-    let field = |label: &str, value: &str, f: Field, placeholder: &str| -> Element<Message> {
-        row![
-            text(label.to_string()).size(13).width(Length::Fixed(110.0)),
-            text_input(placeholder, value)
-                .size(13)
-                .padding([6, 9])
-                .style(rounded_input)
-                .on_input(move |s| Message::EditField(f, s)),
-        ]
-        .spacing(8)
-        .align_y(iced::Alignment::Center)
-        .into()
+    let field = |label: &'a str, value: &'a str, f: Field, placeholder: &'a str| {
+        labeled_field(
+            label,
+            text_field(placeholder, value, move |s| Message::EditField(f, s)),
+        )
     };
 
     // SSH config: a dropdown of known configs (plus the current value if it
@@ -2118,23 +2281,15 @@ fn edit_view<'a>(form: &'a EditForm, ssh_names: &[String]) -> Element<'a, Messag
         options.push(form.ssh.clone());
     }
     let selected = (!form.ssh.is_empty()).then(|| form.ssh.clone());
-    let ssh_field: Element<Message> = row![
-        text("SSH config").size(13).width(Length::Fixed(110.0)),
-        pick_list(options, selected, |name| {
+    let ssh_field = labeled_field(
+        "SSH config",
+        dropdown(options, selected, "choose an SSH config", |name| {
             Message::EditField(Field::Ssh, name)
-        })
-        .placeholder("choose an SSH config")
-        .padding([6, 9])
-        .text_size(13)
-        .style(rounded_pick)
-        .width(Length::Fill),
-    ]
-    .spacing(8)
-    .align_y(iced::Alignment::Center)
-    .into();
+        }),
+    );
 
     let mut col = column![
-        text(title).size(18),
+        screen_title(title),
         field("Path", &form.path, Field::Path, "gc/dev/db/app-api"),
         ssh_field,
         field("Local port", &form.local_port, Field::LocalPort, "54321"),
@@ -2149,32 +2304,17 @@ fn edit_view<'a>(form: &'a EditForm, ssh_names: &[String]) -> Element<'a, Messag
     .spacing(10);
 
     if let Some(err) = &form.error {
-        col = col.push(
-            text(err.clone())
-                .size(12)
-                .color(Color::from_rgb(0.9, 0.3, 0.3)),
-        );
+        col = col.push(error_text(err.clone()));
     }
 
     let mut buttons = row![
-        button(text("Save").size(13))
-            .style(pill_button)
-            .padding([5, 16])
-            .on_press(Message::SaveEdit),
-        button(text("Cancel").size(13))
-            .style(pill_secondary)
-            .padding([5, 16])
-            .on_press(Message::CancelEdit),
+        primary_button("Save", Message::SaveEdit),
+        secondary_button("Cancel", Some(Message::CancelEdit)),
     ]
     .spacing(10);
     if let Some(idx) = form.target {
         buttons = buttons.push(space().width(Length::Fill));
-        buttons = buttons.push(
-            button(text("Delete").size(13))
-                .style(pill_danger)
-                .padding([5, 16])
-                .on_press(Message::DeleteTunnel(idx)),
-        );
+        buttons = buttons.push(danger_button("Delete", Message::DeleteTunnel(idx)));
     }
     col = col.push(buttons);
 
@@ -2242,7 +2382,7 @@ fn ssh_list_view(app: &App) -> Element<'_, Message> {
             icon_button(ICON_CHEVRON_LEFT, 18.0, Message::CloseSshConfigs),
             "Back"
         ),
-        text("SSH configs").size(18).width(Length::Fill),
+        screen_title("SSH configs").width(Length::Fill),
         tip(
             icon_button(ICON_PLUS, 18.0, Message::StartAddSsh),
             "Add SSH config"
@@ -2259,12 +2399,9 @@ fn ssh_list_view(app: &App) -> Element<'_, Message> {
     for (i, c) in app.ssh_configs.iter().enumerate() {
         let user = c.user.as_deref().unwrap_or("-");
         let sub = format!("{user}@{}:{}", c.host, c.port);
-        let content = column![
-            text(c.name.clone()).size(14),
-            text(sub).size(11).color(Color::from_rgb(0.5, 0.5, 0.56)),
-        ]
-        .spacing(2)
-        .width(Length::Fill);
+        let content = column![text(c.name.clone()).size(14), caption(sub)]
+            .spacing(2)
+            .width(Length::Fill);
         // Click a row to edit; delete lives inside the edit form.
         list = list.push(
             button(content)
@@ -2303,29 +2440,22 @@ fn icon_btn_style(_theme: &iced::Theme, status: button::Status) -> iced::widget:
     row_style(bg, 7.0)
 }
 
-fn ssh_edit_view(form: &SshForm) -> Element<'_, Message> {
+fn ssh_edit_view<'a>(form: &'a SshForm) -> Element<'a, Message> {
     let title = if form.target.is_some() {
         "Edit SSH config"
     } else {
         "New SSH config"
     };
 
-    let field = |label: &str, value: &str, f: SshField, placeholder: &str| -> Element<Message> {
-        row![
-            text(label.to_string()).size(13).width(Length::Fixed(110.0)),
-            text_input(placeholder, value)
-                .size(13)
-                .padding([6, 9])
-                .style(rounded_input)
-                .on_input(move |s| Message::EditSshField(f, s)),
-        ]
-        .spacing(8)
-        .align_y(iced::Alignment::Center)
-        .into()
+    let field = |label: &'a str, value: &'a str, f: SshField, placeholder: &'a str| {
+        labeled_field(
+            label,
+            text_field(placeholder, value, move |s| Message::EditSshField(f, s)),
+        )
     };
 
     let mut col = column![
-        text(title).size(18),
+        screen_title(title),
         field("Name", &form.name, SshField::Name, "gemx-dev"),
         field("Host", &form.host, SshField::Host, "1.2.3.4 or alias"),
         field("Port", &form.port, SshField::Port, "22"),
@@ -2340,32 +2470,17 @@ fn ssh_edit_view(form: &SshForm) -> Element<'_, Message> {
     .spacing(10);
 
     if let Some(err) = &form.error {
-        col = col.push(
-            text(err.clone())
-                .size(12)
-                .color(Color::from_rgb(0.9, 0.3, 0.3)),
-        );
+        col = col.push(error_text(err.clone()));
     }
 
     let mut buttons = row![
-        button(text("Save").size(13))
-            .style(pill_button)
-            .padding([5, 16])
-            .on_press(Message::SaveSsh),
-        button(text("Cancel").size(13))
-            .style(pill_secondary)
-            .padding([5, 16])
-            .on_press(Message::CancelSsh),
+        primary_button("Save", Message::SaveSsh),
+        secondary_button("Cancel", Some(Message::CancelSsh)),
     ]
     .spacing(10);
     if let Some(idx) = form.target {
         buttons = buttons.push(space().width(Length::Fill));
-        buttons = buttons.push(
-            button(text("Delete").size(13))
-                .style(pill_danger)
-                .padding([5, 16])
-                .on_press(Message::DeleteSsh(idx)),
-        );
+        buttons = buttons.push(danger_button("Delete", Message::DeleteSsh(idx)));
     }
     col = col.push(buttons);
 
@@ -2380,11 +2495,7 @@ fn confirm_view(pending: &PendingDelete) -> Element<'_, Message> {
                 items = items.push(text(format!("• {p}")).size(12).color(TEXT_DARK));
             }
             if paths.len() > 8 {
-                items = items.push(
-                    text(format!("…and {} more", paths.len() - 8))
-                        .size(12)
-                        .color(Color::from_rgb(0.5, 0.5, 0.56)),
-                );
+                items = items.push(caption(format!("…and {} more", paths.len() - 8)));
             }
             (format!("Delete {} tunnel(s)?", paths.len()), items.into())
         }
@@ -2395,18 +2506,12 @@ fn confirm_view(pending: &PendingDelete) -> Element<'_, Message> {
     };
 
     let col = column![
-        text(title).size(18),
+        screen_title(title),
         text("This can't be undone.").size(13),
         listing,
         row![
-            button(text("Delete").size(13))
-                .style(pill_danger)
-                .padding([5, 16])
-                .on_press(Message::ConfirmDelete),
-            button(text("Cancel").size(13))
-                .style(pill_secondary)
-                .padding([5, 16])
-                .on_press(Message::CancelDelete),
+            danger_button("Delete", Message::ConfirmDelete),
+            secondary_button("Cancel", Some(Message::CancelDelete)),
         ]
         .spacing(10),
     ]
