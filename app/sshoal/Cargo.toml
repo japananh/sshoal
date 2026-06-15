@@ -14,7 +14,18 @@ sshoal-core = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 
-iced = { version = "0.14", features = ["tokio"] }
+# Software (tiny-skia) renderer only — drops the wgpu/GPU stack for a much
+# smaller binary and lower memory use; the tray UI doesn't need a GPU.
+iced = { version = "0.14", default-features = false, features = [
+    "tokio",
+    "tiny-skia",
+    "crisp",
+    "web-colors",
+    "thread-pool",
+    "linux-theme-detection",
+    "x11",
+    "wayland",
+] }
 tray-icon = "0.24"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }

@@ -8,6 +8,15 @@ version = "0.0.1-beta.2"
 license = "MIT"
 repository = "https://github.com/japananh/sshoal"
 
+# Optimize release builds for size (a tray utility, not a hot loop): LTO +
+# single codegen unit + size opt-level, and strip symbols. `panic = "unwind"`
+# is kept so a panicking tunnel task can't take the whole daemon down.
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+
 [workspace.dependencies]
 sshoal-core = { path = "crates/sshoal-core" }
 
