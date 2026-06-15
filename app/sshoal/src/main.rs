@@ -1311,7 +1311,11 @@ fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
         ];
         return stack![base, backdrop, floating].into();
     }
-    base
+    // Keep the root a `stack` even with nothing floating: iced reconciles widget
+    // state positionally, so if the root tag flipped Container↔Stack when a popup
+    // opened, the list's scrollable would be rebuilt and snap back to the top.
+    // Pinning `base` at child[0] preserves its scroll offset across every popup.
+    stack![base].into()
 }
 
 fn tunnels_base(app: &App) -> Element<'_, Message> {
