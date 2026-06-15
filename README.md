@@ -19,6 +19,7 @@ macOS (Tahoe+) · Ubuntu (22.04+)
 - ✅ **Multi-select & bulk** Connect / Disconnect / Delete; open a terminal to any tunnel's host.
 - 🔑 **In-app SSH configs**; import hosts from `~/.ssh/config` and tunnels from `opentunnels.sh` files.
 - 💾 **Portable config** — one YAML file; encrypted export/import via [`age`](https://github.com/FiloSottile/age).
+- 🔄 **Update check** — pings GitHub Releases on launch (opt-out in Preferences) and shows a banner; never auto-installs.
 - 🔒 **Local-only** — no account, no telemetry; shells out to your system `ssh` (`~/.ssh/config`, ProxyJump, agent all work).
 
 ## Install
@@ -37,7 +38,7 @@ Or grab the `.dmg` from [Releases](https://github.com/japananh/sshoal/releases) 
 curl -fsSL https://raw.githubusercontent.com/japananh/sshoal/main/packaging/linux/install.sh | sh
 ```
 
-Needs a system tray (on GNOME, the AppIndicator extension) plus the runtime libs above.
+Needs a system tray (on GNOME, the AppIndicator extension) and the GTK/AppIndicator runtime libraries: `libgtk-3-0 libayatana-appindicator3-1 libxdo3 libxkbcommon0`.
 
 **From source** (stable [Rust](https://rustup.rs)):
 
@@ -47,12 +48,12 @@ cargo run -p sshoal      # run the tray app
 ./scripts/make-dmg.sh    # …or build a .dmg locally
 ```
 
-Ubuntu also needs `libgtk-3-dev libayatana-appindicator3-dev libxdo-dev libxkbcommon-dev`.
+Building on Ubuntu also needs the `-dev` packages: `libgtk-3-dev libayatana-appindicator3-dev libxdo-dev libxkbcommon-dev`.
 
 ## Use
 
 - **Tray icon** — left-click toggles the window, right-click opens the menu; **⌃⌘S** summons it anywhere. Closing only hides; tunnels keep running.
-- **A row** — the toggle connects/disconnects, the terminal icon opens a shell. Click to select, ⌘/Shift-click or ↑/↓ to multi-select, right-click for actions, **Enter** to edit.
+- **A row** — the toggle connects/disconnects, the terminal icon opens a shell. Click to select; ⌘/Shift-click (or ↑/↓, Shift+↑/↓) to select more; right-click for actions; **Enter** to edit.
 - **Config** lives in `~/.config/sshoal/servers.yaml`. Bring in what you have with `sshoal import-ssh --prefix gc FILE…`; move machines with `sshoal export [--encrypt]` / `sshoal import`.
 
 ## How it works
