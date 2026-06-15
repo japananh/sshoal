@@ -11,10 +11,6 @@ on:
 permissions:
   contents: write
 
-# Run JavaScript actions on Node 24 (Node 20 is being deprecated on runners).
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-
 jobs:
   macos:
     runs-on: macos-latest
@@ -24,7 +20,7 @@ jobs:
       - name: Build .dmg
         run: ./scripts/make-dmg.sh
       - name: Attach to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: target/sshoal-*.dmg
           prerelease: ${{ contains(github.ref_name, '-') }}
@@ -44,7 +40,7 @@ jobs:
         run: |
           tar -C target/release -czf "sshoal-${GITHUB_REF_NAME}-linux-x86_64.tar.gz" sshoal
       - name: Attach to release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: sshoal-*-linux-x86_64.tar.gz
           prerelease: ${{ contains(github.ref_name, '-') }}
