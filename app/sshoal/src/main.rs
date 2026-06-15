@@ -34,14 +34,17 @@ const ICON_FOLDER_OPEN: &str = "\u{e247}";
 const ICON_TERMINAL: &str = "\u{e181}";
 const ICON_SETTINGS: &str = "\u{e154}";
 const ICON_SEARCH: char = '\u{e151}';
+/// The running version, compared against the newest GitHub release tag.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Blue used for the folder glyph (and a selected folder's name).
 const FOLDER_BLUE: Color = Color::from_rgb(0.20, 0.50, 0.95);
 /// Default dark row text.
 const TEXT_DARK: Color = Color::from_rgb(0.13, 0.13, 0.18);
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
+use sshoal_core::updater::{self, RELEASES_URL, UpdateInfo};
 use sshoal_core::{
-    AppConfig, Backoff, OpenSshTransport, SshConfig, Transport, Tunnel, TunnelState,
+    AppConfig, Backoff, OpenSshTransport, Settings, SshConfig, Transport, Tunnel, TunnelState,
     TunnelSupervisor,
 };
 use tracing::info;
@@ -133,11 +136,23 @@ enum Message {
     // Filter bar (tunnels screen)
     FilterInput(String),
     SetFilter(StateFilter),
+    // Preferences screen + auto-update.
+    ClosePrefs,
+    ToggleAutoUpdate(bool),
+    /// Run an update check now (from launch or the "Check now" button).
+    CheckUpdates,
+    /// Result of a check — Ok(info) or a human-readable failure.
+    UpdateChecked(Result<UpdateInfo, String>),
+    /// Open the release page (or the releases list) in the browser.
+    OpenReleasePage,
+    /// Hide the update banner and remember not to show this version again.
+    DismissUpdate,
 }
 
 struct MenuIds {
     connect_all: MenuId,
     open: MenuId,
+    prefs: MenuId,
     quit: MenuId,
 }
 
@@ -237,6 +252,16 @@ struct App {
     filter_state: StateFilter,
     /// Current window width (for fitting tunnel names with an ellipsis).
     window_width: f32,
+    /// Persisted preferences (auto-update toggle, skipped version).
+    settings: Settings,
+    /// Showing the Preferences screen.
+    managing_prefs: bool,
+    /// An available, not-yet-dismissed update — drives the banner.
+    update_info: Option<UpdateInfo>,
+    /// A check is in flight (disables the "Check now" button).
+    update_checking: bool,
+    /// Transient result of the last manual check, shown in Preferences.
+    update_status: Option<String>,
 }
 
 impl App {
@@ -314,6 +339,7 @@ fn boot(runtime: Arc<tokio::runtime::Runtime>) -> (App, Task<Message>) {
     });
     info!(path = %path.display(), tunnels = config.tunnels.len(), "config loaded");
 
+    let settings = config.settings;
     let ssh_configs = config.ssh_configs;
     let rows: Vec<TunnelRow> = config
         .tunnels
@@ -352,6 +378,11 @@ fn boot(runtime: Arc<tokio::runtime::Runtime>) -> (App, Task<Message>) {
         filter: String::new(),
         filter_state: StateFilter::All,
         window_width: 360.0,
+        settings,
+        managing_prefs: false,
+        update_info: None,
+        update_checking: false,
+        update_status: None,
     };
 
     // Show the window on launch so opening the app always surfaces it (the tray
@@ -359,8 +390,30 @@ fn boot(runtime: Arc<tokio::runtime::Runtime>) -> (App, Task<Message>) {
     // run as a menu-bar accessory with no Dock icon.
     let (id, open_task) = window::open(open_window_settings());
     app.window = Some(id);
-    let task = Task::batch([open_task.map(Message::WindowOpened), window::gain_focus(id)]);
-    (app, task)
+    let mut tasks = vec![open_task.map(Message::WindowOpened), window::gain_focus(id)];
+    // Best-effort update check on launch when enabled — read-only, never installs.
+    if app.settings.auto_update_enabled {
+        app.update_checking = true;
+        tasks.push(check_update_task(app.runtime.clone()));
+    }
+    (app, Task::batch(tasks))
+}
+
+/// A background GitHub release check, off the UI thread (the `curl` call blocks).
+fn check_update_task(runtime: Arc<tokio::runtime::Runtime>) -> Task<Message> {
+    Task::perform(
+        async move {
+            match runtime
+                .spawn_blocking(|| updater::check_latest(VERSION))
+                .await
+            {
+                Ok(Ok(info)) => Ok(info),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(e) => Err(e.to_string()),
+            }
+        },
+        Message::UpdateChecked,
+    )
 }
 
 fn update(app: &mut App, message: Message) -> Task<Message> {
@@ -397,16 +450,38 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 app._hotkey = register_hotkey();
             }
 
-            let ids = app
-                .menu
-                .as_ref()
-                .map(|m| (m.open.clone(), m.quit.clone(), m.connect_all.clone()));
+            let ids = app.menu.as_ref().map(|m| {
+                (
+                    m.open.clone(),
+                    m.quit.clone(),
+                    m.connect_all.clone(),
+                    m.prefs.clone(),
+                )
+            });
             let rx = MenuEvent::receiver();
             while let Ok(event) = rx.try_recv() {
-                let Some((open, quit, connect_all)) = ids.as_ref() else {
+                let Some((open, quit, connect_all, prefs)) = ids.as_ref() else {
                     break;
                 };
                 if event.id == *open {
+                    if app.window.is_none() {
+                        let (id, task) = window::open(open_window_settings());
+                        app.window = Some(id);
+                        return Task::batch([
+                            task.map(Message::WindowOpened),
+                            window::gain_focus(id),
+                        ]);
+                    } else if let Some(id) = app.window {
+                        return window::gain_focus(id);
+                    }
+                } else if event.id == *prefs {
+                    // Surface the window (creating it if needed) on the Preferences
+                    // screen, clearing any other screen/form so it lands clean.
+                    app.managing_prefs = true;
+                    app.managing_ssh = false;
+                    app.editing = None;
+                    app.editing_ssh = None;
+                    app.context_menu = None;
                     if app.window.is_none() {
                         let (id, task) = window::open(open_window_settings());
                         app.window = Some(id);
@@ -646,6 +721,10 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 app.managing_ssh = false;
                 return Task::none();
             }
+            if app.managing_prefs {
+                app.managing_prefs = false;
+                return Task::none();
+            }
             if let Some(id) = app.window {
                 return window::close(id);
             }
@@ -825,12 +904,12 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                     }
                     info!(count = doomed.len(), "delete tunnels");
                     app.expanded = all_folder_paths(&app.rows);
-                    persist(&app.rows, &app.ssh_configs);
+                    persist(&app.rows, &app.ssh_configs, &app.settings);
                 }
                 Some(PendingDelete::Ssh(name)) => {
                     app.ssh_configs.retain(|c| c.name != name);
                     info!(ssh = %name, "delete ssh config");
-                    persist(&app.rows, &app.ssh_configs);
+                    persist(&app.rows, &app.ssh_configs, &app.settings);
                 }
                 None => {}
             }
@@ -850,6 +929,66 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::SetFilter(state) => {
             app.filter_state = state;
+            Task::none()
+        }
+        Message::ClosePrefs => {
+            app.managing_prefs = false;
+            Task::none()
+        }
+        Message::ToggleAutoUpdate(on) => {
+            app.settings.auto_update_enabled = on;
+            persist(&app.rows, &app.ssh_configs, &app.settings);
+            // Flipping it on with no result yet: check straight away.
+            if on && app.update_info.is_none() && !app.update_checking {
+                app.update_checking = true;
+                app.update_status = None;
+                return check_update_task(app.runtime.clone());
+            }
+            Task::none()
+        }
+        Message::CheckUpdates => {
+            if app.update_checking {
+                return Task::none();
+            }
+            app.update_checking = true;
+            app.update_status = None;
+            check_update_task(app.runtime.clone())
+        }
+        Message::UpdateChecked(result) => {
+            app.update_checking = false;
+            match result {
+                Ok(info) if info.available => {
+                    // Honour a version the user chose to dismiss.
+                    if app.settings.skipped_version.as_deref() == Some(info.latest.as_str()) {
+                        app.update_info = None;
+                        app.update_status = Some(format!("{} available (dismissed)", info.latest));
+                    } else {
+                        app.update_status = Some(format!("Update available: {}", info.latest));
+                        app.update_info = Some(info);
+                    }
+                }
+                Ok(info) => {
+                    app.update_info = None;
+                    app.update_status = Some(format!("Up to date (v{})", info.current));
+                }
+                Err(e) => app.update_status = Some(format!("Check failed: {e}")),
+            }
+            Task::none()
+        }
+        Message::OpenReleasePage => {
+            let url = app
+                .update_info
+                .as_ref()
+                .map(|i| i.url.clone())
+                .unwrap_or_else(|| RELEASES_URL.to_string());
+            open_url(&url);
+            Task::none()
+        }
+        Message::DismissUpdate => {
+            if let Some(info) = app.update_info.take() {
+                app.settings.skipped_version = Some(info.latest);
+                persist(&app.rows, &app.ssh_configs, &app.settings);
+            }
             Task::none()
         }
         Message::WindowOpened(id) => {
@@ -1057,14 +1196,15 @@ fn save_edit(app: &mut App) {
 
     app.editing = None;
     app.expanded = all_folder_paths(&app.rows);
-    persist(&app.rows, &app.ssh_configs);
+    persist(&app.rows, &app.ssh_configs, &app.settings);
 }
 
-/// Write the current ssh configs + tunnels back to the config file.
-fn persist(rows: &[TunnelRow], ssh_configs: &[SshConfig]) {
+/// Write the current ssh configs + tunnels + settings back to the config file.
+fn persist(rows: &[TunnelRow], ssh_configs: &[SshConfig], settings: &Settings) {
     let config = AppConfig {
         ssh_configs: ssh_configs.to_vec(),
         tunnels: rows.iter().map(|r| r.tunnel.clone()).collect(),
+        settings: settings.clone(),
     };
     if let Err(e) = config.save(config_path()) {
         tracing::error!(error = %e, "failed to save config");
@@ -1280,6 +1420,9 @@ fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
     if let Some(form) = &app.editing {
         return edit_view(form, &app.ssh_names());
     }
+    if app.managing_prefs {
+        return prefs_view(app);
+    }
 
     // The base screen: SSH-config list or the tunnel tree.
     let base: Element<Message> = if app.managing_ssh {
@@ -1393,11 +1536,19 @@ fn tunnels_base(app: &App) -> Element<'_, Message> {
         .direction(thin_scrollbar())
         .style(scroll_style)
         .height(Length::Fill);
-    let mut screen = column![container(header).padding(pad_r(10.0))].spacing(8);
-    if !app.rows.is_empty() {
-        screen = screen.push(container(chips).padding(pad_r(10.0)));
+    // Keep `body` (the scrollable) at a fixed position in the screen tree so it
+    // never gets rebuilt — see the note in `view`. The variable header bits
+    // (search, the optional update banner, the chips) live in their own column,
+    // so toggling the banner reshuffles only that sub-column and the list holds
+    // its scroll offset.
+    let mut top = column![container(header).padding(pad_r(10.0))].spacing(8);
+    if let Some(info) = &app.update_info {
+        top = top.push(container(update_banner(info)).padding(pad_r(10.0)));
     }
-    screen = screen.push(body);
+    if !app.rows.is_empty() {
+        top = top.push(container(chips).padding(pad_r(10.0)));
+    }
+    let screen = column![top, body].spacing(8);
     container(screen)
         .padding(iced::Padding {
             top: 12.0,
@@ -1406,6 +1557,123 @@ fn tunnels_base(app: &App) -> Element<'_, Message> {
             left: 12.0,
         })
         .into()
+}
+
+/// The "update available" strip shown atop the tunnel list. `View` opens the
+/// release page; the `×` dismisses this version (it won't reappear until a newer
+/// one ships). Installing is left to the user — sshoal never self-installs.
+fn update_banner<'a>(info: &UpdateInfo) -> Element<'a, Message> {
+    let label = text(format!(
+        "Update available · v{} → {}",
+        info.current, info.latest
+    ))
+    .size(12);
+    let view = button(text("View").size(12))
+        .style(pill_button)
+        .padding([3, 12])
+        .on_press(Message::OpenReleasePage);
+    let dismiss = button(text("✕").size(12))
+        .style(pill_secondary)
+        .padding([3, 9])
+        .on_press(Message::DismissUpdate);
+    let bar = row![label, space().width(Length::Fill), view, dismiss]
+        .spacing(8)
+        .align_y(iced::Alignment::Center);
+    container(bar)
+        .padding([6, 10])
+        .style(|_t: &iced::Theme| iced::widget::container::Style {
+            background: Some(iced::Background::Color(Color::from_rgb(0.90, 0.95, 1.0))),
+            border: iced::Border {
+                radius: 8.0.into(),
+                width: 1.0,
+                color: Color::from_rgb(0.62, 0.78, 0.98),
+            },
+            ..Default::default()
+        })
+        .into()
+}
+
+/// The Preferences screen (reached from the tray's "Preferences…"): the
+/// auto-update toggle, a manual "Check now", and an About line. Mirrors the
+/// shape of [`ssh_list_view`].
+fn prefs_view(app: &App) -> Element<'_, Message> {
+    let header = row![
+        tip(
+            icon_button(ICON_CHEVRON_LEFT, 18.0, Message::ClosePrefs),
+            "Back"
+        ),
+        text("Preferences").size(18).width(Length::Fill),
+    ]
+    .spacing(8)
+    .align_y(iced::Alignment::Center);
+
+    let muted = Color::from_rgb(0.5, 0.5, 0.56);
+
+    let auto_row = row![
+        text("Automatically check for updates")
+            .size(14)
+            .width(Length::Fill),
+        toggler(app.settings.auto_update_enabled)
+            .size(18)
+            .on_toggle(Message::ToggleAutoUpdate),
+    ]
+    .align_y(iced::Alignment::Center);
+
+    let check_label = if app.update_checking {
+        "Checking…"
+    } else {
+        "Check now"
+    };
+    let mut check = button(text(check_label).size(13))
+        .style(pill_secondary)
+        .padding([5, 16]);
+    if !app.update_checking {
+        check = check.on_press(Message::CheckUpdates);
+    }
+
+    let mut updates = column![
+        text("Updates").size(12).color(muted),
+        auto_row,
+        text("Checks GitHub for new releases on launch and notifies you. Updates are never installed automatically.")
+            .size(11)
+            .color(muted),
+        check,
+    ]
+    .spacing(10);
+    if let Some(status) = &app.update_status {
+        updates = updates.push(text(status.clone()).size(11).color(muted));
+    }
+
+    let about = column![
+        text("About").size(12).color(muted),
+        text(format!("sshoal v{VERSION}")).size(13),
+        button(text("View on GitHub").size(12))
+            .style(pill_secondary)
+            .padding([5, 16])
+            .on_press(Message::OpenReleasePage),
+    ]
+    .spacing(8);
+
+    let body = scrollable(container(column![updates, about].spacing(20)).padding(pad_r(16.0)))
+        .direction(thin_scrollbar())
+        .style(scroll_style)
+        .height(Length::Fill);
+
+    container(column![header, body].spacing(12))
+        .padding(12)
+        .into()
+}
+
+/// Open a URL in the user's default browser (shelling out, like the rest of the
+/// app shells out to `ssh`/`osascript`). Best-effort — failures are logged only.
+fn open_url(url: &str) {
+    #[cfg(target_os = "macos")]
+    let prog = "open";
+    #[cfg(not(target_os = "macos"))]
+    let prog = "xdg-open";
+    if let Err(e) = std::process::Command::new(prog).arg(url).spawn() {
+        tracing::warn!(error = %e, url, "failed to open url");
+    }
 }
 
 /// A visible-but-subtle separator line between folder groups.
@@ -1960,7 +2228,7 @@ fn save_ssh(app: &mut App) {
         _ => app.ssh_configs.push(config),
     }
     app.editing_ssh = None;
-    persist(&app.rows, &app.ssh_configs);
+    persist(&app.rows, &app.ssh_configs, &app.settings);
 }
 
 fn nonempty(s: &str) -> Option<String> {
@@ -2272,13 +2540,16 @@ fn open_window_settings() -> window::Settings {
 fn build_tray() -> (TrayIcon, MenuIds) {
     let connect_all = MenuItem::new("Connect all", true, None);
     let open = MenuItem::new("Open sshoal", true, None);
+    let prefs = MenuItem::new("Preferences…", true, None);
     let quit = MenuItem::new("Quit", true, None);
     let menu = MenuIds {
         connect_all: connect_all.id().clone(),
         open: open.id().clone(),
+        prefs: prefs.id().clone(),
         quit: quit.id().clone(),
     };
-    let tray_menu = Menu::with_items(&[&connect_all, &open, &quit]).expect("build tray menu");
+    let tray_menu =
+        Menu::with_items(&[&connect_all, &open, &prefs, &quit]).expect("build tray menu");
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(tray_menu))
         .with_menu_on_left_click(false)

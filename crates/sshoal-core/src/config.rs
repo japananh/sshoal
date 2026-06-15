@@ -75,6 +75,34 @@ impl Tunnel {
     }
 }
 
+fn default_true() -> bool {
+    true
+}
+
+/// App-wide preferences (not tunnels). Persisted in the same YAML file under a
+/// `settings:` key; an older config without the key still loads, defaulting
+/// every field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Settings {
+    /// Check GitHub for a newer release on launch and surface it in the UI.
+    /// Default on: a check is read-only (it never installs), and the user can
+    /// turn it off in Preferences.
+    #[serde(default = "default_true")]
+    pub auto_update_enabled: bool,
+    /// A release tag the user dismissed; the update banner stays hidden for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped_version: Option<String>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            auto_update_enabled: true,
+            skipped_version: None,
+        }
+    }
+}
+
 /// The whole config file.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -82,6 +110,8 @@ pub struct AppConfig {
     pub ssh_configs: Vec<SshConfig>,
     #[serde(default)]
     pub tunnels: Vec<Tunnel>,
+    #[serde(default)]
+    pub settings: Settings,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -199,6 +229,7 @@ mod tests {
                 remote_host: "db.internal".into(),
                 remote_port: 5432,
             }],
+            settings: Settings::default(),
         }
     }
 

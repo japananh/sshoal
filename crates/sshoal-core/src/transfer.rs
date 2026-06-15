@@ -96,6 +96,7 @@ mod tests {
                 remote_host: "127.0.0.1".into(),
                 remote_port: 5432,
             }],
+            settings: Default::default(),
         }
     }
 
