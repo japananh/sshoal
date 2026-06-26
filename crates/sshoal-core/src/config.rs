@@ -92,6 +92,11 @@ pub struct Settings {
     /// A release tag the user dismissed; the update banner stays hidden for it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skipped_version: Option<String>,
+    /// Folder tree paths the user has collapsed; every other folder is expanded.
+    /// Stored as the *collapsed* set (not expanded) so a fresh or older config —
+    /// where this is empty — starts with everything expanded, as before.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub collapsed_folders: Vec<String>,
 }
 
 impl Default for Settings {
@@ -99,6 +104,7 @@ impl Default for Settings {
         Self {
             auto_update_enabled: true,
             skipped_version: None,
+            collapsed_folders: Vec::new(),
         }
     }
 }
@@ -263,6 +269,20 @@ mod tests {
         let resolved = cfg.resolve_ssh(&t);
         assert_eq!(resolved.host, "other");
         assert_eq!(resolved.user, None);
+    }
+
+    #[test]
+    fn collapsed_folders_roundtrip_and_default_empty() {
+        // A config predating the field still loads, defaulting to all-expanded.
+        let old = "tunnels: []\nsettings:\n  auto_update_enabled: true\n";
+        let cfg = AppConfig::from_yaml(old).unwrap();
+        assert!(cfg.settings.collapsed_folders.is_empty());
+
+        // And the field roundtrips when set.
+        let mut cfg = sample();
+        cfg.settings.collapsed_folders = vec!["gc".into(), "gc/dev".into()];
+        let parsed = AppConfig::from_yaml(&cfg.to_yaml().unwrap()).unwrap();
+        assert_eq!(parsed.settings.collapsed_folders, vec!["gc", "gc/dev"]);
     }
 
     #[test]

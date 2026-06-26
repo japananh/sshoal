@@ -253,7 +253,10 @@ struct App {
     transport: Arc<dyn Transport>,
     ssh_configs: Vec<SshConfig>,
     rows: Vec<TunnelRow>,
-    expanded: HashSet<String>,
+    /// Folder paths the user has collapsed (everything else is expanded). Mirrors
+    /// `Settings::collapsed_folders` and is persisted, so collapse state survives
+    /// connect/disconnect, save/delete and app restarts.
+    collapsed: HashSet<String>,
     editing: Option<EditForm>,
     /// Showing the SSH-configs list screen.
     managing_ssh: bool,
@@ -308,7 +311,7 @@ impl App {
             "",
             0,
             &self.rows,
-            &self.expanded,
+            &self.collapsed,
             allowed.as_ref(),
             &mut out,
         );
@@ -385,7 +388,15 @@ fn boot(runtime: Arc<tokio::runtime::Runtime>) -> (App, Task<Message>) {
             err_seen: None,
         })
         .collect();
-    let expanded = all_folder_paths(&rows);
+    // Restore the user's collapse state, dropping any saved path whose folder no
+    // longer exists (so the set never accretes stale entries).
+    let all_folders = all_folder_paths(&rows);
+    let collapsed: HashSet<String> = settings
+        .collapsed_folders
+        .iter()
+        .filter(|p| all_folders.contains(*p))
+        .cloned()
+        .collect();
 
     let mut app = App {
         tray: None,
@@ -396,7 +407,7 @@ fn boot(runtime: Arc<tokio::runtime::Runtime>) -> (App, Task<Message>) {
         transport: Arc::new(OpenSshTransport),
         ssh_configs,
         rows,
-        expanded,
+        collapsed,
         editing: None,
         managing_ssh: false,
         editing_ssh: None,
@@ -579,9 +590,11 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::ClickFolder(path) => {
             app.context_menu = None;
-            if !app.expanded.remove(&path) {
-                app.expanded.insert(path);
+            // Toggle: if it was collapsed, expand it; otherwise collapse it.
+            if !app.collapsed.remove(&path) {
+                app.collapsed.insert(path);
             }
+            persist_app(app);
             Task::none()
         }
         Message::StartAdd => {
@@ -976,13 +989,13 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                         app.checked.remove(p);
                     }
                     info!(count = doomed.len(), "delete tunnels");
-                    app.expanded = all_folder_paths(&app.rows);
-                    persist(&app.rows, &app.ssh_configs, &app.settings);
+                    reconcile_collapsed(app);
+                    persist_app(app);
                 }
                 Some(PendingDelete::Ssh(name)) => {
                     app.ssh_configs.retain(|c| c.name != name);
                     info!(ssh = %name, "delete ssh config");
-                    persist(&app.rows, &app.ssh_configs, &app.settings);
+                    persist_app(app);
                 }
                 None => {}
             }
@@ -1019,7 +1032,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::ToggleAutoUpdate(on) => {
             app.settings.auto_update_enabled = on;
-            persist(&app.rows, &app.ssh_configs, &app.settings);
+            persist_app(app);
             // Flipping it on with no result yet: check straight away.
             if on && app.update_info.is_none() && !app.update_checking {
                 app.update_checking = true;
@@ -1073,7 +1086,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::DismissUpdate => {
             if let Some(info) = app.update_info.take() {
                 app.settings.skipped_version = Some(info.latest);
-                persist(&app.rows, &app.ssh_configs, &app.settings);
+                persist_app(app);
             }
             Task::none()
         }
@@ -1356,16 +1369,29 @@ fn save_edit(app: &mut App) {
     }
 
     app.editing = None;
-    app.expanded = all_folder_paths(&app.rows);
-    persist(&app.rows, &app.ssh_configs, &app.settings);
+    reconcile_collapsed(app);
+    persist_app(app);
 }
 
-/// Write the current ssh configs + tunnels + settings back to the config file.
-fn persist(rows: &[TunnelRow], ssh_configs: &[SshConfig], settings: &Settings) {
+/// Drop collapse entries for folders that no longer exist after a row change.
+/// We never *add* entries here, so a folder the user didn't collapse — including
+/// a newly appeared one — stays expanded; only their explicit choices persist.
+fn reconcile_collapsed(app: &mut App) {
+    let all = all_folder_paths(&app.rows);
+    app.collapsed.retain(|p| all.contains(p));
+}
+
+/// Write the current ssh configs + tunnels + settings (with the live collapse
+/// state folded in) back to the config file.
+fn persist_app(app: &App) {
+    let mut settings = app.settings.clone();
+    let mut collapsed_folders: Vec<String> = app.collapsed.iter().cloned().collect();
+    collapsed_folders.sort(); // stable YAML output
+    settings.collapsed_folders = collapsed_folders;
     let config = AppConfig {
-        ssh_configs: ssh_configs.to_vec(),
-        tunnels: rows.iter().map(|r| r.tunnel.clone()).collect(),
-        settings: settings.clone(),
+        ssh_configs: app.ssh_configs.clone(),
+        tunnels: app.rows.iter().map(|r| r.tunnel.clone()).collect(),
+        settings,
     };
     if let Err(e) = config.save(config_path()) {
         tracing::error!(error = %e, "failed to save config");
@@ -1480,7 +1506,7 @@ fn flatten(
     prefix: &str,
     depth: usize,
     rows: &[TunnelRow],
-    expanded: &HashSet<String>,
+    collapsed: &HashSet<String>,
     allowed: Option<&HashSet<usize>>,
     out: &mut Vec<DisplayRow>,
 ) {
@@ -1516,9 +1542,10 @@ fn flatten(
             enabled,
             status,
         });
-        // A filter forces folders open so matches are always visible.
-        if allowed.is_some() || expanded.contains(&path) {
-            flatten(sub, &path, depth + 1, rows, expanded, allowed, out);
+        // A filter forces folders open so matches are always visible; otherwise a
+        // folder is open unless the user collapsed it.
+        if allowed.is_some() || !collapsed.contains(&path) {
+            flatten(sub, &path, depth + 1, rows, collapsed, allowed, out);
         }
     }
     for &idx in &folder.leaves {
@@ -2010,7 +2037,7 @@ fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
     // Folder: clicking the glyph 📁/📂 expands/collapses (as before); left-click
     // the name opens the folder dropdown.
     let Some(idx) = d.row_idx else {
-        let expanded = app.expanded.contains(&d.path);
+        let expanded = !app.collapsed.contains(&d.path);
         let icon = if expanded {
             ICON_FOLDER_OPEN
         } else {
@@ -2610,7 +2637,7 @@ fn save_ssh(app: &mut App) {
         _ => app.ssh_configs.push(config),
     }
     app.editing_ssh = None;
-    persist(&app.rows, &app.ssh_configs, &app.settings);
+    persist_app(app);
 }
 
 fn nonempty(s: &str) -> Option<String> {
