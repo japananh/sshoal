@@ -794,9 +794,15 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::FolderPress(path) => {
-            // Left-click a folder → select it (same as a tunnel).
-            apply_select(app, path);
-            Task::none()
+            // Plain left-click anywhere on a folder row toggles it open/closed —
+            // the small glyph was too easy to miss. ⌘/Shift-click still selects
+            // for bulk actions; right-click still opens the folder menu.
+            if app.modifiers.command() || app.modifiers.shift() {
+                apply_select(app, path);
+                Task::none()
+            } else {
+                update(app, Message::ClickFolder(path))
+            }
         }
         Message::FolderMenu(path) => {
             // Right-click a folder → open its dropdown at the cursor.
