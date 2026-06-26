@@ -47,6 +47,8 @@ const TEXT_DARK: Color = Color::from_rgb(0.13, 0.13, 0.18);
 const TEXT_MUTED: Color = Color::from_rgb(0.5, 0.5, 0.56);
 /// Error / destructive text.
 const TEXT_DANGER: Color = Color::from_rgb(0.9, 0.3, 0.3);
+/// Success text (e.g. a passing connection test).
+const TEXT_SUCCESS: Color = Color::from_rgb(0.13, 0.62, 0.33);
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use sshoal_core::updater::{self, RELEASES_URL, UpdateInfo};
@@ -103,6 +105,10 @@ enum Message {
     EditField(Field, String),
     SaveEdit,
     CancelEdit,
+    /// Run a one-shot connectivity test against the form's current values.
+    TestConnection,
+    /// Result of the test — Ok(()) (reachable) or a human-readable failure.
+    TestConnectionResult(Result<(), String>),
     DeleteTunnel(usize),
     // SSH config management
     OpenSshConfigs,
@@ -136,6 +142,11 @@ enum Message {
     FolderConnectAll,
     FolderDisconnectAll,
     FolderDelete,
+    // Folder rename (popover with a new-name field).
+    FolderRename,
+    RenameInput(String),
+    RenameConfirm,
+    RenameCancel,
     // Delete confirmation (every delete is confirmed).
     ConfirmDelete,
     CancelDelete,
@@ -206,6 +217,11 @@ struct EditForm {
     remote_host: String,
     remote_port: String,
     error: Option<String>,
+    /// A "Test connection" probe is in flight (disables the button).
+    testing: bool,
+    /// Result of the last probe: `Ok(())` = reachable, `Err(reason)` = failed.
+    /// Cleared whenever a field changes (so a stale verdict never lingers).
+    test_result: Option<Result<(), String>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -215,6 +231,15 @@ enum SshField {
     Port,
     User,
     Identity,
+}
+
+/// In-progress folder rename. `path` is the folder being renamed; `name` is the
+/// new leaf segment the user is typing (e.g. renaming `gc/dev` edits `dev`).
+#[derive(Default)]
+struct RenameFolder {
+    path: String,
+    name: String,
+    error: Option<String>,
 }
 
 /// In-progress add/edit form for an SSH config.
@@ -242,7 +267,10 @@ struct App {
     transport: Arc<dyn Transport>,
     ssh_configs: Vec<SshConfig>,
     rows: Vec<TunnelRow>,
-    expanded: HashSet<String>,
+    /// Folder paths the user has collapsed (everything else is expanded). Mirrors
+    /// `Settings::collapsed_folders` and is persisted, so collapse state survives
+    /// connect/disconnect, save/delete and app restarts.
+    collapsed: HashSet<String>,
     editing: Option<EditForm>,
     /// Showing the SSH-configs list screen.
     managing_ssh: bool,
@@ -264,6 +292,8 @@ struct App {
     menu_at: iced::Point,
     /// A delete awaiting confirmation (every delete is confirmed).
     confirm_delete: Option<PendingDelete>,
+    /// An in-progress folder rename (the popover with the new-name field).
+    renaming: Option<RenameFolder>,
     /// Free-text filter (matches tunnel name or folder path).
     filter: String,
     /// Connection-state filter.
@@ -297,7 +327,7 @@ impl App {
             "",
             0,
             &self.rows,
-            &self.expanded,
+            &self.collapsed,
             allowed.as_ref(),
             &mut out,
         );
@@ -374,7 +404,15 @@ fn boot(runtime: Arc<tokio::runtime::Runtime>) -> (App, Task<Message>) {
             err_seen: None,
         })
         .collect();
-    let expanded = all_folder_paths(&rows);
+    // Restore the user's collapse state, dropping any saved path whose folder no
+    // longer exists (so the set never accretes stale entries).
+    let all_folders = all_folder_paths(&rows);
+    let collapsed: HashSet<String> = settings
+        .collapsed_folders
+        .iter()
+        .filter(|p| all_folders.contains(*p))
+        .cloned()
+        .collect();
 
     let mut app = App {
         tray: None,
@@ -385,7 +423,7 @@ fn boot(runtime: Arc<tokio::runtime::Runtime>) -> (App, Task<Message>) {
         transport: Arc::new(OpenSshTransport),
         ssh_configs,
         rows,
-        expanded,
+        collapsed,
         editing: None,
         managing_ssh: false,
         editing_ssh: None,
@@ -397,6 +435,7 @@ fn boot(runtime: Arc<tokio::runtime::Runtime>) -> (App, Task<Message>) {
         cursor: iced::Point::ORIGIN,
         menu_at: iced::Point::ORIGIN,
         confirm_delete: None,
+        renaming: None,
         filter: String::new(),
         filter_state: StateFilter::All,
         window_width: 360.0,
@@ -568,9 +607,11 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::ClickFolder(path) => {
             app.context_menu = None;
-            if !app.expanded.remove(&path) {
-                app.expanded.insert(path);
+            // Toggle: if it was collapsed, expand it; otherwise collapse it.
+            if !app.collapsed.remove(&path) {
+                app.collapsed.insert(path);
             }
+            persist_app(app);
             Task::none()
         }
         Message::StartAdd => {
@@ -592,6 +633,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                     remote_host: t.remote_host.clone(),
                     remote_port: t.remote_port.to_string(),
                     error: None,
+                    ..EditForm::default()
                 });
             }
             Task::none()
@@ -605,6 +647,8 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                     Field::RemoteHost => form.remote_host = value,
                     Field::RemotePort => form.remote_port = value,
                 }
+                // The values changed — any earlier test verdict is now stale.
+                form.test_result = None;
             }
             Task::none()
         }
@@ -614,6 +658,41 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::SaveEdit => {
             save_edit(app);
+            Task::none()
+        }
+        Message::TestConnection => {
+            // Probe the in-form values without saving. Needs a valid ssh target,
+            // remote host and remote port; the local port is irrelevant (the test
+            // uses a throwaway one).
+            let Some((tunnel, ssh)) = form_test_target(app) else {
+                return Task::none();
+            };
+            match &mut app.editing {
+                Some(form) if form.testing => return Task::none(),
+                Some(form) => {
+                    form.testing = true;
+                    form.test_result = None;
+                }
+                None => return Task::none(),
+            }
+            let runtime = app.runtime.clone();
+            let transport = app.transport.clone();
+            Task::perform(
+                async move {
+                    runtime
+                        .spawn(async move { transport.test(&tunnel, &ssh).await })
+                        .await
+                        .map_err(|e| e.to_string())
+                        .and_then(|r| r.map_err(|e| e.to_string()))
+                },
+                Message::TestConnectionResult,
+            )
+        }
+        Message::TestConnectionResult(result) => {
+            if let Some(form) = &mut app.editing {
+                form.testing = false;
+                form.test_result = Some(result);
+            }
             Task::none()
         }
         Message::DeleteTunnel(i) => {
@@ -715,9 +794,15 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::FolderPress(path) => {
-            // Left-click a folder → select it (same as a tunnel).
-            apply_select(app, path);
-            Task::none()
+            // Plain left-click anywhere on a folder row toggles it open/closed —
+            // the small glyph was too easy to miss. ⌘/Shift-click still selects
+            // for bulk actions; right-click still opens the folder menu.
+            if app.modifiers.command() || app.modifiers.shift() {
+                apply_select(app, path);
+                Task::none()
+            } else {
+                update(app, Message::ClickFolder(path))
+            }
         }
         Message::FolderMenu(path) => {
             // Right-click a folder → open its dropdown at the cursor.
@@ -735,6 +820,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             // Back out one level; if nothing is open, hide the window (the app
             // keeps running in the tray — reopen with ⌃⌘S or the tray icon).
             if app.confirm_delete.take().is_some()
+                || app.renaming.take().is_some()
                 || app.context_menu.take().is_some()
                 || app.editing.take().is_some()
                 || app.editing_ssh.take().is_some()
@@ -760,6 +846,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             if app.editing.is_some()
                 || app.editing_ssh.is_some()
                 || app.confirm_delete.is_some()
+                || app.renaming.is_some()
                 || app.managing_ssh
                 || app.context_menu.is_some()
             {
@@ -780,6 +867,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             if app.editing.is_some()
                 || app.editing_ssh.is_some()
                 || app.confirm_delete.is_some()
+                || app.renaming.is_some()
                 || app.managing_ssh
             {
                 return Task::none();
@@ -907,6 +995,36 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             }
             Task::none()
         }
+        Message::FolderRename => {
+            let folder = context_folder(app);
+            app.context_menu = None;
+            if let Some(path) = folder {
+                let name = path.rsplit('/').next().unwrap_or(&path).to_string();
+                app.renaming = Some(RenameFolder {
+                    path,
+                    name,
+                    error: None,
+                });
+                // Put the cursor in the field so the user can type immediately.
+                return iced::widget::operation::focus(RENAME_ID);
+            }
+            Task::none()
+        }
+        Message::RenameInput(value) => {
+            if let Some(form) = &mut app.renaming {
+                form.name = value;
+                form.error = None;
+            }
+            Task::none()
+        }
+        Message::RenameConfirm => {
+            rename_folder(app);
+            Task::none()
+        }
+        Message::RenameCancel => {
+            app.renaming = None;
+            Task::none()
+        }
         Message::CancelDelete => {
             app.confirm_delete = None;
             Task::none()
@@ -927,13 +1045,13 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                         app.checked.remove(p);
                     }
                     info!(count = doomed.len(), "delete tunnels");
-                    app.expanded = all_folder_paths(&app.rows);
-                    persist(&app.rows, &app.ssh_configs, &app.settings);
+                    reconcile_collapsed(app);
+                    persist_app(app);
                 }
                 Some(PendingDelete::Ssh(name)) => {
                     app.ssh_configs.retain(|c| c.name != name);
                     info!(ssh = %name, "delete ssh config");
-                    persist(&app.rows, &app.ssh_configs, &app.settings);
+                    persist_app(app);
                 }
                 None => {}
             }
@@ -970,7 +1088,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::ToggleAutoUpdate(on) => {
             app.settings.auto_update_enabled = on;
-            persist(&app.rows, &app.ssh_configs, &app.settings);
+            persist_app(app);
             // Flipping it on with no result yet: check straight away.
             if on && app.update_info.is_none() && !app.update_checking {
                 app.update_checking = true;
@@ -1024,7 +1142,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::DismissUpdate => {
             if let Some(info) = app.update_info.take() {
                 app.settings.skipped_version = Some(info.latest);
-                persist(&app.rows, &app.ssh_configs, &app.settings);
+                persist_app(app);
             }
             Task::none()
         }
@@ -1095,6 +1213,9 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
 /// Widget id for the filter search box, so we can focus it when the window
 /// opens (otherwise typing goes nowhere until you click into it).
 const FILTER_ID: &str = "filter";
+
+/// Widget id for the rename-folder field, focused when the popover opens.
+const RENAME_ID: &str = "rename-folder";
 
 /// Row indices the selection resolves to: tunnels checked directly, plus every
 /// tunnel under a checked folder path.
@@ -1211,6 +1332,37 @@ fn ssh_login_command(ssh: &SshConfig) -> String {
     parts.join(" ")
 }
 
+/// Build the (tunnel, ssh) pair a "Test connection" probe should run against
+/// from the current edit form, or `None` if the form isn't testable yet. The
+/// `path` and `local_port` don't affect the probe (it uses a throwaway port), so
+/// only the ssh target, remote host and remote port need to be valid.
+fn form_test_target(app: &App) -> Option<(Tunnel, SshConfig)> {
+    let form = app.editing.as_ref()?;
+    let ssh_name = form.ssh.trim();
+    let remote_host = form.remote_host.trim();
+    if ssh_name.is_empty() || remote_host.is_empty() {
+        return None;
+    }
+    let remote_port = form.remote_port.trim().parse::<u16>().ok()?;
+    let tunnel = Tunnel {
+        path: "test".to_string(),
+        ssh: ssh_name.to_string(),
+        local_port: form.local_port.trim().parse::<u16>().unwrap_or(0),
+        remote_host: remote_host.to_string(),
+        remote_port,
+    };
+    let ssh = app.resolve_ssh(&tunnel);
+    Some((tunnel, ssh))
+}
+
+/// Whether the edit form has enough to run a "Test connection" probe (mirrors
+/// the checks in [`form_test_target`], for enabling/disabling the button).
+fn test_ready(form: &EditForm) -> bool {
+    !form.ssh.trim().is_empty()
+        && !form.remote_host.trim().is_empty()
+        && form.remote_port.trim().parse::<u16>().is_ok()
+}
+
 /// Validate the edit form and apply it (replace or append a tunnel), then save.
 fn save_edit(app: &mut App) {
     let Some(form) = &app.editing else { return };
@@ -1276,20 +1428,110 @@ fn save_edit(app: &mut App) {
     }
 
     app.editing = None;
-    app.expanded = all_folder_paths(&app.rows);
-    persist(&app.rows, &app.ssh_configs, &app.settings);
+    reconcile_collapsed(app);
+    persist_app(app);
 }
 
-/// Write the current ssh configs + tunnels + settings back to the config file.
-fn persist(rows: &[TunnelRow], ssh_configs: &[SshConfig], settings: &Settings) {
+/// Drop collapse entries for folders that no longer exist after a row change.
+/// We never *add* entries here, so a folder the user didn't collapse — including
+/// a newly appeared one — stays expanded; only their explicit choices persist.
+fn reconcile_collapsed(app: &mut App) {
+    let all = all_folder_paths(&app.rows);
+    app.collapsed.retain(|p| all.contains(p));
+}
+
+/// Write the current ssh configs + tunnels + settings (with the live collapse
+/// state folded in) back to the config file.
+fn persist_app(app: &App) {
+    let mut settings = app.settings.clone();
+    let mut collapsed_folders: Vec<String> = app.collapsed.iter().cloned().collect();
+    collapsed_folders.sort(); // stable YAML output
+    settings.collapsed_folders = collapsed_folders;
     let config = AppConfig {
-        ssh_configs: ssh_configs.to_vec(),
-        tunnels: rows.iter().map(|r| r.tunnel.clone()).collect(),
-        settings: settings.clone(),
+        ssh_configs: app.ssh_configs.clone(),
+        tunnels: app.rows.iter().map(|r| r.tunnel.clone()).collect(),
+        settings,
     };
     if let Err(e) = config.save(config_path()) {
         tracing::error!(error = %e, "failed to save config");
     }
+}
+
+/// Apply a folder rename from the popover: rewrite the matching path prefix on
+/// every descendant tunnel, then the collapse state, then persist. Live tunnels
+/// keep running — only the `path` label changes, which the supervisor (holding
+/// its own clone and keying ssh args off host/port, not `path`) never reads.
+fn rename_folder(app: &mut App) {
+    let Some(form) = &app.renaming else { return };
+    let folder_path = form.path.clone();
+    let new_leaf = form.name.trim().to_string();
+
+    let invalid = if new_leaf.is_empty() {
+        Some("Name is required".to_string())
+    } else if new_leaf.contains('/') {
+        Some("Name can't contain “/”".to_string())
+    } else {
+        None
+    };
+    if let Some(msg) = invalid {
+        if let Some(form) = &mut app.renaming {
+            form.error = Some(msg);
+        }
+        return;
+    }
+
+    // Swap the folder's last segment for the new name.
+    let new_folder_path = match folder_path.rsplit_once('/') {
+        Some((parent, _leaf)) => format!("{parent}/{new_leaf}"),
+        None => new_leaf.clone(),
+    };
+    if new_folder_path == folder_path {
+        app.renaming = None; // no-op rename
+        return;
+    }
+
+    let old_prefix = format!("{folder_path}/");
+    let rewrite = |p: &str| match p.strip_prefix(&old_prefix) {
+        Some(rest) => format!("{new_folder_path}/{rest}"),
+        None => p.to_string(),
+    };
+
+    // Compute every tunnel's resulting path and reject a rename that would make
+    // two tunnels collide (tunnels are keyed by `path`).
+    let new_paths: Vec<String> = app.rows.iter().map(|r| rewrite(&r.tunnel.path)).collect();
+    let mut seen = HashSet::new();
+    if let Some(dup) = new_paths.iter().find(|p| !seen.insert((*p).clone())) {
+        if let Some(form) = &mut app.renaming {
+            form.error = Some(format!("A tunnel already exists at “{dup}”"));
+        }
+        return;
+    }
+
+    // Apply — supervisors are left untouched, so connected tunnels don't flap.
+    for (row, np) in app.rows.iter_mut().zip(new_paths) {
+        row.tunnel.path = np;
+    }
+    // Carry the subtree's collapse state across the rename — the folder itself
+    // (exact match) plus any collapsed descendant folders (prefix match).
+    app.collapsed = app
+        .collapsed
+        .iter()
+        .map(|p| {
+            if p == &folder_path {
+                new_folder_path.clone()
+            } else {
+                rewrite(p)
+            }
+        })
+        .collect();
+    // Selection paths are now stale.
+    app.checked.clear();
+    app.select_anchor = None;
+    app.select_cursor = None;
+
+    info!(from = %folder_path, to = %new_folder_path, "rename folder");
+    app.renaming = None;
+    persist_app(app);
 }
 
 /// Spawn or tear down the supervisor for one tunnel row.
@@ -1400,7 +1642,7 @@ fn flatten(
     prefix: &str,
     depth: usize,
     rows: &[TunnelRow],
-    expanded: &HashSet<String>,
+    collapsed: &HashSet<String>,
     allowed: Option<&HashSet<usize>>,
     out: &mut Vec<DisplayRow>,
 ) {
@@ -1436,9 +1678,10 @@ fn flatten(
             enabled,
             status,
         });
-        // A filter forces folders open so matches are always visible.
-        if allowed.is_some() || expanded.contains(&path) {
-            flatten(sub, &path, depth + 1, rows, expanded, allowed, out);
+        // A filter forces folders open so matches are always visible; otherwise a
+        // folder is open unless the user collapsed it.
+        if allowed.is_some() || !collapsed.contains(&path) {
+            flatten(sub, &path, depth + 1, rows, collapsed, allowed, out);
         }
     }
     for &idx in &folder.leaves {
@@ -1516,6 +1759,15 @@ fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
         let backdrop = mouse_area(space().width(Length::Fill).height(Length::Fill))
             .on_press(Message::CancelDelete);
         let centered = container(confirm_view(pending))
+            .center_x(Length::Fill)
+            .center_y(Length::Fill);
+        return stack![base, backdrop, centered].into();
+    }
+    // Rename-folder popover, centered over whatever screen is showing.
+    if let Some(form) = &app.renaming {
+        let backdrop = mouse_area(space().width(Length::Fill).height(Length::Fill))
+            .on_press(Message::RenameCancel);
+        let centered = container(rename_view(form))
             .center_x(Length::Fill)
             .center_y(Length::Fill);
         return stack![base, backdrop, centered].into();
@@ -1930,7 +2182,7 @@ fn tree_row<'a>(app: &App, d: &DisplayRow) -> Element<'a, Message> {
     // Folder: clicking the glyph 📁/📂 expands/collapses (as before); left-click
     // the name opens the folder dropdown.
     let Some(idx) = d.row_idx else {
-        let expanded = app.expanded.contains(&d.path);
+        let expanded = !app.collapsed.contains(&d.path);
         let icon = if expanded {
             ICON_FOLDER_OPEN
         } else {
@@ -2075,6 +2327,7 @@ fn menu_panel<'a>(app: &App, menu: &ContextMenu) -> Element<'a, Message> {
         ContextMenu::Folder(_) => {
             items = items.push(item("Connect all", Message::FolderConnectAll, false));
             items = items.push(item("Disconnect all", Message::FolderDisconnectAll, false));
+            items = items.push(item("Rename", Message::FolderRename, false));
             items = items.push(item("Delete", Message::FolderDelete, true));
         }
     }
@@ -2444,6 +2697,27 @@ fn edit_view<'a>(form: &'a EditForm, ssh_names: &[String]) -> Element<'a, Messag
         col = col.push(error_text(err.clone()));
     }
 
+    // Verify the SSH target is reachable before saving. The button disables while
+    // a probe runs or the form lacks an ssh target / remote host / remote port.
+    let test_label = if form.testing {
+        "Testing…"
+    } else {
+        "Test connection"
+    };
+    let test_btn = secondary_button(
+        test_label,
+        (!form.testing && test_ready(form)).then_some(Message::TestConnection),
+    );
+    let mut test_row = row![test_btn].spacing(8).align_y(iced::Alignment::Center);
+    match &form.test_result {
+        Some(Ok(())) => test_row = test_row.push(text("✓ reachable").size(12).color(TEXT_SUCCESS)),
+        Some(Err(reason)) => {
+            test_row = test_row.push(text(format!("✗ {reason}")).size(12).color(TEXT_DANGER))
+        }
+        None => {}
+    }
+    col = col.push(test_row);
+
     let mut buttons = row![
         primary_button("Save", Message::SaveEdit),
         secondary_button("Cancel", Some(Message::CancelEdit)),
@@ -2505,7 +2779,7 @@ fn save_ssh(app: &mut App) {
         _ => app.ssh_configs.push(config),
     }
     app.editing_ssh = None;
-    persist(&app.rows, &app.ssh_configs, &app.settings);
+    persist_app(app);
 }
 
 fn nonempty(s: &str) -> Option<String> {
@@ -2654,6 +2928,39 @@ fn confirm_view(pending: &PendingDelete) -> Element<'_, Message> {
     ]
     .spacing(10);
     // A floating popover (not a full screen).
+    container(col)
+        .padding(16)
+        .width(Length::Fixed(300.0))
+        .style(menu_box_style)
+        .into()
+}
+
+/// The rename-folder popover: a single field (pre-filled with the folder's
+/// current leaf name) plus Rename / Cancel. Enter in the field also confirms.
+fn rename_view(form: &RenameFolder) -> Element<'_, Message> {
+    let input = text_input("folder name", &form.name)
+        .id(RENAME_ID)
+        .size(13)
+        .padding([6, 9])
+        .style(rounded_input)
+        .on_input(Message::RenameInput)
+        .on_submit(Message::RenameConfirm);
+    let mut col = column![
+        screen_title("Rename folder"),
+        caption(format!("Renaming “{}”", form.path)),
+        input,
+    ]
+    .spacing(10);
+    if let Some(err) = &form.error {
+        col = col.push(error_text(err.clone()));
+    }
+    col = col.push(
+        row![
+            primary_button("Rename", Message::RenameConfirm),
+            secondary_button("Cancel", Some(Message::RenameCancel)),
+        ]
+        .spacing(10),
+    );
     container(col)
         .padding(16)
         .width(Length::Fixed(300.0))
