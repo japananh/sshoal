@@ -1678,9 +1678,11 @@ fn flatten(
             enabled,
             status,
         });
-        // A filter forces folders open so matches are always visible; otherwise a
-        // folder is open unless the user collapsed it.
-        if allowed.is_some() || !collapsed.contains(&path) {
+        // A folder is open unless the user collapsed it — honoured even while
+        // filtering, so clicking a folder still expands/collapses it (the folder
+        // row still shows because it has a matching descendant; collapsing just
+        // hides the matches under it until it's expanded again).
+        if !collapsed.contains(&path) {
             flatten(sub, &path, depth + 1, rows, collapsed, allowed, out);
         }
     }
