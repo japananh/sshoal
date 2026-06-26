@@ -47,6 +47,8 @@ const TEXT_DARK: Color = Color::from_rgb(0.13, 0.13, 0.18);
 const TEXT_MUTED: Color = Color::from_rgb(0.5, 0.5, 0.56);
 /// Error / destructive text.
 const TEXT_DANGER: Color = Color::from_rgb(0.9, 0.3, 0.3);
+/// Success text (e.g. a passing connection test).
+const TEXT_SUCCESS: Color = Color::from_rgb(0.13, 0.62, 0.33);
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use sshoal_core::updater::{self, RELEASES_URL, UpdateInfo};
@@ -103,6 +105,10 @@ enum Message {
     EditField(Field, String),
     SaveEdit,
     CancelEdit,
+    /// Run a one-shot connectivity test against the form's current values.
+    TestConnection,
+    /// Result of the test — Ok(()) (reachable) or a human-readable failure.
+    TestConnectionResult(Result<(), String>),
     DeleteTunnel(usize),
     // SSH config management
     OpenSshConfigs,
@@ -206,6 +212,11 @@ struct EditForm {
     remote_host: String,
     remote_port: String,
     error: Option<String>,
+    /// A "Test connection" probe is in flight (disables the button).
+    testing: bool,
+    /// Result of the last probe: `Ok(())` = reachable, `Err(reason)` = failed.
+    /// Cleared whenever a field changes (so a stale verdict never lingers).
+    test_result: Option<Result<(), String>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -592,6 +603,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                     remote_host: t.remote_host.clone(),
                     remote_port: t.remote_port.to_string(),
                     error: None,
+                    ..EditForm::default()
                 });
             }
             Task::none()
@@ -605,6 +617,8 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                     Field::RemoteHost => form.remote_host = value,
                     Field::RemotePort => form.remote_port = value,
                 }
+                // The values changed — any earlier test verdict is now stale.
+                form.test_result = None;
             }
             Task::none()
         }
@@ -614,6 +628,41 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         }
         Message::SaveEdit => {
             save_edit(app);
+            Task::none()
+        }
+        Message::TestConnection => {
+            // Probe the in-form values without saving. Needs a valid ssh target,
+            // remote host and remote port; the local port is irrelevant (the test
+            // uses a throwaway one).
+            let Some((tunnel, ssh)) = form_test_target(app) else {
+                return Task::none();
+            };
+            match &mut app.editing {
+                Some(form) if form.testing => return Task::none(),
+                Some(form) => {
+                    form.testing = true;
+                    form.test_result = None;
+                }
+                None => return Task::none(),
+            }
+            let runtime = app.runtime.clone();
+            let transport = app.transport.clone();
+            Task::perform(
+                async move {
+                    runtime
+                        .spawn(async move { transport.test(&tunnel, &ssh).await })
+                        .await
+                        .map_err(|e| e.to_string())
+                        .and_then(|r| r.map_err(|e| e.to_string()))
+                },
+                Message::TestConnectionResult,
+            )
+        }
+        Message::TestConnectionResult(result) => {
+            if let Some(form) = &mut app.editing {
+                form.testing = false;
+                form.test_result = Some(result);
+            }
             Task::none()
         }
         Message::DeleteTunnel(i) => {
@@ -1209,6 +1258,37 @@ fn ssh_login_command(ssh: &SshConfig) -> String {
         None => ssh.host.clone(),
     });
     parts.join(" ")
+}
+
+/// Build the (tunnel, ssh) pair a "Test connection" probe should run against
+/// from the current edit form, or `None` if the form isn't testable yet. The
+/// `path` and `local_port` don't affect the probe (it uses a throwaway port), so
+/// only the ssh target, remote host and remote port need to be valid.
+fn form_test_target(app: &App) -> Option<(Tunnel, SshConfig)> {
+    let form = app.editing.as_ref()?;
+    let ssh_name = form.ssh.trim();
+    let remote_host = form.remote_host.trim();
+    if ssh_name.is_empty() || remote_host.is_empty() {
+        return None;
+    }
+    let remote_port = form.remote_port.trim().parse::<u16>().ok()?;
+    let tunnel = Tunnel {
+        path: "test".to_string(),
+        ssh: ssh_name.to_string(),
+        local_port: form.local_port.trim().parse::<u16>().unwrap_or(0),
+        remote_host: remote_host.to_string(),
+        remote_port,
+    };
+    let ssh = app.resolve_ssh(&tunnel);
+    Some((tunnel, ssh))
+}
+
+/// Whether the edit form has enough to run a "Test connection" probe (mirrors
+/// the checks in [`form_test_target`], for enabling/disabling the button).
+fn test_ready(form: &EditForm) -> bool {
+    !form.ssh.trim().is_empty()
+        && !form.remote_host.trim().is_empty()
+        && form.remote_port.trim().parse::<u16>().is_ok()
 }
 
 /// Validate the edit form and apply it (replace or append a tunnel), then save.
@@ -2443,6 +2523,31 @@ fn edit_view<'a>(form: &'a EditForm, ssh_names: &[String]) -> Element<'a, Messag
     if let Some(err) = &form.error {
         col = col.push(error_text(err.clone()));
     }
+
+    // Verify the SSH target is reachable before saving. The button disables while
+    // a probe runs or the form lacks an ssh target / remote host / remote port.
+    let test_label = if form.testing {
+        "Testing…"
+    } else {
+        "Test connection"
+    };
+    let test_btn = secondary_button(
+        test_label,
+        (!form.testing && test_ready(form)).then_some(Message::TestConnection),
+    );
+    let mut test_row = row![test_btn]
+        .spacing(8)
+        .align_y(iced::Alignment::Center);
+    match &form.test_result {
+        Some(Ok(())) => {
+            test_row = test_row.push(text("✓ reachable").size(12).color(TEXT_SUCCESS))
+        }
+        Some(Err(reason)) => {
+            test_row = test_row.push(text(format!("✗ {reason}")).size(12).color(TEXT_DANGER))
+        }
+        None => {}
+    }
+    col = col.push(test_row);
 
     let mut buttons = row![
         primary_button("Save", Message::SaveEdit),

@@ -30,6 +30,22 @@ pub trait Transport: Send + Sync {
         tunnel: &Tunnel,
         ssh: &SshConfig,
     ) -> anyhow::Result<Box<dyn TunnelHandle>>;
+
+    /// One-shot reachability check that persists nothing: bring the tunnel up,
+    /// confirm it comes up, then tear it straight back down. The default reuses
+    /// [`connect`]; [`OpenSshTransport`] overrides it to add `BatchMode=yes` (so a
+    /// config needing an interactive password fails fast instead of hanging) and a
+    /// throwaway local port (so the probe never collides with a live tunnel).
+    ///
+    /// This clears the same bar a real connection does — ssh authenticates and the
+    /// local forward binds — but does not prove `remote_host:remote_port` is
+    /// reachable: with `ssh -L` the remote dial is lazy, only attempted on first
+    /// traffic through the forward.
+    async fn test(&self, tunnel: &Tunnel, ssh: &SshConfig) -> anyhow::Result<()> {
+        let mut handle = self.connect(tunnel, ssh).await?;
+        handle.shutdown().await;
+        Ok(())
+    }
 }
 
 /// A live tunnel.
@@ -84,6 +100,25 @@ pub fn build_ssh_args(tunnel: &Tunnel, ssh: &SshConfig) -> Vec<String> {
     args
 }
 
+/// Like [`build_ssh_args`] but for a one-shot connectivity test: prepends
+/// `BatchMode=yes` so ssh fails fast instead of blocking on a password prompt —
+/// a test must never hang. (A real connection omits it so agent / askpass auth
+/// still work.)
+pub fn build_test_ssh_args(tunnel: &Tunnel, ssh: &SshConfig) -> Vec<String> {
+    let mut args = build_ssh_args(tunnel, ssh);
+    args.insert(0, "BatchMode=yes".to_string());
+    args.insert(0, "-o".to_string());
+    args
+}
+
+/// Ask the OS for a free local TCP port (bind to `:0`, read it back, release it
+/// on drop). Best-effort — `None` if it fails, so the caller can fall back to the
+/// tunnel's configured port.
+async fn free_local_port() -> Option<u16> {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.ok()?;
+    listener.local_addr().ok().map(|addr| addr.port())
+}
+
 /// Expand a leading `~/` to the home directory (ssh receives an absolute path
 /// since we spawn it without a shell).
 fn expand_tilde(path: &str) -> String {
@@ -123,6 +158,36 @@ impl Transport for OpenSshTransport {
         }
 
         Ok(Box::new(OpenSshHandle { child: Some(child) }))
+    }
+
+    async fn test(&self, tunnel: &Tunnel, ssh: &SshConfig) -> anyhow::Result<()> {
+        // Probe on a throwaway local port so the test never collides with the
+        // real tunnel's port (which may already be live) or anything else.
+        let mut probe = tunnel.clone();
+        if let Some(port) = free_local_port().await {
+            probe.local_port = port;
+        }
+
+        let args = build_test_ssh_args(&probe, ssh);
+        let mut child = tokio::process::Command::new("ssh")
+            .args(&args)
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
+
+        // Up means ssh authenticated and the forward bound; tear it straight down
+        // either way — a test must never leave a tunnel running. On failure,
+        // surface ssh's own stderr as the reason.
+        let ready = wait_forward_ready(&mut child, probe.local_port).await;
+        if let Err(err) = ready {
+            let reason = read_stderr_tail(&mut child).await;
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(reason.map_or(err, |d| anyhow::anyhow!(d)));
+        }
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+        Ok(())
     }
 }
 
@@ -206,6 +271,17 @@ mod tests {
         let p = args.iter().position(|a| a == "-p").expect("-p present");
         assert_eq!(args[p + 1], "2222");
         assert_eq!(args.last().unwrap(), "deploy@example.com");
+    }
+
+    #[test]
+    fn test_args_add_batch_mode_and_keep_the_forward() {
+        let ssh = SshConfig::alias("gemx-dev");
+        let args = build_test_ssh_args(&tunnel(), &ssh);
+        // Fails fast instead of hanging on a password prompt…
+        assert!(args.contains(&"BatchMode=yes".to_string()));
+        // …while still being a real connection (same forward as a live tunnel).
+        assert!(args.contains(&"54321:db.internal:5432".to_string()));
+        assert_eq!(args.last().unwrap(), "gemx-dev");
     }
 
     #[test]
