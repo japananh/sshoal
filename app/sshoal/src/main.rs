@@ -142,6 +142,11 @@ enum Message {
     FolderConnectAll,
     FolderDisconnectAll,
     FolderDelete,
+    // Folder rename (popover with a new-name field).
+    FolderRename,
+    RenameInput(String),
+    RenameConfirm,
+    RenameCancel,
     // Delete confirmation (every delete is confirmed).
     ConfirmDelete,
     CancelDelete,
@@ -228,6 +233,15 @@ enum SshField {
     Identity,
 }
 
+/// In-progress folder rename. `path` is the folder being renamed; `name` is the
+/// new leaf segment the user is typing (e.g. renaming `gc/dev` edits `dev`).
+#[derive(Default)]
+struct RenameFolder {
+    path: String,
+    name: String,
+    error: Option<String>,
+}
+
 /// In-progress add/edit form for an SSH config.
 #[derive(Default)]
 struct SshForm {
@@ -278,6 +292,8 @@ struct App {
     menu_at: iced::Point,
     /// A delete awaiting confirmation (every delete is confirmed).
     confirm_delete: Option<PendingDelete>,
+    /// An in-progress folder rename (the popover with the new-name field).
+    renaming: Option<RenameFolder>,
     /// Free-text filter (matches tunnel name or folder path).
     filter: String,
     /// Connection-state filter.
@@ -419,6 +435,7 @@ fn boot(runtime: Arc<tokio::runtime::Runtime>) -> (App, Task<Message>) {
         cursor: iced::Point::ORIGIN,
         menu_at: iced::Point::ORIGIN,
         confirm_delete: None,
+        renaming: None,
         filter: String::new(),
         filter_state: StateFilter::All,
         window_width: 360.0,
@@ -797,6 +814,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             // Back out one level; if nothing is open, hide the window (the app
             // keeps running in the tray — reopen with ⌃⌘S or the tray icon).
             if app.confirm_delete.take().is_some()
+                || app.renaming.take().is_some()
                 || app.context_menu.take().is_some()
                 || app.editing.take().is_some()
                 || app.editing_ssh.take().is_some()
@@ -822,6 +840,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             if app.editing.is_some()
                 || app.editing_ssh.is_some()
                 || app.confirm_delete.is_some()
+                || app.renaming.is_some()
                 || app.managing_ssh
                 || app.context_menu.is_some()
             {
@@ -842,6 +861,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             if app.editing.is_some()
                 || app.editing_ssh.is_some()
                 || app.confirm_delete.is_some()
+                || app.renaming.is_some()
                 || app.managing_ssh
             {
                 return Task::none();
@@ -967,6 +987,36 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                     app.confirm_delete = Some(PendingDelete::Tunnels(paths));
                 }
             }
+            Task::none()
+        }
+        Message::FolderRename => {
+            let folder = context_folder(app);
+            app.context_menu = None;
+            if let Some(path) = folder {
+                let name = path.rsplit('/').next().unwrap_or(&path).to_string();
+                app.renaming = Some(RenameFolder {
+                    path,
+                    name,
+                    error: None,
+                });
+                // Put the cursor in the field so the user can type immediately.
+                return iced::widget::operation::focus(RENAME_ID);
+            }
+            Task::none()
+        }
+        Message::RenameInput(value) => {
+            if let Some(form) = &mut app.renaming {
+                form.name = value;
+                form.error = None;
+            }
+            Task::none()
+        }
+        Message::RenameConfirm => {
+            rename_folder(app);
+            Task::none()
+        }
+        Message::RenameCancel => {
+            app.renaming = None;
             Task::none()
         }
         Message::CancelDelete => {
@@ -1157,6 +1207,9 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
 /// Widget id for the filter search box, so we can focus it when the window
 /// opens (otherwise typing goes nowhere until you click into it).
 const FILTER_ID: &str = "filter";
+
+/// Widget id for the rename-folder field, focused when the popover opens.
+const RENAME_ID: &str = "rename-folder";
 
 /// Row indices the selection resolves to: tunnels checked directly, plus every
 /// tunnel under a checked folder path.
@@ -1398,6 +1451,83 @@ fn persist_app(app: &App) {
     }
 }
 
+/// Apply a folder rename from the popover: rewrite the matching path prefix on
+/// every descendant tunnel, then the collapse state, then persist. Live tunnels
+/// keep running — only the `path` label changes, which the supervisor (holding
+/// its own clone and keying ssh args off host/port, not `path`) never reads.
+fn rename_folder(app: &mut App) {
+    let Some(form) = &app.renaming else { return };
+    let folder_path = form.path.clone();
+    let new_leaf = form.name.trim().to_string();
+
+    let invalid = if new_leaf.is_empty() {
+        Some("Name is required".to_string())
+    } else if new_leaf.contains('/') {
+        Some("Name can't contain “/”".to_string())
+    } else {
+        None
+    };
+    if let Some(msg) = invalid {
+        if let Some(form) = &mut app.renaming {
+            form.error = Some(msg);
+        }
+        return;
+    }
+
+    // Swap the folder's last segment for the new name.
+    let new_folder_path = match folder_path.rsplit_once('/') {
+        Some((parent, _leaf)) => format!("{parent}/{new_leaf}"),
+        None => new_leaf.clone(),
+    };
+    if new_folder_path == folder_path {
+        app.renaming = None; // no-op rename
+        return;
+    }
+
+    let old_prefix = format!("{folder_path}/");
+    let rewrite = |p: &str| match p.strip_prefix(&old_prefix) {
+        Some(rest) => format!("{new_folder_path}/{rest}"),
+        None => p.to_string(),
+    };
+
+    // Compute every tunnel's resulting path and reject a rename that would make
+    // two tunnels collide (tunnels are keyed by `path`).
+    let new_paths: Vec<String> = app.rows.iter().map(|r| rewrite(&r.tunnel.path)).collect();
+    let mut seen = HashSet::new();
+    if let Some(dup) = new_paths.iter().find(|p| !seen.insert((*p).clone())) {
+        if let Some(form) = &mut app.renaming {
+            form.error = Some(format!("A tunnel already exists at “{dup}”"));
+        }
+        return;
+    }
+
+    // Apply — supervisors are left untouched, so connected tunnels don't flap.
+    for (row, np) in app.rows.iter_mut().zip(new_paths) {
+        row.tunnel.path = np;
+    }
+    // Carry the subtree's collapse state across the rename — the folder itself
+    // (exact match) plus any collapsed descendant folders (prefix match).
+    app.collapsed = app
+        .collapsed
+        .iter()
+        .map(|p| {
+            if p == &folder_path {
+                new_folder_path.clone()
+            } else {
+                rewrite(p)
+            }
+        })
+        .collect();
+    // Selection paths are now stale.
+    app.checked.clear();
+    app.select_anchor = None;
+    app.select_cursor = None;
+
+    info!(from = %folder_path, to = %new_folder_path, "rename folder");
+    app.renaming = None;
+    persist_app(app);
+}
+
 /// Spawn or tear down the supervisor for one tunnel row.
 fn set_enabled(app: &mut App, i: usize, on: bool) {
     let transport = app.transport.clone();
@@ -1623,6 +1753,15 @@ fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
         let backdrop = mouse_area(space().width(Length::Fill).height(Length::Fill))
             .on_press(Message::CancelDelete);
         let centered = container(confirm_view(pending))
+            .center_x(Length::Fill)
+            .center_y(Length::Fill);
+        return stack![base, backdrop, centered].into();
+    }
+    // Rename-folder popover, centered over whatever screen is showing.
+    if let Some(form) = &app.renaming {
+        let backdrop = mouse_area(space().width(Length::Fill).height(Length::Fill))
+            .on_press(Message::RenameCancel);
+        let centered = container(rename_view(form))
             .center_x(Length::Fill)
             .center_y(Length::Fill);
         return stack![base, backdrop, centered].into();
@@ -2182,6 +2321,7 @@ fn menu_panel<'a>(app: &App, menu: &ContextMenu) -> Element<'a, Message> {
         ContextMenu::Folder(_) => {
             items = items.push(item("Connect all", Message::FolderConnectAll, false));
             items = items.push(item("Disconnect all", Message::FolderDisconnectAll, false));
+            items = items.push(item("Rename", Message::FolderRename, false));
             items = items.push(item("Delete", Message::FolderDelete, true));
         }
     }
@@ -2562,13 +2702,9 @@ fn edit_view<'a>(form: &'a EditForm, ssh_names: &[String]) -> Element<'a, Messag
         test_label,
         (!form.testing && test_ready(form)).then_some(Message::TestConnection),
     );
-    let mut test_row = row![test_btn]
-        .spacing(8)
-        .align_y(iced::Alignment::Center);
+    let mut test_row = row![test_btn].spacing(8).align_y(iced::Alignment::Center);
     match &form.test_result {
-        Some(Ok(())) => {
-            test_row = test_row.push(text("✓ reachable").size(12).color(TEXT_SUCCESS))
-        }
+        Some(Ok(())) => test_row = test_row.push(text("✓ reachable").size(12).color(TEXT_SUCCESS)),
         Some(Err(reason)) => {
             test_row = test_row.push(text(format!("✗ {reason}")).size(12).color(TEXT_DANGER))
         }
@@ -2786,6 +2922,39 @@ fn confirm_view(pending: &PendingDelete) -> Element<'_, Message> {
     ]
     .spacing(10);
     // A floating popover (not a full screen).
+    container(col)
+        .padding(16)
+        .width(Length::Fixed(300.0))
+        .style(menu_box_style)
+        .into()
+}
+
+/// The rename-folder popover: a single field (pre-filled with the folder's
+/// current leaf name) plus Rename / Cancel. Enter in the field also confirms.
+fn rename_view(form: &RenameFolder) -> Element<'_, Message> {
+    let input = text_input("folder name", &form.name)
+        .id(RENAME_ID)
+        .size(13)
+        .padding([6, 9])
+        .style(rounded_input)
+        .on_input(Message::RenameInput)
+        .on_submit(Message::RenameConfirm);
+    let mut col = column![
+        screen_title("Rename folder"),
+        caption(format!("Renaming “{}”", form.path)),
+        input,
+    ]
+    .spacing(10);
+    if let Some(err) = &form.error {
+        col = col.push(error_text(err.clone()));
+    }
+    col = col.push(
+        row![
+            primary_button("Rename", Message::RenameConfirm),
+            secondary_button("Cancel", Some(Message::RenameCancel)),
+        ]
+        .spacing(10),
+    );
     container(col)
         .padding(16)
         .width(Length::Fixed(300.0))
