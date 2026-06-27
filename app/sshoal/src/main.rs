@@ -2712,7 +2712,7 @@ fn edit_view<'a>(form: &'a EditForm, ssh_names: &[String]) -> Element<'a, Messag
     );
     let mut test_row = row![test_btn].spacing(8).align_y(iced::Alignment::Center);
     match &form.test_result {
-        Some(Ok(())) => test_row = test_row.push(text("✓ reachable").size(12).color(TEXT_SUCCESS)),
+        Some(Ok(())) => test_row = test_row.push(text("✓ Reachable").size(12).color(TEXT_SUCCESS)),
         Some(Err(reason)) => {
             test_row = test_row.push(text(format!("✗ {reason}")).size(12).color(TEXT_DANGER))
         }
