@@ -20,7 +20,7 @@ fn home() -> String {
 /// Minimum passphrase length for `--encrypt`. The KDF (Argon2id) only buys time
 /// against an offline brute-force of the passphrase — a short one defeats it —
 /// so we refuse obviously weak ones. A few random words easily clears this.
-const MIN_PASSPHRASE_LEN: usize = 12;
+pub(crate) const MIN_PASSPHRASE_LEN: usize = 12;
 
 /// If invoked as a CLI subcommand, run it and exit the process. Otherwise return.
 pub fn maybe_run() {
@@ -311,7 +311,7 @@ fn run_import(args: &[String]) -> i32 {
 
 /// Read each referenced config's `identity_file` and embed its contents. An
 /// unreadable / absent key is skipped with a warning (the path still travels).
-fn gather_keys(portable: &PortableConfig) -> Vec<EmbeddedKey> {
+pub(crate) fn gather_keys(portable: &PortableConfig) -> Vec<EmbeddedKey> {
     let mut keys = Vec::new();
     for c in &portable.ssh_configs {
         let Some(path) = &c.identity_file else {
@@ -336,7 +336,7 @@ fn gather_keys(portable: &PortableConfig) -> Vec<EmbeddedKey> {
 /// from the path inside the imported file — a hostile export could otherwise set
 /// `identity_file` to `~/.ssh/authorized_keys`, `~/.ssh/config`, a `..` traversal
 /// or an absolute path and have us write attacker-controlled bytes there.
-fn materialize_keys(incoming: &mut PortableConfig, overwrite: bool) -> usize {
+pub(crate) fn materialize_keys(incoming: &mut PortableConfig, overwrite: bool) -> usize {
     let mut written = 0;
     for key in &incoming.keys {
         let rel = format!("~/.config/sshoal/keys/{}", sanitize_key_name(&key.config));
