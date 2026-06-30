@@ -1292,11 +1292,11 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 ));
                 return Task::none();
             }
-            let name = if f.encrypt {
-                "sshoal-tunnels.age"
-            } else {
-                "sshoal-tunnels.yaml"
-            };
+            // Timestamp the default name so exports don't overwrite each other
+            // and sort chronologically, e.g. sshoal-tunnels-20260630-135959.age.
+            let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+            let ext = if f.encrypt { "age" } else { "yaml" };
+            let name = format!("sshoal-tunnels-{stamp}.{ext}");
             Task::perform(
                 async move {
                     rfd::AsyncFileDialog::new()
@@ -2325,8 +2325,8 @@ fn prefs_view(app: &App) -> Element<'_, Message> {
     let mut backup = column![
         caption("Export tunnels to a portable file (encrypted by default), or import one."),
         row![
-            primary_button("Export…", Message::OpenExport),
-            secondary_button("Import…", Some(Message::OpenImport)),
+            primary_button("Export", Message::OpenExport),
+            secondary_button("Import", Some(Message::OpenImport)),
         ]
         .spacing(8),
     ]
@@ -3270,7 +3270,7 @@ fn rename_view(form: &RenameFolder) -> Element<'_, Message> {
 }
 
 /// The export-options popover: encrypt + include-keys toggles, a passphrase field
-/// (when encrypting), then "Choose file…" which opens the native save dialog.
+/// (when encrypting), then "Choose file" which opens the native save dialog.
 fn export_view(form: &ExportForm) -> Element<'_, Message> {
     let toggle_row = |label: &'static str, on: bool, msg: fn(bool) -> Message| {
         row![
@@ -3310,7 +3310,7 @@ fn export_view(form: &ExportForm) -> Element<'_, Message> {
     }
     col = col.push(
         row![
-            primary_button("Choose file…", Message::ExportPick),
+            primary_button("Choose file", Message::ExportPick),
             secondary_button("Cancel", Some(Message::BackupCancel)),
         ]
         .spacing(10),
