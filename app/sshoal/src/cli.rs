@@ -426,8 +426,10 @@ fn safe_key_dest(path: &str) -> bool {
         "environment",
         "rc",
     ];
+    // Case-insensitive: macOS/APFS is case-insensitive, so `Authorized_keys`
+    // would otherwise slip through and resolve to `authorized_keys` on disk.
     let base = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
-    !base.is_empty() && !RESERVED.contains(&base)
+    !base.is_empty() && !RESERVED.iter().any(|r| base.eq_ignore_ascii_case(r))
 }
 
 /// A safe filename for a managed key: only `[A-Za-z0-9_-]`, so it can never be
