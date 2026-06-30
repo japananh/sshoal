@@ -1293,8 +1293,8 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 return Task::none();
             }
             // Timestamp the default name so exports don't overwrite each other
-            // and sort chronologically, e.g. sshoal-tunnels-20260630-135959.age.
-            let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+            // and sort chronologically, e.g. sshoal-tunnels-2026-06-30_14-08-23.age.
+            let stamp = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S");
             let ext = if f.encrypt { "age" } else { "yaml" };
             let name = format!("sshoal-tunnels-{stamp}.{ext}");
             Task::perform(
