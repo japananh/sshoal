@@ -392,8 +392,18 @@ pub(crate) fn materialize_keys(incoming: &mut PortableConfig, overwrite: bool) -
 /// of ssh's own control files. Everything else is rejected so a hostile export
 /// can't write outside `~/.ssh` or clobber `authorized_keys` / `config` / etc.
 fn safe_key_dest(path: &str) -> bool {
-    let prefix = format!("{}/.ssh/", home());
-    if !path.starts_with(&prefix) {
+    safe_key_dest_in(path, &home())
+}
+
+/// Pure core of [`safe_key_dest`], with `home` injected so it's unit-testable.
+fn safe_key_dest_in(path: &str, home: &str) -> bool {
+    let prefix = format!("{home}/.ssh/");
+    // Must be a real file *under* ~/.ssh/ — reject the dir itself and any
+    // directory path (trailing slash).
+    let Some(rest) = path.strip_prefix(&prefix) else {
+        return false;
+    };
+    if rest.is_empty() || rest.ends_with('/') {
         return false;
     }
     let p = Path::new(path);
@@ -473,4 +483,66 @@ fn passphrase(confirm: bool) -> String {
 fn fail(message: String) -> i32 {
     eprintln!("error: {message}");
     1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HOME: &str = "/home/u";
+
+    #[test]
+    fn safe_key_dest_allows_normal_keys_under_ssh() {
+        assert!(safe_key_dest_in("/home/u/.ssh/es-admin.pem", HOME));
+        assert!(safe_key_dest_in("/home/u/.ssh/id_ed25519", HOME));
+        assert!(safe_key_dest_in("/home/u/.ssh/keys/work.pem", HOME)); // nested ok
+    }
+
+    #[test]
+    fn safe_key_dest_blocks_ssh_control_files_any_case() {
+        for name in [
+            "authorized_keys",
+            "Authorized_keys", // macOS case-insensitive bypass attempt
+            "AUTHORIZED_KEYS",
+            "config",
+            "Config",
+            "known_hosts",
+            "environment",
+            "rc",
+        ] {
+            assert!(
+                !safe_key_dest_in(&format!("/home/u/.ssh/{name}"), HOME),
+                "{name} must be blocked"
+            );
+        }
+    }
+
+    #[test]
+    fn safe_key_dest_blocks_outside_ssh_and_traversal() {
+        assert!(!safe_key_dest_in(
+            "/home/u/.config/autostart/x.desktop",
+            HOME
+        )); // outside ~/.ssh
+        assert!(!safe_key_dest_in("/home/u/.bashrc", HOME));
+        assert!(!safe_key_dest_in("/etc/cron.d/x", HOME)); // absolute, outside home
+        assert!(!safe_key_dest_in("/home/u/.ssh/../.bashrc", HOME)); // traversal
+        assert!(!safe_key_dest_in("/home/u/.sshEVIL/k", HOME)); // sibling-prefix trick
+        assert!(!safe_key_dest_in("/home/u/.ssh/", HOME)); // the dir itself / empty base
+        // A macOS-absolute path on a Linux home falls outside → rejected (falls back).
+        assert!(!safe_key_dest_in("/Users/nana/.ssh/k.pem", HOME));
+    }
+
+    #[test]
+    fn sanitize_key_name_strips_unsafe_chars() {
+        assert_eq!(sanitize_key_name("gemx-dev"), "gemx-dev");
+        assert_eq!(sanitize_key_name("es-admin.pem"), "es-admin_pem"); // '.' -> '_'
+        assert_eq!(sanitize_key_name("../../etc/passwd"), "______etc_passwd"); // no '/' or '..'
+        assert_eq!(sanitize_key_name("a/b"), "a_b");
+        assert_eq!(sanitize_key_name(""), "key"); // never empty
+        // Result can never contain a path separator or be a traversal token.
+        for n in ["..", "/", "a/../b", ""] {
+            let s = sanitize_key_name(n);
+            assert!(!s.contains('/') && s != ".." && s != ".");
+        }
+    }
 }
