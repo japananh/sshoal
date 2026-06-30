@@ -332,19 +332,41 @@ pub(crate) fn gather_keys(portable: &PortableConfig) -> Vec<EmbeddedKey> {
     keys
 }
 
-/// Write embedded keys into sshoal's own keys dir (`~/.config/sshoal/keys/`,
-/// chmod 600) and repoint each matching config's `identity_file` there. Skips an
+/// Write embedded keys back to their config's original `identity_file` path when
+/// that path is safe (see [`safe_key_dest`]), so a self-export restores keys to
+/// `~/.ssh/…` as-is. Unsafe paths fall back to sshoal's own keys dir
+/// (`~/.config/sshoal/keys/<config>`) with `identity_file` repointed there.
+/// Private keys get chmod 600; a matching `.pub` is written alongside. Skips an
 /// existing file unless `overwrite`. Returns how many key files were written.
 ///
-/// Security: the destination is derived from a *sanitized* config name, NEVER
-/// from the path inside the imported file — a hostile export could otherwise set
-/// `identity_file` to `~/.ssh/authorized_keys`, `~/.ssh/config`, a `..` traversal
-/// or an absolute path and have us write attacker-controlled bytes there.
+/// Security: we never blindly honour the path from an imported file — a hostile
+/// export could otherwise target `~/.ssh/authorized_keys`, `~/.ssh/config`,
+/// `~/.config/autostart/…`, a `..` traversal, or an absolute system path. Only
+/// non-control files directly under `~/.ssh/` are restored in place.
 pub(crate) fn materialize_keys(incoming: &mut PortableConfig, overwrite: bool) -> usize {
     let mut written = 0;
     for key in &incoming.keys {
-        let rel = format!("~/.config/sshoal/keys/{}", sanitize_key_name(&key.config));
-        let dest = expand_tilde(&rel);
+        let original = incoming
+            .ssh_configs
+            .iter()
+            .find(|c| c.name == key.config)
+            .and_then(|c| c.identity_file.clone());
+
+        // Restore to the original path if it's safe; otherwise our own keys dir.
+        let (dest, repoint) = match &original {
+            Some(p) if safe_key_dest(&expand_tilde(p)) => (expand_tilde(p), None),
+            _ => {
+                let rel = format!("~/.config/sshoal/keys/{}", sanitize_key_name(&key.config));
+                if original.is_some() {
+                    eprintln!(
+                        "note: key path for {} isn't safe to restore in place; writing to {rel}",
+                        key.config
+                    );
+                }
+                (expand_tilde(&rel), Some(rel))
+            }
+        };
+
         if Path::new(&dest).exists() && !overwrite {
             eprintln!("skip key {dest} (already exists; use --overwrite to replace)");
         } else {
@@ -362,18 +384,50 @@ pub(crate) fn materialize_keys(incoming: &mut PortableConfig, overwrite: bool) -
             }
             written += 1;
         }
-        // Point the config at the managed key (whether just written or pre-existing).
-        if let Some(cfg) = incoming
-            .ssh_configs
-            .iter_mut()
-            .find(|c| c.name == key.config)
-        {
-            cfg.identity_file = Some(rel);
-        } else {
-            eprintln!("warning: embedded key for unknown config {}", key.config);
+
+        // Only repoint identity_file when we fell back to the managed dir; an
+        // in-place restore keeps the original path.
+        if let Some(rel) = repoint {
+            if let Some(cfg) = incoming
+                .ssh_configs
+                .iter_mut()
+                .find(|c| c.name == key.config)
+            {
+                cfg.identity_file = Some(rel);
+            } else {
+                eprintln!("warning: embedded key for unknown config {}", key.config);
+            }
         }
     }
     written
+}
+
+/// Whether `path` (already tilde-expanded to absolute) is safe to materialize a
+/// key into: directly or nested under `~/.ssh/`, no `..` traversal, and not one
+/// of ssh's own control files. Everything else is rejected so a hostile export
+/// can't write outside `~/.ssh` or clobber `authorized_keys` / `config` / etc.
+fn safe_key_dest(path: &str) -> bool {
+    let prefix = format!("{}/.ssh/", home());
+    if !path.starts_with(&prefix) {
+        return false;
+    }
+    let p = Path::new(path);
+    if p.components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return false;
+    }
+    const RESERVED: [&str; 7] = [
+        "authorized_keys",
+        "authorized_keys2",
+        "config",
+        "known_hosts",
+        "known_hosts2",
+        "environment",
+        "rc",
+    ];
+    let base = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    !base.is_empty() && !RESERVED.contains(&base)
 }
 
 /// A safe filename for a managed key: only `[A-Za-z0-9_-]`, so it can never be
