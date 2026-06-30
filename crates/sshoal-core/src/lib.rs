@@ -18,7 +18,7 @@ pub mod updater;
 pub use config::{AppConfig, Settings, SshConfig, Tunnel};
 pub use import::{SshHost, parse_ssh_config, parse_tunnel_file, ssh_configs_for};
 pub use supervisor::{Backoff, TunnelState, TunnelSupervisor};
-pub use transfer::{ExportError, ImportError, export, import};
+pub use transfer::{ExportError, ImportError, PortableConfig, export, export_portable, import};
 pub use transport::{
     OpenSshTransport, Transport, TunnelHandle, build_ssh_args, build_test_ssh_args,
 };

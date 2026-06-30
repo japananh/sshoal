@@ -7,6 +7,7 @@
 //! self-contained. Private keys themselves are never stored — only a path to
 //! the key file.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -162,6 +163,36 @@ impl AppConfig {
             .unwrap_or_else(|| SshConfig::alias(&tunnel.ssh))
     }
 
+    /// Tunnels selected for export: everything when `prefix` is `None`, otherwise
+    /// the subtree at or under `prefix`. Matching is **segment-aware** — `gc/dev`
+    /// matches `gc/dev` and `gc/dev/...` but not `gc/development`.
+    pub fn select_tunnels(&self, prefix: Option<&str>) -> Vec<Tunnel> {
+        match prefix {
+            None => self.tunnels.clone(),
+            Some(p) => {
+                let child = format!("{p}/");
+                self.tunnels
+                    .iter()
+                    .filter(|t| t.path == p || t.path.starts_with(&child))
+                    .cloned()
+                    .collect()
+            }
+        }
+    }
+
+    /// The ssh configs referenced (by `Tunnel.ssh` name) by `tunnels`, in this
+    /// config's own order. A tunnel whose ssh name has no matching config is
+    /// simply skipped here — on import it falls back to an alias, mirroring
+    /// runtime [`resolve_ssh`]. This is what makes an export self-contained.
+    pub fn referenced_ssh_configs(&self, tunnels: &[Tunnel]) -> Vec<SshConfig> {
+        let needed: HashSet<&str> = tunnels.iter().map(|t| t.ssh.as_str()).collect();
+        self.ssh_configs
+            .iter()
+            .filter(|c| needed.contains(c.name.as_str()))
+            .cloned()
+            .collect()
+    }
+
     /// Load from a file, returning an empty config if the file does not exist.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
@@ -289,6 +320,74 @@ mod tests {
     fn load_missing_file_yields_empty_config() {
         let cfg = AppConfig::load("/nonexistent/sshoal/servers.yaml").unwrap();
         assert_eq!(cfg, AppConfig::default());
+    }
+
+    #[test]
+    fn select_tunnels_prefix_is_segment_aware() {
+        let cfg = AppConfig {
+            ssh_configs: vec![],
+            tunnels: vec![
+                Tunnel {
+                    path: "gc/dev/db".into(),
+                    ssh: "a".into(),
+                    local_port: 1,
+                    remote_host: "h".into(),
+                    remote_port: 2,
+                },
+                Tunnel {
+                    path: "gc/development/db".into(), // must NOT match "gc/dev"
+                    ssh: "a".into(),
+                    local_port: 3,
+                    remote_host: "h".into(),
+                    remote_port: 4,
+                },
+                Tunnel {
+                    path: "gc/prod/db".into(),
+                    ssh: "a".into(),
+                    local_port: 5,
+                    remote_host: "h".into(),
+                    remote_port: 6,
+                },
+            ],
+            settings: Settings::default(),
+        };
+        let under: Vec<_> = cfg
+            .select_tunnels(Some("gc/dev"))
+            .into_iter()
+            .map(|t| t.path)
+            .collect();
+        assert_eq!(under, vec!["gc/dev/db"]);
+        assert_eq!(cfg.select_tunnels(None).len(), 3); // None = all
+    }
+
+    #[test]
+    fn referenced_ssh_configs_gathers_only_used_and_skips_missing() {
+        let cfg = AppConfig {
+            ssh_configs: vec![SshConfig::alias("used"), SshConfig::alias("unused")],
+            tunnels: vec![
+                Tunnel {
+                    path: "a".into(),
+                    ssh: "used".into(),
+                    local_port: 1,
+                    remote_host: "h".into(),
+                    remote_port: 2,
+                },
+                Tunnel {
+                    path: "b".into(),
+                    ssh: "alias-only".into(), // no matching SshConfig → skipped
+                    local_port: 3,
+                    remote_host: "h".into(),
+                    remote_port: 4,
+                },
+            ],
+            settings: Settings::default(),
+        };
+        let refs: Vec<_> = cfg
+            .referenced_ssh_configs(&cfg.tunnels)
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(refs, vec!["used"]); // only "used"; "unused" dropped, "alias-only" skipped
     }
 
     #[test]

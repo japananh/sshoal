@@ -10,8 +10,9 @@ use std::io::{Read, Write};
 use std::iter;
 
 use age::secrecy::SecretString;
+use serde::{Deserialize, Serialize};
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, SshConfig, Tunnel};
 
 /// age files begin with this header, which lets `import` auto-detect whether a
 /// blob is encrypted.
@@ -39,19 +40,70 @@ pub enum ImportError {
     Io(#[from] std::io::Error),
 }
 
-/// Serialize `config` to a portable blob, encrypting with `passphrase` if given.
-pub fn export(config: &AppConfig, passphrase: Option<&str>) -> Result<Vec<u8>, ExportError> {
-    let yaml = serde_yaml::to_string(config)?;
-    let Some(pass) = passphrase else {
-        return Ok(yaml.into_bytes());
-    };
+/// A self-contained, portable subset of a config: tunnels plus only the
+/// [`SshConfig`]s they reference. `settings` are deliberately excluded — they're
+/// machine-specific (`collapsed_folders`, `skipped_version`, `auto_update_enabled`)
+/// and `AppConfig::merge` ignores incoming settings on import anyway.
+///
+/// A `PortableConfig` YAML is a strict subset of an `AppConfig` YAML (same
+/// top-level `ssh_configs` / `tunnels` keys), so [`import`] parses it straight
+/// into an `AppConfig` with default settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortableConfig {
+    #[serde(default)]
+    pub ssh_configs: Vec<SshConfig>,
+    #[serde(default)]
+    pub tunnels: Vec<Tunnel>,
+}
 
+impl PortableConfig {
+    /// Build a self-contained subset of `config`: the tunnels selected by
+    /// `prefix` (see [`AppConfig::select_tunnels`]) plus the ssh configs they
+    /// reference. With `strip_identity`, `identity_file` paths are dropped (they
+    /// can be machine-specific); no key material is ever included regardless.
+    pub fn build(config: &AppConfig, prefix: Option<&str>, strip_identity: bool) -> Self {
+        let tunnels = config.select_tunnels(prefix);
+        let mut ssh_configs = config.referenced_ssh_configs(&tunnels);
+        if strip_identity {
+            for c in &mut ssh_configs {
+                c.identity_file = None;
+            }
+        }
+        Self {
+            ssh_configs,
+            tunnels,
+        }
+    }
+}
+
+/// Serialize the whole `config` to a portable blob, encrypting if a passphrase
+/// is given. (For a self-contained, settings-free subset, prefer
+/// [`export_portable`].)
+pub fn export(config: &AppConfig, passphrase: Option<&str>) -> Result<Vec<u8>, ExportError> {
+    seal(serde_yaml::to_string(config)?.into_bytes(), passphrase)
+}
+
+/// Serialize a [`PortableConfig`] to a portable blob, encrypting if a passphrase
+/// is given.
+pub fn export_portable(
+    portable: &PortableConfig,
+    passphrase: Option<&str>,
+) -> Result<Vec<u8>, ExportError> {
+    seal(serde_yaml::to_string(portable)?.into_bytes(), passphrase)
+}
+
+/// Pass YAML bytes through unchanged (plaintext) or wrap them with age scrypt
+/// passphrase encryption.
+fn seal(yaml: Vec<u8>, passphrase: Option<&str>) -> Result<Vec<u8>, ExportError> {
+    let Some(pass) = passphrase else {
+        return Ok(yaml);
+    };
     let encryptor = age::Encryptor::with_user_passphrase(SecretString::from(pass.to_owned()));
     let mut out = Vec::new();
     let mut writer = encryptor
         .wrap_output(&mut out)
         .map_err(|e| ExportError::Encrypt(e.to_string()))?;
-    writer.write_all(yaml.as_bytes())?;
+    writer.write_all(&yaml)?;
     writer
         .finish()
         .map_err(|e| ExportError::Encrypt(e.to_string()))?;
@@ -84,7 +136,7 @@ fn decrypt(bytes: &[u8], passphrase: &str) -> Result<Vec<u8>, ImportError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Tunnel;
+    use crate::config::{Settings, Tunnel};
 
     fn sample() -> AppConfig {
         AppConfig {
@@ -98,6 +150,113 @@ mod tests {
             }],
             settings: Default::default(),
         }
+    }
+
+    fn tunnel(path: &str, ssh: &str, local: u16) -> Tunnel {
+        Tunnel {
+            path: path.into(),
+            ssh: ssh.into(),
+            local_port: local,
+            remote_host: "db.internal".into(),
+            remote_port: 5432,
+        }
+    }
+
+    fn ssh(name: &str) -> SshConfig {
+        SshConfig {
+            name: name.into(),
+            host: format!("{name}.example.com"),
+            port: 22,
+            user: Some("deploy".into()),
+            identity_file: Some(format!("~/.ssh/{name}.pem")),
+        }
+    }
+
+    /// Two ssh configs (one unused) and tunnels under two subtrees.
+    fn full() -> AppConfig {
+        AppConfig {
+            ssh_configs: vec![ssh("dev"), ssh("prod"), ssh("unused")],
+            tunnels: vec![
+                tunnel("gc/dev/db", "dev", 1),
+                tunnel("gc/dev/redis", "dev", 2),
+                tunnel("gc/prod/db", "prod", 3),
+            ],
+            settings: Settings {
+                skipped_version: Some("v9.9.9".into()),
+                collapsed_folders: vec!["gc/prod".into()],
+                ..Settings::default()
+            },
+        }
+    }
+
+    #[test]
+    fn portable_export_is_self_contained_and_roundtrips_into_empty() {
+        let cfg = full();
+        let portable = PortableConfig::build(&cfg, None, false); // --all
+        // Self-contained: includes the referenced configs (dev, prod), not "unused".
+        let names: Vec<_> = portable
+            .ssh_configs
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+        assert_eq!(names, vec!["dev", "prod"]);
+
+        // Import into an empty config recreates identical tunnels + referenced configs.
+        let blob = export_portable(&portable, None).unwrap();
+        let mut empty = AppConfig::default();
+        empty.merge(import(&blob, None).unwrap(), true);
+        assert_eq!(empty.tunnels, cfg.tunnels);
+        assert_eq!(empty.ssh_configs, vec![ssh("dev"), ssh("prod")]);
+        // Settings never travel (the importer's stay default).
+        assert_eq!(empty.settings, Settings::default());
+    }
+
+    #[test]
+    fn portable_export_excludes_settings_from_the_file() {
+        let blob = export_portable(&PortableConfig::build(&full(), None, false), None).unwrap();
+        let text = String::from_utf8(blob).unwrap();
+        assert!(
+            !text.contains("settings"),
+            "portable file must not carry settings"
+        );
+        assert!(!text.contains("v9.9.9") && !text.contains("collapsed_folders"));
+    }
+
+    #[test]
+    fn portable_export_by_prefix_selects_subtree_and_its_configs() {
+        let portable = PortableConfig::build(&full(), Some("gc/dev"), false);
+        let paths: Vec<_> = portable.tunnels.iter().map(|t| t.path.clone()).collect();
+        assert_eq!(paths, vec!["gc/dev/db", "gc/dev/redis"]);
+        // Only the config those tunnels use (dev), not prod/unused.
+        let names: Vec<_> = portable
+            .ssh_configs
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+        assert_eq!(names, vec!["dev"]);
+    }
+
+    #[test]
+    fn strip_identity_drops_key_paths() {
+        let portable = PortableConfig::build(&full(), None, true);
+        assert!(
+            portable
+                .ssh_configs
+                .iter()
+                .all(|c| c.identity_file.is_none())
+        );
+        let text = String::from_utf8(export_portable(&portable, None).unwrap()).unwrap();
+        assert!(!text.contains("identity_file"));
+    }
+
+    #[test]
+    fn reimport_is_idempotent() {
+        let blob = export_portable(&PortableConfig::build(&full(), None, false), None).unwrap();
+        let mut cfg = AppConfig::default();
+        cfg.merge(import(&blob, None).unwrap(), false); // skip
+        cfg.merge(import(&blob, None).unwrap(), false); // re-import, skip
+        assert_eq!(cfg.tunnels.len(), 3); // no duplicates — merge is keyed
+        assert_eq!(cfg.ssh_configs.len(), 2);
     }
 
     #[test]
