@@ -3264,7 +3264,7 @@ fn rename_view(form: &RenameFolder) -> Element<'_, Message> {
 }
 
 /// The export-options popover: encrypt + include-keys toggles, a passphrase field
-/// (when encrypting), then "Choose file" which opens the native save dialog.
+/// (when encrypting), then "Save" which opens the native save dialog.
 fn export_view(form: &ExportForm) -> Element<'_, Message> {
     let toggle_row = |label: &'static str, on: bool, msg: fn(bool) -> Message| {
         row![
@@ -3308,7 +3308,7 @@ fn export_view(form: &ExportForm) -> Element<'_, Message> {
     }
     col = col.push(
         row![
-            primary_button("Choose file", Message::ExportPick),
+            primary_button("Save", Message::ExportPick),
             secondary_button("Cancel", Some(Message::BackupCancel)),
         ]
         .spacing(10),
