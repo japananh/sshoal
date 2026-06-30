@@ -83,6 +83,12 @@ pub struct EmbeddedKey {
     pub config: String,
     /// The private-key file's contents (PEM / OpenSSH text).
     pub contents: String,
+    /// The matching public key (`<identity_file>.pub`), if it existed alongside
+    /// the private one. Public material (not sensitive), kept only as a
+    /// convenience — re-authorizing the key on a server / sharing it. The client
+    /// never needs it to connect (ssh derives it from the private key).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public: Option<String>,
 }
 
 impl PortableConfig {
@@ -359,6 +365,7 @@ mod tests {
         portable.keys = vec![EmbeddedKey {
             config: "dev".into(),
             contents: "-----BEGIN PRIVATE KEY-----\nMOCK\n-----END PRIVATE KEY-----\n".into(),
+            public: Some("ssh-ed25519 AAAAMOCK mock@host\n".into()),
         }];
         // Encrypted (as --include-keys forces), then read back.
         let blob = export_portable(&portable, Some("a good passphrase")).unwrap();

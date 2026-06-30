@@ -309,18 +309,22 @@ fn run_import(args: &[String]) -> i32 {
     0
 }
 
-/// Read each referenced config's `identity_file` and embed its contents. An
-/// unreadable / absent key is skipped with a warning (the path still travels).
+/// Read each referenced config's `identity_file` and embed its contents, plus the
+/// matching `<identity_file>.pub` if it sits alongside (a convenience — the public
+/// key isn't needed to connect). An unreadable / absent private key is skipped
+/// with a warning (the path still travels).
 pub(crate) fn gather_keys(portable: &PortableConfig) -> Vec<EmbeddedKey> {
     let mut keys = Vec::new();
     for c in &portable.ssh_configs {
         let Some(path) = &c.identity_file else {
             continue;
         };
-        match std::fs::read_to_string(expand_tilde(path)) {
+        let expanded = expand_tilde(path);
+        match std::fs::read_to_string(&expanded) {
             Ok(contents) => keys.push(EmbeddedKey {
                 config: c.name.clone(),
                 contents,
+                public: std::fs::read_to_string(format!("{expanded}.pub")).ok(),
             }),
             Err(e) => eprintln!("warning: skipping key for {}: {path}: {e}", c.name),
         }
@@ -352,6 +356,10 @@ pub(crate) fn materialize_keys(incoming: &mut PortableConfig, overwrite: bool) -
                 continue;
             }
             chmod_600(&dest);
+            // Drop the public key next to it (public material, perms don't matter).
+            if let Some(pubkey) = &key.public {
+                let _ = std::fs::write(format!("{dest}.pub"), pubkey);
+            }
             written += 1;
         }
         // Point the config at the managed key (whether just written or pre-existing).
