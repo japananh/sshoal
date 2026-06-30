@@ -32,3 +32,5 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 rpassword = "7.5.4"
 resvg = "0.47.0"
 global-hotkey = "0.8.0"
+# Native open/save file dialogs for Export… / Import… in Preferences.
+rfd = "0.15"

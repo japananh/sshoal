@@ -53,8 +53,8 @@ use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use sshoal_core::updater::{self, RELEASES_URL, UpdateInfo};
 use sshoal_core::{
-    AppConfig, Backoff, OpenSshTransport, Settings, SshConfig, Transport, Tunnel, TunnelState,
-    TunnelSupervisor,
+    AppConfig, Backoff, ImportError, OpenSshTransport, PortableConfig, Settings, SshConfig,
+    Transport, Tunnel, TunnelState, TunnelSupervisor, export_portable, import_portable,
 };
 use tracing::info;
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
@@ -176,6 +176,27 @@ enum Message {
     InstallUpdate,
     /// Result of the install — Ok(()) (about to relaunch) or a failure.
     UpdateInstalled(Result<(), String>),
+    // Backup: Export / Import (Preferences → Backup).
+    /// Open the export-options popover.
+    OpenExport,
+    ExportToggleEncrypt(bool),
+    ExportToggleKeys(bool),
+    ExportPassphrase(String),
+    /// Validate the form, then open the native save dialog.
+    ExportPick,
+    /// Save-dialog result; `Some(path)` → build + write the export there.
+    ExportPicked(Option<PathBuf>),
+    /// Open the native open dialog to import.
+    OpenImport,
+    /// Open-dialog result: the chosen file's bytes (`None` if cancelled).
+    ImportPicked(Option<Vec<u8>>),
+    ImportPassphraseInput(String),
+    /// Decrypt + merge the picked file using the typed passphrase.
+    ImportConfirm,
+    /// Result of an export/import — a human-readable status line.
+    BackupFinished(Result<String, String>),
+    /// Close the Export/Import popover.
+    BackupCancel,
 }
 
 struct MenuIds {
@@ -254,6 +275,32 @@ struct SshForm {
     error: Option<String>,
 }
 
+/// The Export/Import popover (Preferences → Backup).
+enum Backup {
+    /// Export options + passphrase, before the save dialog.
+    Export(ExportForm),
+    /// A picked, encrypted file awaiting its passphrase to import.
+    ImportPassphrase(ImportForm),
+}
+
+/// Options for an export (mirrors the CLI flags).
+struct ExportForm {
+    /// Encrypt the file (default on). Off = plaintext YAML.
+    encrypt: bool,
+    /// Embed private-key contents (forces `encrypt`).
+    include_keys: bool,
+    passphrase: String,
+    error: Option<String>,
+}
+
+/// A decrypt-on-import prompt: the file's bytes + the passphrase being typed.
+#[derive(Default)]
+struct ImportForm {
+    bytes: Vec<u8>,
+    passphrase: String,
+    error: Option<String>,
+}
+
 struct App {
     /// Created lazily on the first tick — on macOS the tray must be created
     /// after the app's event loop is running, not during `boot`.
@@ -314,6 +361,10 @@ struct App {
     update_prompt: bool,
     /// An install (download + replace) is in flight.
     update_installing: bool,
+    /// The Export/Import popover (Preferences → Backup), if open.
+    backup: Option<Backup>,
+    /// Transient result of the last export/import, shown in Preferences.
+    backup_status: Option<String>,
 }
 
 impl App {
@@ -446,6 +497,8 @@ fn boot(runtime: Arc<tokio::runtime::Runtime>) -> (App, Task<Message>) {
         update_status: None,
         update_prompt: false,
         update_installing: false,
+        backup: None,
+        backup_status: None,
     };
 
     // Show the window on launch so opening the app always surfaces it (the tray
@@ -820,6 +873,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             // Back out one level; if nothing is open, hide the window (the app
             // keeps running in the tray — reopen with ⌃⌘S or the tray icon).
             if app.confirm_delete.take().is_some()
+                || app.backup.take().is_some()
                 || app.renaming.take().is_some()
                 || app.context_menu.take().is_some()
                 || app.editing.take().is_some()
@@ -1190,6 +1244,164 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             }
             Task::none()
         }
+        Message::OpenExport => {
+            app.backup = Some(Backup::Export(ExportForm {
+                encrypt: true,
+                include_keys: false,
+                passphrase: String::new(),
+                error: None,
+            }));
+            app.backup_status = None;
+            Task::none()
+        }
+        Message::ExportToggleEncrypt(on) => {
+            if let Some(Backup::Export(f)) = &mut app.backup {
+                f.encrypt = on;
+                f.error = None;
+            }
+            Task::none()
+        }
+        Message::ExportToggleKeys(on) => {
+            if let Some(Backup::Export(f)) = &mut app.backup {
+                f.include_keys = on;
+                f.error = None;
+            }
+            Task::none()
+        }
+        Message::ExportPassphrase(s) => {
+            if let Some(Backup::Export(f)) = &mut app.backup {
+                f.passphrase = s;
+                f.error = None;
+            }
+            Task::none()
+        }
+        Message::ExportPick => {
+            let Some(Backup::Export(f)) = &mut app.backup else {
+                return Task::none();
+            };
+            if f.encrypt && f.passphrase.chars().count() < cli::MIN_PASSPHRASE_LEN {
+                f.error = Some(format!(
+                    "Passphrase too short (min {} chars)",
+                    cli::MIN_PASSPHRASE_LEN
+                ));
+                return Task::none();
+            }
+            // Timestamp the default name with the Unix epoch (seconds) so exports
+            // don't overwrite each other and still sort chronologically, e.g.
+            // sshoal_1782561000.age.
+            let stamp = chrono::Local::now().timestamp();
+            let ext = if f.encrypt { "age" } else { "yaml" };
+            let name = format!("sshoal_{stamp}.{ext}");
+            Task::perform(
+                async move {
+                    rfd::AsyncFileDialog::new()
+                        .set_file_name(name)
+                        .save_file()
+                        .await
+                        .map(|h| h.path().to_path_buf())
+                },
+                Message::ExportPicked,
+            )
+        }
+        Message::ExportPicked(path) => {
+            let Some(path) = path else {
+                return Task::none(); // cancelled — leave the popover open
+            };
+            let Some(Backup::Export(f)) = &app.backup else {
+                return Task::none();
+            };
+            let passphrase = f.encrypt.then(|| f.passphrase.clone());
+            let include_keys = f.include_keys;
+            let cfg = AppConfig {
+                ssh_configs: app.ssh_configs.clone(),
+                tunnels: app.rows.iter().map(|r| r.tunnel.clone()).collect(),
+                settings: Settings::default(),
+            };
+            let portable = PortableConfig::build(&cfg, None, false);
+            app.backup = None;
+            let runtime = app.runtime.clone();
+            Task::perform(
+                async move {
+                    runtime
+                        .spawn_blocking(move || {
+                            do_export(portable, include_keys, passphrase, &path)
+                        })
+                        .await
+                        .map_err(|e| e.to_string())
+                        .and_then(|r| r)
+                },
+                Message::BackupFinished,
+            )
+        }
+        Message::OpenImport => {
+            app.backup_status = None;
+            Task::perform(
+                async move {
+                    match rfd::AsyncFileDialog::new().pick_file().await {
+                        Some(h) => Some(h.read().await),
+                        None => None,
+                    }
+                },
+                Message::ImportPicked,
+            )
+        }
+        Message::ImportPicked(bytes) => {
+            let Some(bytes) = bytes else {
+                return Task::none(); // cancelled
+            };
+            // Plaintext imports apply at once; encrypted ones need a passphrase.
+            match import_portable(&bytes, None) {
+                Ok(portable) => apply_import(app, portable),
+                Err(ImportError::PassphraseRequired) => {
+                    app.backup = Some(Backup::ImportPassphrase(ImportForm {
+                        bytes,
+                        ..Default::default()
+                    }));
+                    Task::none()
+                }
+                Err(e) => {
+                    app.backup_status = Some(format!("Import failed: {e}"));
+                    Task::none()
+                }
+            }
+        }
+        Message::ImportPassphraseInput(s) => {
+            if let Some(Backup::ImportPassphrase(f)) = &mut app.backup {
+                f.passphrase = s;
+                f.error = None;
+            }
+            Task::none()
+        }
+        Message::ImportConfirm => {
+            let Some(Backup::ImportPassphrase(f)) = &app.backup else {
+                return Task::none();
+            };
+            let bytes = f.bytes.clone();
+            let pass = f.passphrase.clone();
+            match import_portable(&bytes, Some(&pass)) {
+                Ok(portable) => {
+                    app.backup = None;
+                    apply_import(app, portable)
+                }
+                Err(e) => {
+                    if let Some(Backup::ImportPassphrase(f)) = &mut app.backup {
+                        f.error = Some(format!("{e}"));
+                    }
+                    Task::none()
+                }
+            }
+        }
+        Message::BackupFinished(result) => {
+            app.backup_status = Some(match result {
+                Ok(s) => s,
+                Err(e) => format!("Failed: {e}"),
+            });
+            Task::none()
+        }
+        Message::BackupCancel => {
+            app.backup = None;
+            Task::none()
+        }
         Message::WindowOpened(id) => {
             info!(window = ?id, "window opened");
             // Put the cursor in the search box so you can filter by just typing.
@@ -1455,6 +1667,61 @@ fn persist_app(app: &App) {
     if let Err(e) = config.save(config_path()) {
         tracing::error!(error = %e, "failed to save config");
     }
+}
+
+/// Build (optionally embedding keys), encrypt-or-not, and write an export. Runs
+/// off the UI thread (Argon2id + file I/O). Returns a status line.
+fn do_export(
+    mut portable: PortableConfig,
+    include_keys: bool,
+    passphrase: Option<String>,
+    path: &Path,
+) -> Result<String, String> {
+    if include_keys {
+        cli::embed_keys(&mut portable);
+    }
+    let blob = export_portable(&portable, passphrase.as_deref()).map_err(|e| e.to_string())?;
+    std::fs::write(path, &blob).map_err(|e| format!("writing {}: {e}", path.display()))?;
+    Ok(format!(
+        "Exported {} tunnel(s) to {}",
+        portable.tunnels.len(),
+        path.display()
+    ))
+}
+
+/// Merge an imported config into the running app: materialize embedded keys, add
+/// new ssh configs + tunnels (skipping conflicts, so running tunnels and existing
+/// entries are untouched), reconcile collapse state, and persist.
+fn apply_import(app: &mut App, mut portable: PortableConfig) -> Task<Message> {
+    let wrote = cli::materialize_keys(&mut portable, false);
+    for c in portable.ssh_configs_plain() {
+        if !app.ssh_configs.iter().any(|x| x.name == c.name) {
+            app.ssh_configs.push(c);
+        }
+    }
+    let mut added = 0;
+    for t in portable.tunnels {
+        if app.rows.iter().any(|r| r.tunnel.path == t.path) {
+            continue; // keep the existing tunnel (and its running supervisor)
+        }
+        app.rows.push(TunnelRow {
+            tunnel: t,
+            supervisor: None,
+            status: TunnelState::Idle,
+            notice: None,
+            err_seen: None,
+        });
+        added += 1;
+    }
+    reconcile_collapsed(app);
+    persist_app(app);
+    let keys = if wrote > 0 {
+        format!(", wrote {wrote} key file(s)")
+    } else {
+        String::new()
+    };
+    app.backup_status = Some(format!("Imported {added} new tunnel(s){keys}"));
+    Task::none()
 }
 
 /// Apply a folder rename from the popover: rewrite the matching path prefix on
@@ -1774,6 +2041,19 @@ fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
             .center_y(Length::Fill);
         return stack![base, backdrop, centered].into();
     }
+    // Export/Import popover, centered over whatever screen is showing.
+    if let Some(backup) = &app.backup {
+        let backdrop = mouse_area(space().width(Length::Fill).height(Length::Fill))
+            .on_press(Message::BackupCancel);
+        let view = match backup {
+            Backup::Export(form) => export_view(form),
+            Backup::ImportPassphrase(form) => import_passphrase_view(form),
+        };
+        let centered = container(view)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill);
+        return stack![base, backdrop, centered].into();
+    }
     // Confirm-to-update popover, centered over whatever screen is showing.
     if app.update_prompt
         && let Some(info) = &app.update_info
@@ -2037,6 +2317,19 @@ fn prefs_view(app: &App) -> Element<'_, Message> {
         updates = updates.push(primary_button("Update now", Message::PromptUpdate));
     }
 
+    let mut backup = column![
+        caption("Export tunnels to a portable file (encrypted by default), or import one."),
+        row![
+            primary_button("Export", Message::OpenExport),
+            secondary_button("Import", Some(Message::OpenImport)),
+        ]
+        .spacing(8),
+    ]
+    .spacing(10);
+    if let Some(status) = &app.backup_status {
+        backup = backup.push(caption(status.clone()));
+    }
+
     let about = column![
         text(format!("sshoal v{VERSION}")).size(13),
         row![
@@ -2053,6 +2346,7 @@ fn prefs_view(app: &App) -> Element<'_, Message> {
     let body = scrollable(
         column![
             pref_section("Updates", updates),
+            pref_section("Backup", backup),
             pref_section("About", about),
         ]
         .spacing(18),
@@ -2966,6 +3260,94 @@ fn rename_view(form: &RenameFolder) -> Element<'_, Message> {
     container(col)
         .padding(16)
         .width(Length::Fixed(300.0))
+        .style(menu_box_style)
+        .into()
+}
+
+/// The export-options popover: encrypt + include-keys toggles, a passphrase field
+/// (when encrypting), then "Save" which opens the native save dialog.
+fn export_view(form: &ExportForm) -> Element<'_, Message> {
+    let toggle_row = |label: &'static str, on: bool, msg: fn(bool) -> Message| {
+        row![
+            text(label).size(13).width(Length::Fill),
+            toggler(on).size(18).on_toggle(msg),
+        ]
+        .align_y(iced::Alignment::Center)
+    };
+    let mut col = column![
+        screen_title("Export tunnels"),
+        caption("Save all tunnels (and the ssh configs they use) to a file."),
+        toggle_row("Encrypt", form.encrypt, Message::ExportToggleEncrypt),
+        toggle_row(
+            "Include private keys",
+            form.include_keys,
+            Message::ExportToggleKeys
+        ),
+    ]
+    .spacing(10);
+    if form.encrypt {
+        col = col.push(
+            text_input("passphrase (min 12 chars)", &form.passphrase)
+                .secure(true)
+                .size(13)
+                .padding([6, 9])
+                .style(rounded_input)
+                .on_input(Message::ExportPassphrase)
+                .on_submit(Message::ExportPick),
+        );
+    } else if form.include_keys {
+        col = col.push(error_text(
+            "Unencrypted + private keys — anyone who gets this file gets your keys.",
+        ));
+    } else {
+        col = col.push(caption(
+            "Unencrypted — the file will contain hostnames and usernames.",
+        ));
+    }
+    if let Some(err) = &form.error {
+        col = col.push(error_text(err.clone()));
+    }
+    col = col.push(
+        row![
+            primary_button("Save", Message::ExportPick),
+            secondary_button("Cancel", Some(Message::BackupCancel)),
+        ]
+        .spacing(10),
+    );
+    container(col)
+        .padding(16)
+        .width(Length::Fixed(320.0))
+        .style(menu_box_style)
+        .into()
+}
+
+/// The passphrase prompt for importing an encrypted file.
+fn import_passphrase_view(form: &ImportForm) -> Element<'_, Message> {
+    let mut col = column![
+        screen_title("Import — passphrase"),
+        caption("This file is encrypted. Enter its passphrase to import."),
+        text_input("passphrase", &form.passphrase)
+            .secure(true)
+            .size(13)
+            .padding([6, 9])
+            .style(rounded_input)
+            .on_input(Message::ImportPassphraseInput)
+            .on_submit(Message::ImportConfirm),
+    ]
+    .spacing(10);
+    if let Some(err) = &form.error {
+        col = col.push(error_text(err.clone()));
+    }
+    col = col.push(
+        row![
+            primary_button("Import", Message::ImportConfirm),
+            secondary_button("Cancel", Some(Message::BackupCancel)),
+        ]
+        .spacing(10),
+    );
+    container(col)
+        .padding(16)
+        .width(Length::Fixed(320.0))
         .style(menu_box_style)
         .into()
 }
