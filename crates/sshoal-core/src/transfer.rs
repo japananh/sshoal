@@ -4,8 +4,9 @@
 //! Plaintext is just the YAML (easy to inspect/diff). With a passphrase the blob
 //! is encrypted with **Argon2id** (key derivation) + **XChaCha20-Poly1305**
 //! (authenticated encryption), both from RustCrypto; we own only the small
-//! versioned envelope around them. Private keys are never in here regardless —
-//! sshoal only stores tunnel topology + ssh-config metadata.
+//! versioned envelope around them. By default the export carries only tunnel
+//! topology + ssh-config metadata (paths, not keys); private-key *contents* are
+//! included only when the caller opts in (the `keys` section).
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};

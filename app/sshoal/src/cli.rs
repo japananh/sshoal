@@ -47,7 +47,7 @@ fn print_usage() {
          \\                                  export tunnels + the ssh configs they use to FILE\n  \
          \\                                  or stdout; self-contained, no settings. ENCRYPTED\n  \
          \\                                  by default (Argon2id); --plaintext to opt out.\n  \
-         \\                                  --include-keys embeds private keys (forces encrypt)\n  \
+         \\                                  --include-keys embeds private keys in the file\n  \
          sshoal import FILE [--overwrite | --skip]   merge tunnels from FILE\n  \
          \\                                  (default --skip: keep current on conflict)\n  \
          sshoal import-ssh TUNNELFILE...    import opentunnels.sh tunnel files\n  \
@@ -169,15 +169,9 @@ fn run_export(args: &[String]) -> i32 {
     // Destination: `--out FILE`, else a positional FILE, else stdout.
     let file = out.or(positional);
 
-    // Embedding private keys (--include-keys) contradicts dropping them
-    // (--strip-identity), and must never land in a plaintext file.
+    // Embedding private keys (--include-keys) contradicts dropping them.
     if include_keys && strip_identity {
         return fail("--include-keys and --strip-identity are mutually exclusive".to_string());
-    }
-    if include_keys && !encrypt {
-        return fail(
-            "refusing to write private keys to an unencrypted file — drop --plaintext".to_string(),
-        );
     }
 
     let config = match AppConfig::load(config_path()) {
@@ -208,13 +202,19 @@ fn run_export(args: &[String]) -> i32 {
         }
         Some(pass)
     } else {
-        // Plaintext export of a self-contained file: it carries hostnames and
-        // usernames (no keys/passwords, but still infra detail). Nudge, the way
-        // password managers warn on plaintext exports.
-        eprintln!(
-            "warning: --plaintext — writing an UNENCRYPTED file with hostnames and usernames. \
-             Drop --plaintext to encrypt it, and don't commit the plaintext to a shared repo."
-        );
+        // Plaintext export. Warn loudly — and louder still if it carries keys,
+        // which is a foot-gun the user explicitly opted into.
+        if include_keys {
+            eprintln!(
+                "warning: --plaintext WITH --include-keys — writing UNENCRYPTED PRIVATE KEYS. \
+                 Anyone who reads this file gets your keys; protect it accordingly."
+            );
+        } else {
+            eprintln!(
+                "warning: --plaintext — writing an UNENCRYPTED file with hostnames and usernames. \
+                 Drop --plaintext to encrypt it, and don't commit the plaintext to a shared repo."
+            );
+        }
         None
     };
     let blob = match export_portable(&portable, passphrase.as_deref()) {

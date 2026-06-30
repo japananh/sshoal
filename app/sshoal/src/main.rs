@@ -1257,9 +1257,6 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::ExportToggleEncrypt(on) => {
             if let Some(Backup::Export(f)) = &mut app.backup {
                 f.encrypt = on;
-                if !on {
-                    f.include_keys = false; // can't embed keys in a plaintext file
-                }
                 f.error = None;
             }
             Task::none()
@@ -1267,9 +1264,6 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::ExportToggleKeys(on) => {
             if let Some(Backup::Export(f)) = &mut app.backup {
                 f.include_keys = on;
-                if on {
-                    f.encrypt = true; // embedding private keys forces encryption
-                }
                 f.error = None;
             }
             Task::none()
@@ -3300,6 +3294,10 @@ fn export_view(form: &ExportForm) -> Element<'_, Message> {
                 .on_input(Message::ExportPassphrase)
                 .on_submit(Message::ExportPick),
         );
+    } else if form.include_keys {
+        col = col.push(error_text(
+            "Unencrypted + private keys — anyone who gets this file gets your keys.",
+        ));
     } else {
         col = col.push(caption(
             "Unencrypted — the file will contain hostnames and usernames.",
