@@ -51,15 +51,30 @@ pub enum ImportError {
 /// machine-specific (`collapsed_folders`, `skipped_version`, `auto_update_enabled`)
 /// and `AppConfig::merge` ignores incoming settings on import anyway.
 ///
-/// A `PortableConfig` YAML is a strict subset of an `AppConfig` YAML (same
-/// top-level `ssh_configs` / `tunnels` keys), so [`import`] parses it straight
-/// into an `AppConfig` with default settings.
+/// A `PortableConfig` YAML is a near-subset of an `AppConfig` YAML (same
+/// top-level `ssh_configs` / `tunnels` keys, plus an optional `keys` section),
+/// so [`import`] parses it straight into an `AppConfig` with default settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortableConfig {
     #[serde(default)]
     pub ssh_configs: Vec<SshConfig>,
     #[serde(default)]
     pub tunnels: Vec<Tunnel>,
+    /// Optionally embedded private-key file contents (one per ssh config), so an
+    /// export can be fully self-contained. Empty unless the user opted in with
+    /// `--include-keys`. Never persisted to the main config — on import these are
+    /// written back out to key files and only the *path* is kept.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keys: Vec<EmbeddedKey>,
+}
+
+/// The contents of one ssh config's `identity_file`, carried inside an export.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbeddedKey {
+    /// The [`SshConfig::name`] this key belongs to.
+    pub config: String,
+    /// The private-key file's contents (PEM / OpenSSH text).
+    pub contents: String,
 }
 
 impl PortableConfig {
@@ -78,6 +93,7 @@ impl PortableConfig {
         Self {
             ssh_configs,
             tunnels,
+            keys: Vec::new(),
         }
     }
 }
@@ -136,8 +152,13 @@ fn seal(yaml: Vec<u8>, passphrase: Option<&str>) -> Result<Vec<u8>, ExportError>
     Ok(out)
 }
 
-/// Parse a blob produced by [`export`], decrypting first if it is encrypted.
-pub fn import(bytes: &[u8], passphrase: Option<&str>) -> Result<AppConfig, ImportError> {
+/// Parse a blob produced by [`export_portable`] / [`export`], decrypting first if
+/// it is encrypted. Returns the full [`PortableConfig`] including any embedded
+/// `keys` (a whole-config export's `settings` are ignored).
+pub fn import_portable(
+    bytes: &[u8],
+    passphrase: Option<&str>,
+) -> Result<PortableConfig, ImportError> {
     let plaintext = if bytes.starts_with(MAGIC) {
         let pass = passphrase.ok_or(ImportError::PassphraseRequired)?;
         open(bytes, pass)?
@@ -146,6 +167,17 @@ pub fn import(bytes: &[u8], passphrase: Option<&str>) -> Result<AppConfig, Impor
     };
     let text = String::from_utf8(plaintext).map_err(|_| ImportError::Decrypt)?;
     Ok(serde_yaml::from_str(&text)?)
+}
+
+/// Like [`import_portable`] but as an [`AppConfig`] (default settings, embedded
+/// `keys` dropped) — convenient when the caller only needs tunnels + ssh configs.
+pub fn import(bytes: &[u8], passphrase: Option<&str>) -> Result<AppConfig, ImportError> {
+    let p = import_portable(bytes, passphrase)?;
+    Ok(AppConfig {
+        ssh_configs: p.ssh_configs,
+        tunnels: p.tunnels,
+        settings: Default::default(),
+    })
 }
 
 /// Derive a 32-byte key from a passphrase with Argon2id.
@@ -303,6 +335,22 @@ mod tests {
         );
         let text = String::from_utf8(export_portable(&portable, None).unwrap()).unwrap();
         assert!(!text.contains("identity_file"));
+    }
+
+    #[test]
+    fn embedded_keys_roundtrip_through_import_portable() {
+        let mut portable = PortableConfig::build(&full(), Some("gc/dev"), false);
+        portable.keys = vec![EmbeddedKey {
+            config: "dev".into(),
+            contents: "-----BEGIN PRIVATE KEY-----\nMOCK\n-----END PRIVATE KEY-----\n".into(),
+        }];
+        // Encrypted (as --include-keys forces), then read back.
+        let blob = export_portable(&portable, Some("a good passphrase")).unwrap();
+        let back = import_portable(&blob, Some("a good passphrase")).unwrap();
+        assert_eq!(back.keys, portable.keys);
+        // The plain `import` view drops embedded keys (never persisted to config).
+        let app = import(&blob, Some("a good passphrase")).unwrap();
+        assert_eq!(app.tunnels, portable.tunnels);
     }
 
     #[test]

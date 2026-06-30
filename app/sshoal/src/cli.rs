@@ -7,8 +7,8 @@ use std::io::Write;
 use std::path::Path;
 
 use sshoal_core::{
-    AppConfig, ImportError, PortableConfig, export_portable, import, parse_ssh_config,
-    parse_tunnel_file, ssh_configs_for,
+    AppConfig, EmbeddedKey, ImportError, PortableConfig, export_portable, import_portable,
+    parse_ssh_config, parse_tunnel_file, ssh_configs_for,
 };
 
 use crate::config_path;
@@ -17,9 +17,9 @@ fn home() -> String {
     std::env::var("HOME").unwrap_or_else(|_| ".".to_string())
 }
 
-/// Minimum passphrase length for `--encrypt`. The KDF (age/scrypt) only buys
-/// time against an offline brute-force of the passphrase — a short one defeats
-/// it — so we refuse obviously weak ones. A few random words easily clears this.
+/// Minimum passphrase length for `--encrypt`. The KDF (Argon2id) only buys time
+/// against an offline brute-force of the passphrase — a short one defeats it —
+/// so we refuse obviously weak ones. A few random words easily clears this.
 const MIN_PASSPHRASE_LEN: usize = 12;
 
 /// If invoked as a CLI subcommand, run it and exit the process. Otherwise return.
@@ -42,10 +42,12 @@ fn print_usage() {
         "sshoal — SSH tunnel manager\n\n\
          Usage:\n  \
          sshoal                      launch the tray app\n  \
-         sshoal export [--out FILE] [--all | --path PREFIX] [--plaintext] [--strip-identity]\n  \
-         \\                                  export tunnels (+ the ssh configs they use) to\n  \
-         \\                                  FILE or stdout; self-contained, no settings/keys.\n  \
-         \\                                  ENCRYPTED by default (age); --plaintext to opt out\n  \
+         sshoal export [--out FILE] [--all | --path PREFIX]\n  \
+         \\              [--plaintext] [--strip-identity | --include-keys]\n  \
+         \\                                  export tunnels + the ssh configs they use to FILE\n  \
+         \\                                  or stdout; self-contained, no settings. ENCRYPTED\n  \
+         \\                                  by default (Argon2id); --plaintext to opt out.\n  \
+         \\                                  --include-keys embeds private keys (forces encrypt)\n  \
          sshoal import FILE [--overwrite | --skip]   merge tunnels from FILE\n  \
          \\                                  (default --skip: keep current on conflict)\n  \
          sshoal import-ssh TUNNELFILE...    import opentunnels.sh tunnel files\n  \
@@ -137,10 +139,11 @@ fn run_import_ssh(args: &[String]) -> i32 {
 
 fn run_export(args: &[String]) -> i32 {
     // Secure by default: the file carries hostnames + usernames (real infra
-    // recon), so it is age-encrypted unless the user explicitly opts out with
+    // recon), so it is encrypted unless the user explicitly opts out with
     // `--plaintext`. `--encrypt` is still accepted (now a no-op) for muscle memory.
     let mut encrypt = true;
     let mut strip_identity = false;
+    let mut include_keys = false;
     let mut all = false;
     let mut prefix: Option<String> = None;
     let mut out: Option<String> = None;
@@ -152,6 +155,7 @@ fn run_export(args: &[String]) -> i32 {
             "--plaintext" => encrypt = false,
             "--encrypt" => encrypt = true,
             "--strip-identity" => strip_identity = true,
+            "--include-keys" => include_keys = true,
             "--all" => all = true,
             "--path" => prefix = it.next().cloned(),
             "--out" => out = it.next().cloned(),
@@ -165,15 +169,32 @@ fn run_export(args: &[String]) -> i32 {
     // Destination: `--out FILE`, else a positional FILE, else stdout.
     let file = out.or(positional);
 
+    // Embedding private keys (--include-keys) contradicts dropping them
+    // (--strip-identity), and must never land in a plaintext file.
+    if include_keys && strip_identity {
+        return fail("--include-keys and --strip-identity are mutually exclusive".to_string());
+    }
+    if include_keys && !encrypt {
+        return fail(
+            "refusing to write private keys to an unencrypted file — drop --plaintext".to_string(),
+        );
+    }
+
     let config = match AppConfig::load(config_path()) {
         Ok(c) => c,
         Err(e) => return fail(format!("loading config: {e}")),
     };
 
-    let portable = PortableConfig::build(&config, selection, strip_identity);
+    let mut portable = PortableConfig::build(&config, selection, strip_identity);
     if portable.tunnels.is_empty() {
         let where_ = prefix.as_deref().unwrap_or("the config");
         eprintln!("warning: no tunnels matched {where_} — exporting an empty file");
+    }
+    // Embed the contents of each referenced config's identity_file, so the export
+    // reconstructs a working setup on another machine. Unreadable keys are skipped
+    // (the path still travels).
+    if include_keys {
+        portable.keys = gather_keys(&portable);
     }
 
     let passphrase = if encrypt {
@@ -206,8 +227,13 @@ fn run_export(args: &[String]) -> i32 {
             if let Err(e) = std::fs::write(&path, &blob) {
                 return fail(format!("writing {path}: {e}"));
             }
+            let keys = if portable.keys.is_empty() {
+                String::new()
+            } else {
+                format!(" + {} key(s)", portable.keys.len())
+            };
             eprintln!(
-                "exported {} tunnel(s) + {} ssh config(s) to {path}{}",
+                "exported {} tunnel(s) + {} ssh config(s){keys} to {path}{}",
                 portable.tunnels.len(),
                 portable.ssh_configs.len(),
                 if encrypt { " (encrypted)" } else { "" }
@@ -237,30 +263,122 @@ fn run_import(args: &[String]) -> i32 {
     };
 
     // Try plaintext first; if the blob is encrypted, ask for a passphrase.
-    let incoming = match import(&bytes, None) {
+    let incoming = match import_portable(&bytes, None) {
         Ok(c) => c,
-        Err(ImportError::PassphraseRequired) => match import(&bytes, Some(&passphrase(false))) {
-            Ok(c) => c,
-            Err(e) => return fail(format!("import: {e}")),
-        },
+        Err(ImportError::PassphraseRequired) => {
+            match import_portable(&bytes, Some(&passphrase(false))) {
+                Ok(c) => c,
+                Err(e) => return fail(format!("import: {e}")),
+            }
+        }
         Err(e) => return fail(format!("import: {e}")),
     };
+
+    // Materialize any embedded private keys to their key files first, so the
+    // imported `identity_file` paths resolve. Writes nothing to the config.
+    let written = materialize_keys(&incoming, overwrite);
 
     let mut current = match AppConfig::load(config_path()) {
         Ok(c) => c,
         Err(e) => return fail(format!("loading config: {e}")),
     };
     let added = incoming.tunnels.len();
-    current.merge(incoming, overwrite);
+    // Only tunnels + ssh configs (paths) reach the config — never key contents.
+    current.merge(
+        AppConfig {
+            ssh_configs: incoming.ssh_configs,
+            tunnels: incoming.tunnels,
+            settings: Default::default(),
+        },
+        overwrite,
+    );
     if let Err(e) = current.save(config_path()) {
         return fail(format!("saving config: {e}"));
     }
+    let keys = if written == 0 {
+        String::new()
+    } else {
+        format!(", wrote {written} key file(s)")
+    };
     eprintln!(
-        "imported {added} tunnel(s) into {} (now {} total)",
+        "imported {added} tunnel(s) into {} (now {} total){keys}",
         config_path().display(),
         current.tunnels.len()
     );
     0
+}
+
+/// Read each referenced config's `identity_file` and embed its contents. An
+/// unreadable / absent key is skipped with a warning (the path still travels).
+fn gather_keys(portable: &PortableConfig) -> Vec<EmbeddedKey> {
+    let mut keys = Vec::new();
+    for c in &portable.ssh_configs {
+        let Some(path) = &c.identity_file else {
+            continue;
+        };
+        match std::fs::read_to_string(expand_tilde(path)) {
+            Ok(contents) => keys.push(EmbeddedKey {
+                config: c.name.clone(),
+                contents,
+            }),
+            Err(e) => eprintln!("warning: skipping key for {}: {path}: {e}", c.name),
+        }
+    }
+    keys
+}
+
+/// Write embedded keys back to their config's `identity_file` path (chmod 600,
+/// creating `~/.ssh` as needed). Skips an existing file unless `overwrite`.
+/// Returns how many key files were written.
+fn materialize_keys(incoming: &PortableConfig, overwrite: bool) -> usize {
+    let mut written = 0;
+    for key in &incoming.keys {
+        let Some(cfg) = incoming.ssh_configs.iter().find(|c| c.name == key.config) else {
+            eprintln!("warning: embedded key for unknown config {}", key.config);
+            continue;
+        };
+        let Some(rel) = &cfg.identity_file else {
+            eprintln!(
+                "warning: config {} has no identity_file path for its key",
+                key.config
+            );
+            continue;
+        };
+        let dest = expand_tilde(rel);
+        if Path::new(&dest).exists() && !overwrite {
+            eprintln!("skip key {dest} (already exists; use --overwrite to replace)");
+            continue;
+        }
+        if let Some(parent) = Path::new(&dest).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(e) = std::fs::write(&dest, &key.contents) {
+            eprintln!("warning: writing key {dest}: {e}");
+            continue;
+        }
+        chmod_600(&dest);
+        written += 1;
+    }
+    written
+}
+
+/// Restrict a key file to owner read/write (ssh refuses world-readable keys).
+fn chmod_600(path: &str) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+/// Expand a leading `~/` to the home directory.
+fn expand_tilde(path: &str) -> String {
+    match path.strip_prefix("~/") {
+        Some(rest) => format!("{}/{rest}", home()),
+        None => path.to_string(),
+    }
 }
 
 /// Passphrase from `$SSHOAL_PASSPHRASE`, else an interactive hidden prompt.
