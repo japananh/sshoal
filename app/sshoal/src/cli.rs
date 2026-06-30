@@ -7,7 +7,8 @@ use std::io::Write;
 use std::path::Path;
 
 use sshoal_core::{
-    AppConfig, ImportError, export, import, parse_ssh_config, parse_tunnel_file, ssh_configs_for,
+    AppConfig, ImportError, PortableConfig, export_portable, import, parse_ssh_config,
+    parse_tunnel_file, ssh_configs_for,
 };
 
 use crate::config_path;
@@ -15,6 +16,11 @@ use crate::config_path;
 fn home() -> String {
     std::env::var("HOME").unwrap_or_else(|_| ".".to_string())
 }
+
+/// Minimum passphrase length for `--encrypt`. The KDF (age/scrypt) only buys
+/// time against an offline brute-force of the passphrase — a short one defeats
+/// it — so we refuse obviously weak ones. A few random words easily clears this.
+const MIN_PASSPHRASE_LEN: usize = 12;
 
 /// If invoked as a CLI subcommand, run it and exit the process. Otherwise return.
 pub fn maybe_run() {
@@ -36,8 +42,12 @@ fn print_usage() {
         "sshoal — SSH tunnel manager\n\n\
          Usage:\n  \
          sshoal                      launch the tray app\n  \
-         sshoal export [FILE] [--encrypt]   write config to FILE (or stdout)\n  \
-         sshoal import FILE [--no-overwrite]  merge config from FILE\n  \
+         sshoal export [--out FILE] [--all | --path PREFIX] [--plaintext] [--strip-identity]\n  \
+         \\                                  export tunnels (+ the ssh configs they use) to\n  \
+         \\                                  FILE or stdout; self-contained, no settings/keys.\n  \
+         \\                                  ENCRYPTED by default (age); --plaintext to opt out\n  \
+         sshoal import FILE [--overwrite | --skip]   merge tunnels from FILE\n  \
+         \\                                  (default --skip: keep current on conflict)\n  \
          sshoal import-ssh TUNNELFILE...    import opentunnels.sh tunnel files\n  \
          \\                                  ([--prefix gc] [--dry-run] [--no-overwrite])\n\n\
          Passphrase is read from $SSHOAL_PASSPHRASE, else prompted."
@@ -126,32 +136,80 @@ fn run_import_ssh(args: &[String]) -> i32 {
 }
 
 fn run_export(args: &[String]) -> i32 {
-    let encrypt = args.iter().any(|a| a == "--encrypt");
-    let file = args.iter().find(|a| !a.starts_with("--"));
+    // Secure by default: the file carries hostnames + usernames (real infra
+    // recon), so it is age-encrypted unless the user explicitly opts out with
+    // `--plaintext`. `--encrypt` is still accepted (now a no-op) for muscle memory.
+    let mut encrypt = true;
+    let mut strip_identity = false;
+    let mut all = false;
+    let mut prefix: Option<String> = None;
+    let mut out: Option<String> = None;
+    let mut positional: Option<String> = None;
+
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--plaintext" => encrypt = false,
+            "--encrypt" => encrypt = true,
+            "--strip-identity" => strip_identity = true,
+            "--all" => all = true,
+            "--path" => prefix = it.next().cloned(),
+            "--out" => out = it.next().cloned(),
+            other if other.starts_with("--") => eprintln!("note: ignoring unknown flag {other}"),
+            other => positional = Some(other.to_string()),
+        }
+    }
+    // `--all` exports everything (the default when no `--path` is given); an
+    // explicit `--path` selects a subtree. `--all` wins if both are passed.
+    let selection = if all { None } else { prefix.as_deref() };
+    // Destination: `--out FILE`, else a positional FILE, else stdout.
+    let file = out.or(positional);
 
     let config = match AppConfig::load(config_path()) {
         Ok(c) => c,
         Err(e) => return fail(format!("loading config: {e}")),
     };
 
+    let portable = PortableConfig::build(&config, selection, strip_identity);
+    if portable.tunnels.is_empty() {
+        let where_ = prefix.as_deref().unwrap_or("the config");
+        eprintln!("warning: no tunnels matched {where_} — exporting an empty file");
+    }
+
     let passphrase = if encrypt {
-        Some(passphrase(true))
+        let pass = passphrase(true);
+        // The file is only as safe as the passphrase — reject obviously weak ones.
+        if pass.chars().count() < MIN_PASSPHRASE_LEN {
+            return fail(format!(
+                "passphrase too short (min {MIN_PASSPHRASE_LEN} chars) — use a longer one, \
+                 e.g. a few random words"
+            ));
+        }
+        Some(pass)
     } else {
+        // Plaintext export of a self-contained file: it carries hostnames and
+        // usernames (no keys/passwords, but still infra detail). Nudge, the way
+        // password managers warn on plaintext exports.
+        eprintln!(
+            "warning: --plaintext — writing an UNENCRYPTED file with hostnames and usernames. \
+             Drop --plaintext to encrypt it, and don't commit the plaintext to a shared repo."
+        );
         None
     };
-    let blob = match export(&config, passphrase.as_deref()) {
+    let blob = match export_portable(&portable, passphrase.as_deref()) {
         Ok(b) => b,
         Err(e) => return fail(format!("export: {e}")),
     };
 
     match file {
         Some(path) => {
-            if let Err(e) = std::fs::write(path, &blob) {
+            if let Err(e) = std::fs::write(&path, &blob) {
                 return fail(format!("writing {path}: {e}"));
             }
             eprintln!(
-                "exported {} tunnel(s) to {path}{}",
-                config.tunnels.len(),
+                "exported {} tunnel(s) + {} ssh config(s) to {path}{}",
+                portable.tunnels.len(),
+                portable.ssh_configs.len(),
                 if encrypt { " (encrypted)" } else { "" }
             );
         }
@@ -165,7 +223,10 @@ fn run_export(args: &[String]) -> i32 {
 }
 
 fn run_import(args: &[String]) -> i32 {
-    let overwrite = !args.iter().any(|a| a == "--no-overwrite");
+    // Default keeps the current entry on a `path`/`name` conflict (skip);
+    // `--overwrite` replaces it. `--skip` and the older `--no-overwrite` are
+    // explicit aliases for the default.
+    let overwrite = args.iter().any(|a| a == "--overwrite");
     let Some(path) = args.iter().find(|a| !a.starts_with("--")) else {
         return fail("import needs a FILE argument".to_string());
     };

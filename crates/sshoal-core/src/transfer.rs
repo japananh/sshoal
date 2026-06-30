@@ -1,22 +1,32 @@
 //! Export/import of the config as a portable blob — the "reuse on another
 //! machine" feature.
 //!
-//! Plaintext by default (it's just the YAML, easy to copy around). With a
-//! passphrase the blob is encrypted with [`age`] (scrypt passphrase recipient),
-//! for when the config carries real production hosts. Private keys are never in
-//! here regardless — sshoal only ever stores tunnel topology.
+//! Plaintext is just the YAML (easy to inspect/diff). With a passphrase the blob
+//! is encrypted with **Argon2id** (key derivation) + **XChaCha20-Poly1305**
+//! (authenticated encryption), both from RustCrypto; we own only the small
+//! versioned envelope around them. Private keys are never in here regardless —
+//! sshoal only stores tunnel topology + ssh-config metadata.
 
-use std::io::{Read, Write};
-use std::iter;
-
-use age::secrecy::SecretString;
+use argon2::{Algorithm, Argon2, Params, Version};
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{AppConfig, SshConfig, Tunnel};
 
-/// age files begin with this header, which lets `import` auto-detect whether a
-/// blob is encrypted.
-const AGE_MAGIC: &[u8] = b"age-encryption.org";
+/// Our encrypted blobs start with these 8 bytes (`c1` = format version 1), so
+/// `import` can tell an encrypted blob from plaintext YAML.
+const MAGIC: &[u8; 8] = b"SSHOALc1";
+const SALT_LEN: usize = 16;
+const NONCE_LEN: usize = 24; // XChaCha20-Poly1305 nonce
+const KEY_LEN: usize = 32;
+/// Header layout: MAGIC(8) | m_cost(4) | t_cost(4) | p_cost(4) | salt(16) | nonce(24).
+const HEADER_LEN: usize = 8 + 4 + 4 + 4 + SALT_LEN + NONCE_LEN;
+/// Argon2id parameters — the OWASP 2026 baseline (m=19 MiB, t=2, p=1). Stored in
+/// the header so a future bump can still decrypt old blobs.
+const M_COST: u32 = 19_456;
+const T_COST: u32 = 2;
+const P_COST: u32 = 1;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExportError {
@@ -24,8 +34,6 @@ pub enum ExportError {
     Serialize(#[from] serde_yaml::Error),
     #[error("encrypting: {0}")]
     Encrypt(String),
-    #[error("io: {0}")]
-    Io(#[from] std::io::Error),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -36,8 +44,6 @@ pub enum ImportError {
     Decrypt,
     #[error("parsing config: {0}")]
     Parse(#[from] serde_yaml::Error),
-    #[error("io: {0}")]
-    Io(#[from] std::io::Error),
 }
 
 /// A self-contained, portable subset of a config: tunnels plus only the
@@ -92,29 +98,49 @@ pub fn export_portable(
     seal(serde_yaml::to_string(portable)?.into_bytes(), passphrase)
 }
 
-/// Pass YAML bytes through unchanged (plaintext) or wrap them with age scrypt
-/// passphrase encryption.
+/// Pass YAML bytes through unchanged (plaintext) or wrap them with Argon2id +
+/// XChaCha20-Poly1305. The header (params + salt + nonce) is bound as the AEAD's
+/// associated data, so tampering with it fails decryption.
 fn seal(yaml: Vec<u8>, passphrase: Option<&str>) -> Result<Vec<u8>, ExportError> {
     let Some(pass) = passphrase else {
         return Ok(yaml);
     };
-    let encryptor = age::Encryptor::with_user_passphrase(SecretString::from(pass.to_owned()));
-    let mut out = Vec::new();
-    let mut writer = encryptor
-        .wrap_output(&mut out)
+
+    let mut salt = [0u8; SALT_LEN];
+    let mut nonce = [0u8; NONCE_LEN];
+    getrandom::getrandom(&mut salt).map_err(|e| ExportError::Encrypt(e.to_string()))?;
+    getrandom::getrandom(&mut nonce).map_err(|e| ExportError::Encrypt(e.to_string()))?;
+
+    let mut header = Vec::with_capacity(HEADER_LEN);
+    header.extend_from_slice(MAGIC);
+    header.extend_from_slice(&M_COST.to_le_bytes());
+    header.extend_from_slice(&T_COST.to_le_bytes());
+    header.extend_from_slice(&P_COST.to_le_bytes());
+    header.extend_from_slice(&salt);
+    header.extend_from_slice(&nonce);
+
+    let key = derive_key(pass, &salt, M_COST, T_COST, P_COST).map_err(ExportError::Encrypt)?;
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
+    let ciphertext = cipher
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: &yaml,
+                aad: &header,
+            },
+        )
         .map_err(|e| ExportError::Encrypt(e.to_string()))?;
-    writer.write_all(&yaml)?;
-    writer
-        .finish()
-        .map_err(|e| ExportError::Encrypt(e.to_string()))?;
+
+    let mut out = header;
+    out.extend_from_slice(&ciphertext);
     Ok(out)
 }
 
 /// Parse a blob produced by [`export`], decrypting first if it is encrypted.
 pub fn import(bytes: &[u8], passphrase: Option<&str>) -> Result<AppConfig, ImportError> {
-    let plaintext = if bytes.starts_with(AGE_MAGIC) {
+    let plaintext = if bytes.starts_with(MAGIC) {
         let pass = passphrase.ok_or(ImportError::PassphraseRequired)?;
-        decrypt(bytes, pass)?
+        open(bytes, pass)?
     } else {
         bytes.to_vec()
     };
@@ -122,15 +148,45 @@ pub fn import(bytes: &[u8], passphrase: Option<&str>) -> Result<AppConfig, Impor
     Ok(serde_yaml::from_str(&text)?)
 }
 
-fn decrypt(bytes: &[u8], passphrase: &str) -> Result<Vec<u8>, ImportError> {
-    let decryptor = age::Decryptor::new(bytes).map_err(|_| ImportError::Decrypt)?;
-    let identity = age::scrypt::Identity::new(SecretString::from(passphrase.to_owned()));
-    let mut reader = decryptor
-        .decrypt(iter::once(&identity as &dyn age::Identity))
-        .map_err(|_| ImportError::Decrypt)?;
-    let mut out = Vec::new();
-    reader.read_to_end(&mut out)?;
-    Ok(out)
+/// Derive a 32-byte key from a passphrase with Argon2id.
+fn derive_key(
+    passphrase: &str,
+    salt: &[u8],
+    m: u32,
+    t: u32,
+    p: u32,
+) -> Result<[u8; KEY_LEN], String> {
+    let params = Params::new(m, t, p, Some(KEY_LEN)).map_err(|e| e.to_string())?;
+    let kdf = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+    let mut key = [0u8; KEY_LEN];
+    kdf.hash_password_into(passphrase.as_bytes(), salt, &mut key)
+        .map_err(|e| e.to_string())?;
+    Ok(key)
+}
+
+/// Decrypt a blob written by [`seal`]: re-derive the key from the header's params
+/// + salt and open the AEAD (verifying the tag over ciphertext + header).
+fn open(bytes: &[u8], passphrase: &str) -> Result<Vec<u8>, ImportError> {
+    if bytes.len() < HEADER_LEN {
+        return Err(ImportError::Decrypt);
+    }
+    let (header, ciphertext) = bytes.split_at(HEADER_LEN);
+    let rd = |o: usize| u32::from_le_bytes(header[o..o + 4].try_into().unwrap());
+    let (m, t, p) = (rd(8), rd(12), rd(16));
+    let salt = &header[20..20 + SALT_LEN];
+    let nonce = &header[20 + SALT_LEN..HEADER_LEN];
+
+    let key = derive_key(passphrase, salt, m, t, p).map_err(|_| ImportError::Decrypt)?;
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
+    cipher
+        .decrypt(
+            XNonce::from_slice(nonce),
+            Payload {
+                msg: ciphertext,
+                aad: header,
+            },
+        )
+        .map_err(|_| ImportError::Decrypt)
 }
 
 #[cfg(test)]
@@ -263,7 +319,7 @@ mod tests {
     fn plaintext_roundtrips() {
         let cfg = sample();
         let blob = export(&cfg, None).expect("export");
-        assert!(!blob.starts_with(AGE_MAGIC));
+        assert!(!blob.starts_with(MAGIC));
         let back = import(&blob, None).expect("import");
         assert_eq!(cfg, back);
     }
@@ -271,9 +327,9 @@ mod tests {
     #[test]
     fn encrypted_roundtrips() {
         let cfg = sample();
-        let blob = export(&cfg, Some("correct horse")).expect("export");
-        assert!(blob.starts_with(AGE_MAGIC), "blob should be age-encrypted");
-        let back = import(&blob, Some("correct horse")).expect("import");
+        let blob = export(&cfg, Some("correct horse battery")).expect("export");
+        assert!(blob.starts_with(MAGIC), "blob should be encrypted");
+        let back = import(&blob, Some("correct horse battery")).expect("import");
         assert_eq!(cfg, back);
     }
 
@@ -286,8 +342,28 @@ mod tests {
 
     #[test]
     fn encrypted_blob_needs_a_passphrase() {
-        let blob = export(&sample(), Some("pw")).expect("export");
+        let blob = export(&sample(), Some("a good passphrase")).expect("export");
         let err = import(&blob, None).unwrap_err();
         assert!(matches!(err, ImportError::PassphraseRequired));
+    }
+
+    #[test]
+    fn tampering_is_detected() {
+        let mut blob = export(&sample(), Some("a good passphrase")).expect("export");
+        // Flip a byte in the ciphertext (after the header) — AEAD must reject it.
+        let last = blob.len() - 1;
+        blob[last] ^= 0x01;
+        assert!(matches!(
+            import(&blob, Some("a good passphrase")).unwrap_err(),
+            ImportError::Decrypt
+        ));
+
+        // Flip a byte in the header (the salt) — bound as AAD, so also rejected.
+        let mut blob = export(&sample(), Some("a good passphrase")).expect("export");
+        blob[24] ^= 0x01; // inside the salt region
+        assert!(matches!(
+            import(&blob, Some("a good passphrase")).unwrap_err(),
+            ImportError::Decrypt
+        ));
     }
 }
