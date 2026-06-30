@@ -1678,7 +1678,7 @@ fn do_export(
     path: &Path,
 ) -> Result<String, String> {
     if include_keys {
-        portable.keys = cli::gather_keys(&portable);
+        cli::embed_keys(&mut portable);
     }
     let blob = export_portable(&portable, passphrase.as_deref()).map_err(|e| e.to_string())?;
     std::fs::write(path, &blob).map_err(|e| format!("writing {}: {e}", path.display()))?;
@@ -1694,7 +1694,7 @@ fn do_export(
 /// entries are untouched), reconcile collapse state, and persist.
 fn apply_import(app: &mut App, mut portable: PortableConfig) -> Task<Message> {
     let wrote = cli::materialize_keys(&mut portable, false);
-    for c in portable.ssh_configs {
+    for c in portable.ssh_configs_plain() {
         if !app.ssh_configs.iter().any(|x| x.name == c.name) {
             app.ssh_configs.push(c);
         }

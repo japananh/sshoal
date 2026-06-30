@@ -54,61 +54,110 @@ pub enum ImportError {
     Parse(#[from] serde_yaml::Error),
 }
 
-/// A self-contained, portable subset of a config: tunnels plus only the
-/// [`SshConfig`]s they reference. `settings` are deliberately excluded — they're
+fn default_port() -> u16 {
+    22
+}
+
+/// A self-contained, portable subset of a config: tunnels plus only the ssh
+/// configs they reference. `settings` are deliberately excluded — they're
 /// machine-specific (`collapsed_folders`, `skipped_version`, `auto_update_enabled`)
 /// and `AppConfig::merge` ignores incoming settings on import anyway.
 ///
-/// A `PortableConfig` YAML is a near-subset of an `AppConfig` YAML (same
-/// top-level `ssh_configs` / `tunnels` keys, plus an optional `keys` section),
-/// so [`import`] parses it straight into an `AppConfig` with default settings.
+/// This is a **distinct type** from [`AppConfig`] on purpose: embedded private
+/// keys live under [`PortableSsh::identity_files`], and the plain [`SshConfig`]
+/// has no key field — so importing into the main config structurally can never
+/// carry key material onto disk.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortableConfig {
     #[serde(default)]
-    pub ssh_configs: Vec<SshConfig>,
+    pub ssh_configs: Vec<PortableSsh>,
     #[serde(default)]
     pub tunnels: Vec<Tunnel>,
-    /// Optionally embedded private-key file contents (one per ssh config), so an
-    /// export can be fully self-contained. Empty unless the user opted in with
-    /// `--include-keys`. Never persisted to the main config — on import these are
-    /// written back out to key files and only the *path* is kept.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub keys: Vec<EmbeddedKey>,
 }
 
-/// The contents of one ssh config's `identity_file`, carried inside an export.
+/// An ssh config inside an export: the same fields as [`SshConfig`], plus
+/// optional embedded key material (`identity_files`, empty unless the user opted
+/// into `--include-keys`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EmbeddedKey {
-    /// The [`SshConfig::name`] this key belongs to.
-    pub config: String,
-    /// The private-key file's contents (PEM / OpenSSH text).
-    pub contents: String,
-    /// The matching public key (`<identity_file>.pub`), if it existed alongside
-    /// the private one. Public material (not sensitive), kept only as a
-    /// convenience — re-authorizing the key on a server / sharing it. The client
-    /// never needs it to connect (ssh derives it from the private key).
+pub struct PortableSsh {
+    pub name: String,
+    pub host: String,
+    #[serde(default = "default_port")]
+    pub port: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub public: Option<String>,
+    pub user: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_file: Option<String>,
+    /// Embedded private keys for this config (export-only). Usually one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub identity_files: Vec<IdentityKey>,
+}
+
+/// One embedded private key: where it lived and its contents. The public key is
+/// intentionally not stored — it's always derivable from the private key
+/// (`ssh-keygen -y -f <key>`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdentityKey {
+    /// Original path the key lived at, e.g. `~/.ssh/es-admin.pem`. Drives where
+    /// import restores it (in place when safe, else the managed keys dir).
+    pub location: String,
+    /// The private-key file's contents (PEM / OpenSSH text).
+    pub content: String,
+}
+
+impl PortableSsh {
+    /// The plain [`SshConfig`] (no key material) — what reaches the main config.
+    pub fn to_ssh_config(&self) -> SshConfig {
+        SshConfig {
+            name: self.name.clone(),
+            host: self.host.clone(),
+            port: self.port,
+            user: self.user.clone(),
+            identity_file: self.identity_file.clone(),
+        }
+    }
+
+    fn from_ssh_config(c: SshConfig) -> Self {
+        Self {
+            name: c.name,
+            host: c.host,
+            port: c.port,
+            user: c.user,
+            identity_file: c.identity_file,
+            identity_files: Vec::new(),
+        }
+    }
 }
 
 impl PortableConfig {
     /// Build a self-contained subset of `config`: the tunnels selected by
     /// `prefix` (see [`AppConfig::select_tunnels`]) plus the ssh configs they
-    /// reference. With `strip_identity`, `identity_file` paths are dropped (they
-    /// can be machine-specific); no key material is ever included regardless.
+    /// reference. With `strip_identity`, `identity_file` paths are dropped. No key
+    /// material is embedded here — callers add it via `identity_files`.
     pub fn build(config: &AppConfig, prefix: Option<&str>, strip_identity: bool) -> Self {
         let tunnels = config.select_tunnels(prefix);
-        let mut ssh_configs = config.referenced_ssh_configs(&tunnels);
-        if strip_identity {
-            for c in &mut ssh_configs {
-                c.identity_file = None;
-            }
-        }
+        let ssh_configs = config
+            .referenced_ssh_configs(&tunnels)
+            .into_iter()
+            .map(|mut c| {
+                if strip_identity {
+                    c.identity_file = None;
+                }
+                PortableSsh::from_ssh_config(c)
+            })
+            .collect();
         Self {
             ssh_configs,
             tunnels,
-            keys: Vec::new(),
         }
+    }
+
+    /// The ssh configs as plain [`SshConfig`]s, with all key material dropped.
+    pub fn ssh_configs_plain(&self) -> Vec<SshConfig> {
+        self.ssh_configs
+            .iter()
+            .map(PortableSsh::to_ssh_config)
+            .collect()
     }
 }
 
@@ -184,11 +233,12 @@ pub fn import_portable(
 }
 
 /// Like [`import_portable`] but as an [`AppConfig`] (default settings, embedded
-/// `keys` dropped) — convenient when the caller only needs tunnels + ssh configs.
+/// key material dropped) — convenient when the caller only needs tunnels + ssh
+/// configs.
 pub fn import(bytes: &[u8], passphrase: Option<&str>) -> Result<AppConfig, ImportError> {
     let p = import_portable(bytes, passphrase)?;
     Ok(AppConfig {
-        ssh_configs: p.ssh_configs,
+        ssh_configs: p.ssh_configs_plain(),
         tunnels: p.tunnels,
         settings: Default::default(),
     })
@@ -362,18 +412,24 @@ mod tests {
     #[test]
     fn embedded_keys_roundtrip_through_import_portable() {
         let mut portable = PortableConfig::build(&full(), Some("gc/dev"), false);
-        portable.keys = vec![EmbeddedKey {
-            config: "dev".into(),
-            contents: "-----BEGIN PRIVATE KEY-----\nMOCK\n-----END PRIVATE KEY-----\n".into(),
-            public: Some("ssh-ed25519 AAAAMOCK mock@host\n".into()),
+        // Attach a private key to the "dev" config.
+        portable
+            .ssh_configs
+            .iter_mut()
+            .find(|c| c.name == "dev")
+            .unwrap()
+            .identity_files = vec![IdentityKey {
+            location: "~/.ssh/dev.pem".into(),
+            content:
+                "-----BEGIN OPENSSH PRIVATE KEY-----\nMOCK\n-----END OPENSSH PRIVATE KEY-----\n"
+                    .into(),
         }];
-        // Encrypted (as --include-keys forces), then read back.
         let blob = export_portable(&portable, Some("a good passphrase")).unwrap();
         let back = import_portable(&blob, Some("a good passphrase")).unwrap();
-        assert_eq!(back.keys, portable.keys);
-        // The plain `import` view drops embedded keys (never persisted to config).
+        assert_eq!(back, portable); // everything, including embedded keys, round-trips
+        // The plain `import` view is key-free (SshConfig has no key field at all).
         let app = import(&blob, Some("a good passphrase")).unwrap();
-        assert_eq!(app.tunnels, portable.tunnels);
+        assert_eq!(app.ssh_configs, portable.ssh_configs_plain());
     }
 
     #[test]

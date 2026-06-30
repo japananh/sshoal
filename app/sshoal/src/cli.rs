@@ -7,7 +7,7 @@ use std::io::Write;
 use std::path::Path;
 
 use sshoal_core::{
-    AppConfig, EmbeddedKey, ImportError, PortableConfig, export_portable, import_portable,
+    AppConfig, IdentityKey, ImportError, PortableConfig, export_portable, import_portable,
     parse_ssh_config, parse_tunnel_file, ssh_configs_for,
 };
 
@@ -188,7 +188,7 @@ fn run_export(args: &[String]) -> i32 {
     // reconstructs a working setup on another machine. Unreadable keys are skipped
     // (the path still travels).
     if include_keys {
-        portable.keys = gather_keys(&portable);
+        embed_keys(&mut portable);
     }
 
     let passphrase = if encrypt {
@@ -227,10 +227,15 @@ fn run_export(args: &[String]) -> i32 {
             if let Err(e) = std::fs::write(&path, &blob) {
                 return fail(format!("writing {path}: {e}"));
             }
-            let keys = if portable.keys.is_empty() {
+            let n_keys: usize = portable
+                .ssh_configs
+                .iter()
+                .map(|c| c.identity_files.len())
+                .sum();
+            let keys = if n_keys == 0 {
                 String::new()
             } else {
-                format!(" + {} key(s)", portable.keys.len())
+                format!(" + {n_keys} key(s)")
             };
             eprintln!(
                 "exported {} tunnel(s) + {} ssh config(s){keys} to {path}{}",
@@ -274,8 +279,8 @@ fn run_import(args: &[String]) -> i32 {
         Err(e) => return fail(format!("import: {e}")),
     };
 
-    // Materialize any embedded private keys into sshoal's own keys dir and
-    // repoint each config's identity_file there. Writes nothing to the config.
+    // Materialize any embedded private keys (to their original path when safe,
+    // else the managed keys dir), repointing identity_file on fallback.
     let mut incoming = incoming;
     let written = materialize_keys(&mut incoming, overwrite);
 
@@ -284,10 +289,11 @@ fn run_import(args: &[String]) -> i32 {
         Err(e) => return fail(format!("loading config: {e}")),
     };
     let added = incoming.tunnels.len();
-    // Only tunnels + ssh configs (paths) reach the config — never key contents.
+    // Only tunnels + ssh configs (paths) reach the config — `ssh_configs_plain`
+    // drops every embedded key, so contents can never land in servers.yaml.
     current.merge(
         AppConfig {
-            ssh_configs: incoming.ssh_configs,
+            ssh_configs: incoming.ssh_configs_plain(),
             tunnels: incoming.tunnels,
             settings: Default::default(),
         },
@@ -309,94 +315,73 @@ fn run_import(args: &[String]) -> i32 {
     0
 }
 
-/// Read each referenced config's `identity_file` and embed its contents, plus the
-/// matching `<identity_file>.pub` if it sits alongside (a convenience — the public
-/// key isn't needed to connect). An unreadable / absent private key is skipped
-/// with a warning (the path still travels).
-pub(crate) fn gather_keys(portable: &PortableConfig) -> Vec<EmbeddedKey> {
-    let mut keys = Vec::new();
-    for c in &portable.ssh_configs {
-        let Some(path) = &c.identity_file else {
+/// Embed each referenced config's private key (the contents of its
+/// `identity_file`) into that config's `identity_files`. An unreadable / absent
+/// key is skipped with a warning (the path still travels). The public key isn't
+/// stored — it's always derivable from the private key.
+pub(crate) fn embed_keys(portable: &mut PortableConfig) {
+    for c in &mut portable.ssh_configs {
+        let Some(path) = c.identity_file.clone() else {
             continue;
         };
-        let expanded = expand_tilde(path);
-        match std::fs::read_to_string(&expanded) {
-            Ok(contents) => keys.push(EmbeddedKey {
-                config: c.name.clone(),
-                contents,
-                public: std::fs::read_to_string(format!("{expanded}.pub")).ok(),
+        match std::fs::read_to_string(expand_tilde(&path)) {
+            Ok(content) => c.identity_files.push(IdentityKey {
+                location: path,
+                content,
             }),
             Err(e) => eprintln!("warning: skipping key for {}: {path}: {e}", c.name),
         }
     }
-    keys
 }
 
-/// Write embedded keys back to their config's original `identity_file` path when
-/// that path is safe (see [`safe_key_dest`]), so a self-export restores keys to
-/// `~/.ssh/…` as-is. Unsafe paths fall back to sshoal's own keys dir
+/// Write each config's embedded keys back to their original `location` when that
+/// path is safe (see [`safe_key_dest`]), so a self-export restores keys to
+/// `~/.ssh/…` as-is. Unsafe locations fall back to sshoal's own keys dir
 /// (`~/.config/sshoal/keys/<config>`) with `identity_file` repointed there.
-/// Private keys get chmod 600; a matching `.pub` is written alongside. Skips an
-/// existing file unless `overwrite`. Returns how many key files were written.
+/// Private keys get chmod 600. Skips an existing file unless `overwrite`.
+/// Returns how many key files were written.
 ///
-/// Security: we never blindly honour the path from an imported file — a hostile
-/// export could otherwise target `~/.ssh/authorized_keys`, `~/.ssh/config`,
+/// Security: we never blindly honour the location from an imported file — a
+/// hostile export could otherwise target `~/.ssh/authorized_keys`, `~/.ssh/config`,
 /// `~/.config/autostart/…`, a `..` traversal, or an absolute system path. Only
-/// non-control files directly under `~/.ssh/` are restored in place.
+/// non-control files under `~/.ssh/` are restored in place.
 pub(crate) fn materialize_keys(incoming: &mut PortableConfig, overwrite: bool) -> usize {
     let mut written = 0;
-    for key in &incoming.keys {
-        let original = incoming
-            .ssh_configs
-            .iter()
-            .find(|c| c.name == key.config)
-            .and_then(|c| c.identity_file.clone());
-
-        // Restore to the original path if it's safe; otherwise our own keys dir.
-        let (dest, repoint) = match &original {
-            Some(p) if safe_key_dest(&expand_tilde(p)) => (expand_tilde(p), None),
-            _ => {
-                let rel = format!("~/.config/sshoal/keys/{}", sanitize_key_name(&key.config));
-                if original.is_some() {
-                    eprintln!(
-                        "note: key path for {} isn't safe to restore in place; writing to {rel}",
-                        key.config
-                    );
-                }
-                (expand_tilde(&rel), Some(rel))
-            }
-        };
-
-        if Path::new(&dest).exists() && !overwrite {
-            eprintln!("skip key {dest} (already exists; use --overwrite to replace)");
-        } else {
-            if let Some(parent) = Path::new(&dest).parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            if let Err(e) = std::fs::write(&dest, &key.contents) {
-                eprintln!("warning: writing key {dest}: {e}");
-                continue;
-            }
-            chmod_600(&dest);
-            // Drop the public key next to it (public material, perms don't matter).
-            if let Some(pubkey) = &key.public {
-                let _ = std::fs::write(format!("{dest}.pub"), pubkey);
-            }
-            written += 1;
-        }
-
-        // Only repoint identity_file when we fell back to the managed dir; an
-        // in-place restore keeps the original path.
-        if let Some(rel) = repoint {
-            if let Some(cfg) = incoming
-                .ssh_configs
-                .iter_mut()
-                .find(|c| c.name == key.config)
-            {
-                cfg.identity_file = Some(rel);
+    for c in &mut incoming.ssh_configs {
+        let mut repoint: Option<String> = None;
+        for key in &c.identity_files {
+            // Restore to the key's original location if safe; else our keys dir.
+            let (dest, fallback) = if safe_key_dest(&expand_tilde(&key.location)) {
+                (expand_tilde(&key.location), None)
             } else {
-                eprintln!("warning: embedded key for unknown config {}", key.config);
+                let rel = format!("~/.config/sshoal/keys/{}", sanitize_key_name(&c.name));
+                eprintln!(
+                    "note: key path {} isn't safe to restore in place; writing to {rel}",
+                    key.location
+                );
+                (expand_tilde(&rel), Some(rel))
+            };
+
+            if Path::new(&dest).exists() && !overwrite {
+                eprintln!("skip key {dest} (already exists; use --overwrite to replace)");
+            } else {
+                if let Some(parent) = Path::new(&dest).parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if let Err(e) = std::fs::write(&dest, &key.content) {
+                    eprintln!("warning: writing key {dest}: {e}");
+                    continue;
+                }
+                chmod_600(&dest);
+                written += 1;
             }
+            if let Some(rel) = fallback {
+                repoint = Some(rel);
+            }
+        }
+        // Repoint identity_file only when a key fell back to the managed dir.
+        if let Some(rel) = repoint {
+            c.identity_file = Some(rel);
         }
     }
     written
