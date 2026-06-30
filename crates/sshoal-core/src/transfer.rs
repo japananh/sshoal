@@ -27,6 +27,13 @@ const HEADER_LEN: usize = 8 + 4 + 4 + 4 + SALT_LEN + NONCE_LEN;
 const M_COST: u32 = 19_456;
 const T_COST: u32 = 2;
 const P_COST: u32 = 1;
+/// Upper bounds on the *untrusted* header params we'll honour on decrypt. argon2
+/// itself allows absurd values (m up to ~256 GiB), so a hostile blob could OOM
+/// us before the AEAD tag is ever checked — reject out-of-range params first.
+/// 1 GiB / t=16 / p=16 sits far above any sane setting but well below a crash.
+const MAX_M_COST: u32 = 1_048_576; // KiB = 1 GiB
+const MAX_T_COST: u32 = 16;
+const MAX_P_COST: u32 = 16;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExportError {
@@ -208,6 +215,14 @@ fn open(bytes: &[u8], passphrase: &str) -> Result<Vec<u8>, ImportError> {
     let salt = &header[20..20 + SALT_LEN];
     let nonce = &header[20 + SALT_LEN..HEADER_LEN];
 
+    // These params come from an untrusted file and drive memory allocation in
+    // the KDF, so bound them before deriving — a hostile blob must not OOM us.
+    if !(1..=MAX_M_COST).contains(&m)
+        || !(1..=MAX_T_COST).contains(&t)
+        || !(1..=MAX_P_COST).contains(&p)
+    {
+        return Err(ImportError::Decrypt);
+    }
     let key = derive_key(passphrase, salt, m, t, p).map_err(|_| ImportError::Decrypt)?;
     let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
     cipher
@@ -393,6 +408,18 @@ mod tests {
         let blob = export(&sample(), Some("a good passphrase")).expect("export");
         let err = import(&blob, None).unwrap_err();
         assert!(matches!(err, ImportError::PassphraseRequired));
+    }
+
+    #[test]
+    fn absurd_argon2_params_are_rejected_before_allocating() {
+        let mut blob = export(&sample(), Some("a good passphrase")).expect("export");
+        // Forge m_cost (header offset 8..12) to ~1 TB of KiB — must be rejected by
+        // the clamp, not handed to the KDF to allocate.
+        blob[8..12].copy_from_slice(&1_000_000_000u32.to_le_bytes());
+        assert!(matches!(
+            import(&blob, Some("a good passphrase")).unwrap_err(),
+            ImportError::Decrypt
+        ));
     }
 
     #[test]

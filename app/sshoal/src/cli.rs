@@ -274,9 +274,10 @@ fn run_import(args: &[String]) -> i32 {
         Err(e) => return fail(format!("import: {e}")),
     };
 
-    // Materialize any embedded private keys to their key files first, so the
-    // imported `identity_file` paths resolve. Writes nothing to the config.
-    let written = materialize_keys(&incoming, overwrite);
+    // Materialize any embedded private keys into sshoal's own keys dir and
+    // repoint each config's identity_file there. Writes nothing to the config.
+    let mut incoming = incoming;
+    let written = materialize_keys(&mut incoming, overwrite);
 
     let mut current = match AppConfig::load(config_path()) {
         Ok(c) => c,
@@ -327,39 +328,60 @@ fn gather_keys(portable: &PortableConfig) -> Vec<EmbeddedKey> {
     keys
 }
 
-/// Write embedded keys back to their config's `identity_file` path (chmod 600,
-/// creating `~/.ssh` as needed). Skips an existing file unless `overwrite`.
-/// Returns how many key files were written.
-fn materialize_keys(incoming: &PortableConfig, overwrite: bool) -> usize {
+/// Write embedded keys into sshoal's own keys dir (`~/.config/sshoal/keys/`,
+/// chmod 600) and repoint each matching config's `identity_file` there. Skips an
+/// existing file unless `overwrite`. Returns how many key files were written.
+///
+/// Security: the destination is derived from a *sanitized* config name, NEVER
+/// from the path inside the imported file — a hostile export could otherwise set
+/// `identity_file` to `~/.ssh/authorized_keys`, `~/.ssh/config`, a `..` traversal
+/// or an absolute path and have us write attacker-controlled bytes there.
+fn materialize_keys(incoming: &mut PortableConfig, overwrite: bool) -> usize {
     let mut written = 0;
     for key in &incoming.keys {
-        let Some(cfg) = incoming.ssh_configs.iter().find(|c| c.name == key.config) else {
-            eprintln!("warning: embedded key for unknown config {}", key.config);
-            continue;
-        };
-        let Some(rel) = &cfg.identity_file else {
-            eprintln!(
-                "warning: config {} has no identity_file path for its key",
-                key.config
-            );
-            continue;
-        };
-        let dest = expand_tilde(rel);
+        let rel = format!("~/.config/sshoal/keys/{}", sanitize_key_name(&key.config));
+        let dest = expand_tilde(&rel);
         if Path::new(&dest).exists() && !overwrite {
             eprintln!("skip key {dest} (already exists; use --overwrite to replace)");
-            continue;
+        } else {
+            if let Some(parent) = Path::new(&dest).parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Err(e) = std::fs::write(&dest, &key.contents) {
+                eprintln!("warning: writing key {dest}: {e}");
+                continue;
+            }
+            chmod_600(&dest);
+            written += 1;
         }
-        if let Some(parent) = Path::new(&dest).parent() {
-            let _ = std::fs::create_dir_all(parent);
+        // Point the config at the managed key (whether just written or pre-existing).
+        if let Some(cfg) = incoming
+            .ssh_configs
+            .iter_mut()
+            .find(|c| c.name == key.config)
+        {
+            cfg.identity_file = Some(rel);
+        } else {
+            eprintln!("warning: embedded key for unknown config {}", key.config);
         }
-        if let Err(e) = std::fs::write(&dest, &key.contents) {
-            eprintln!("warning: writing key {dest}: {e}");
-            continue;
-        }
-        chmod_600(&dest);
-        written += 1;
     }
     written
+}
+
+/// A safe filename for a managed key: only `[A-Za-z0-9_-]`, so it can never be
+/// `/`, `.`, `..` or otherwise escape the keys dir.
+fn sanitize_key_name(name: &str) -> String {
+    let s: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if s.is_empty() { "key".to_string() } else { s }
 }
 
 /// Restrict a key file to owner read/write (ssh refuses world-readable keys).
