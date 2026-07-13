@@ -24,13 +24,13 @@ macOS (Tahoe+) · Ubuntu (22.04+)
 
 ## Install
 
-**macOS** — one line (downloads the latest [release](https://github.com/japananh/sshoal/releases) `.dmg`, installs to /Applications, clears Gatekeeper):
+**macOS** — one line (downloads the latest [release](https://github.com/japananh/sshoal/releases) `.dmg`, installs to /Applications, clears Gatekeeper, and links the `sshoal` command onto your PATH):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/japananh/sshoal/main/packaging/macos/install.sh | bash
 ```
 
-Or grab the `.dmg` from [Releases](https://github.com/japananh/sshoal/releases) and drag **sshoal.app** to Applications. Not notarized yet → on first launch right-click → **Open**.
+Or grab the `.dmg` from [Releases](https://github.com/japananh/sshoal/releases) and drag **sshoal.app** to Applications. Not notarized yet → on first launch right-click → **Open**. A manual drag skips the CLI link; add it with `ln -sf /Applications/sshoal.app/Contents/MacOS/sshoal /usr/local/bin/sshoal`.
 
 **Linux** (x86_64) — drops the `sshoal` binary into `~/.local/bin`:
 
@@ -54,7 +54,7 @@ Building on Ubuntu also needs the `-dev` packages: `libgtk-3-dev libayatana-appi
 
 - **Tray icon** — left-click toggles the window, right-click opens the menu; **⌃⌘S** summons it anywhere. Closing only hides; tunnels keep running.
 - **A row** — the toggle connects/disconnects, the terminal icon opens a shell. Click to select; ⌘/Shift-click (or ↑/↓, Shift+↑/↓) to select more; right-click for actions; **Enter** to edit.
-- **Config** lives in `~/.config/sshoal/servers.yaml`. Bring in what you have with `sshoal import-ssh --prefix gc FILE…`; move machines with `sshoal export [--encrypt]` / `sshoal import`.
+- **Config** lives in `~/.config/sshoal/servers.yaml`. Bring in what you have with `sshoal import-ssh --prefix gc FILE…`; back up or move a machine with `sshoal export` / `sshoal import` — or **Preferences → Backup** in the app. Exports are encrypted by default (`--plaintext` to skip); `--include-keys` also bundles the referenced private keys and restores them on import.
 
 ## How it works
 

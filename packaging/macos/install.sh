@@ -4,8 +4,8 @@
 #   curl -fsSL https://raw.githubusercontent.com/japananh/sshoal/main/packaging/macos/install.sh | bash
 #
 # Downloads the newest release .dmg (including pre-releases), copies sshoal.app
-# to /Applications, and clears the Gatekeeper quarantine flag (the app isn't
-# notarized yet).
+# to /Applications, clears the Gatekeeper quarantine flag (the app isn't
+# notarized yet), and links the `sshoal` CLI onto your PATH.
 set -eu
 
 REPO="japananh/sshoal"
@@ -36,4 +36,24 @@ cp -R "$MNT/sshoal.app" /Applications/
 hdiutil detach "$MNT" -quiet
 xattr -dr com.apple.quarantine /Applications/sshoal.app 2>/dev/null || true
 
-echo "==> done. Launch from Spotlight, or:  open -a sshoal"
+# Link the CLI onto the PATH so `sshoal export` / `import` work in a terminal —
+# the same binary is both the tray app and the CLI. Prefer a dir we can write
+# without sudo; fall back to /usr/local/bin (on the default PATH) with sudo.
+echo "==> linking the sshoal CLI onto your PATH"
+BIN=/Applications/sshoal.app/Contents/MacOS/sshoal
+LINK=""
+for d in /opt/homebrew/bin /usr/local/bin; do
+    if [ -d "$d" ] && [ -w "$d" ]; then
+        ln -sf "$BIN" "$d/sshoal" && LINK="$d/sshoal" && break
+    fi
+done
+if [ -z "$LINK" ] && sudo mkdir -p /usr/local/bin && sudo ln -sf "$BIN" /usr/local/bin/sshoal; then
+    LINK=/usr/local/bin/sshoal
+fi
+if [ -n "$LINK" ]; then
+    echo "    linked $LINK"
+else
+    echo "    (couldn't link automatically — run: sudo ln -sf '$BIN' /usr/local/bin/sshoal)"
+fi
+
+echo "==> done. Launch from Spotlight or 'open -a sshoal'; CLI: 'sshoal help'"
