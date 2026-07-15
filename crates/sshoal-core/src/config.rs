@@ -361,6 +361,84 @@ mod tests {
     }
 
     #[test]
+    fn select_tunnels_matches_on_segment_boundaries() {
+        // A tree with siblings that share a textual prefix but *not* a path
+        // segment, so a naive `starts_with(prefix)` would over-select.
+        let paths = [
+            "gc",         // exact leaf sitting at the prefix
+            "gc/prod",    // child segment
+            "gc/staging", // child segment
+            "gcloud/db",  // shares the text "gc" but a different first segment
+            "gcp-thing",  // ditto — no segment boundary after "gc"
+            "other/gc",   // "gc" appears deeper, not at the root
+        ];
+        let cfg = AppConfig {
+            ssh_configs: vec![],
+            tunnels: paths
+                .iter()
+                .enumerate()
+                .map(|(i, p)| Tunnel {
+                    path: (*p).into(),
+                    ssh: "a".into(),
+                    local_port: i as u16,
+                    remote_host: "h".into(),
+                    remote_port: 0,
+                })
+                .collect(),
+            settings: Settings::default(),
+        };
+
+        // Selected paths, sorted for a stable comparison.
+        let selected = |prefix: Option<&str>| -> Vec<String> {
+            let mut v: Vec<String> = cfg
+                .select_tunnels(prefix)
+                .into_iter()
+                .map(|t| t.path)
+                .collect();
+            v.sort();
+            v
+        };
+
+        // (prefix, expected selected paths).
+        let cases: &[(Option<&str>, &[&str])] = &[
+            // exact segment match + child segments; no false positives.
+            (Some("gc"), &["gc", "gc/prod", "gc/staging"]),
+            // a deeper exact segment selects just itself here.
+            (Some("gc/prod"), &["gc/prod"]),
+            // false-positive guard: "gcloud"/"gcp-thing" never match "gc".
+            (Some("gcloud"), &["gcloud/db"]),
+            // `None` selects everything.
+            (
+                None,
+                &[
+                    "gc",
+                    "gc/prod",
+                    "gc/staging",
+                    "gcloud/db",
+                    "gcp-thing",
+                    "other/gc",
+                ],
+            ),
+            // a prefix that matches nothing.
+            (Some("nope"), &[]),
+            // empty prefix `Some("")` — documents current behavior: it matches
+            // nothing (the child glob becomes "/", and no ordinary path equals
+            // "" or starts with "/"). Use `None`, not `Some("")`, for "all".
+            (Some(""), &[]),
+        ];
+
+        for (prefix, expected) in cases {
+            let mut want: Vec<String> = expected.iter().map(|s| (*s).to_string()).collect();
+            want.sort();
+            assert_eq!(
+                selected(*prefix),
+                want,
+                "prefix {prefix:?} selected the wrong tunnels"
+            );
+        }
+    }
+
+    #[test]
     fn referenced_ssh_configs_gathers_only_used_and_skips_missing() {
         let cfg = AppConfig {
             ssh_configs: vec![SshConfig::alias("used"), SshConfig::alias("unused")],
