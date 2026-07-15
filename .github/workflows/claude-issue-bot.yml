@@ -69,35 +69,41 @@ jobs:
                repo — don't guess), and a short root-cause hypothesis. Apply
                labels that clearly fit.
 
-            2. DECIDE whether to auto-fix. This app's GUI COMPILES on this Linux
-               runner, but compiling is NOT the same as working — a tray, popover,
-               or layout fix can pass `cargo build`/`clippy`/`test` and still be
-               visually broken. So auto-fix + merge ONLY when the fix's correctness
-               is fully provable here with `cargo` — i.e. it lives in core logic,
-               config, the transfer/crypto code, or the CLI, and is covered by (or
-               you can add) a headless test or a compile/clippy check. If the fix's
-               correctness depends on GUI / tray / visual / interaction behavior
-               that CANNOT be exercised headlessly, or the issue is ambiguous, a
-               question, or needs a product/design decision → post your proposed
-               fix and clarifying questions in the comment and STOP. Do NOT merge
-               anything you cannot verify on the runner.
+            2. DECIDE how to land it — but ALWAYS aim to IMPLEMENT and open a PR.
+               Only STOP-and-ask (post questions, no PR) if the issue is genuinely
+               too underspecified to make a reasonable attempt. What changes is only
+               whether you MERGE:
+               - AUTO-MERGE only when the fix's correctness is fully provable here
+                 with `cargo` — it lives in core logic, config, the transfer/crypto
+                 code, or the CLI, and is covered by (or you add) a headless test /
+                 compile / clippy check.
+               - This app's GUI COMPILES on this Linux runner, but compiling is NOT
+                 the same as working — a tray/popover/layout fix can pass
+                 `cargo build`/`clippy`/`test` and still be visually broken. So if the
+                 fix's correctness depends on GUI / tray / visual / interaction
+                 behaviour that CANNOT be exercised headlessly, still implement it and
+                 open the PR, but do NOT merge — leave it for the maintainer to eyeball
+                 on a real macOS/Linux desktop. Never merge what you cannot verify here.
 
-            3. IF FIXING — create branch claude/issue-${{ github.event.issue.number }},
-               make the MINIMAL change, add/adjust tests, and run these three until
-               ALL pass (they are the repo's CI gates):
+            3. IMPLEMENT — create branch claude/issue-${{ github.event.issue.number }},
+               make the MINIMAL change (pick sensible defaults for any small product
+               choice and note them in the PR body), add/adjust tests, and run these
+               three until ALL pass (the repo's CI gates):
                  cargo fmt --all --check
                  cargo clippy --workspace --all-targets -- -D warnings
                  cargo test --workspace
-               Only if all three pass: push the branch and open a NORMAL
-               (non-draft) PR:
+               Only if all three pass, push the branch and open a NORMAL (non-draft) PR:
                  gh pr create --base main --head claude/issue-${{ github.event.issue.number }} --title "..." --body "Closes #${{ github.event.issue.number }} ..."
-               then squash-merge it and delete the branch:
+               Then land it per step 2:
+               - Fully verifiable here → squash-merge and delete the branch:
                  gh pr merge <pr-number> --squash --delete-branch
-               Do NOT create any git tag or release. Finally, comment the merged
-               result (commit/PR link) back on the issue. If any of the three
-               checks do NOT pass, leave the PR OPEN (do not merge) and comment
-               what is blocking. Never push directly to main — always go through
-               the PR.
+                 then comment the merged result (commit/PR link) on the issue.
+               - GUI/visual you could NOT verify headlessly → leave the PR OPEN and
+                 comment on the issue with the PR link + exactly what needs a human
+                 visual check before merge.
+               If any of the three checks do NOT pass, leave the PR OPEN and comment
+               what is blocking. Do NOT create any git tag or release. Never push
+               directly to main — always go through the PR.
 
             Write all comments in English. Keep the change minimal; match
             surrounding style; do NOT add "Generated with Claude Code" or
