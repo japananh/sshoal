@@ -2355,9 +2355,13 @@ fn prefs_view(app: &App) -> Element<'_, Message> {
     .style(scroll_style)
     .height(Length::Fill);
 
+    // A small muted footer pinning the running version to the bottom of the
+    // window, so it's visible at a glance without scrolling into the About card.
+    let footer = caption(format!("sshoal v{VERSION}"));
+
     // Same white backdrop as the main screen — sections are set apart by the
     // white cards' border + soft shadow, not by a different screen colour.
-    container(column![header, body].spacing(12))
+    container(column![header, body, footer].spacing(12))
         .padding(14)
         .into()
 }
