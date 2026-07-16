@@ -585,15 +585,13 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 app._hotkey = register_hotkey();
             }
 
-            // Show "sshoal" over the connected (Up) count as a monochrome
-            // template icon — macOS tints it to the menu-bar colour (adapts
-            // light/dark). Only touch the tray when the count actually changes.
+            // Show the connected (Up) count as a large green "<n> ✓" beside/over
+            // the icon; plain logo at 0. Only touch the tray when it changes.
             let connected = connected_count(app.rows.iter().map(|r| r.status));
             if app.tray_count != Some(connected) {
                 app.tray_count = Some(connected);
                 if let Some(tray) = &app.tray {
-                    let _ =
-                        tray.set_icon_with_as_template(Some(make_icon_with_count(connected)), true);
+                    let _ = tray.set_icon(Some(make_icon_with_count(connected)));
                     let _ = tray.set_tooltip(Some(tray_tooltip(connected)));
                 }
             }
@@ -3652,8 +3650,8 @@ const COUNT_FONT: &str = "Helvetica";
 #[cfg(not(target_os = "macos"))]
 const COUNT_FONT: &str = "DejaVu Sans";
 
-/// A ring + checkmark, monochrome (tinted by macOS as a template).
-const CHECK_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><circle cx="50" cy="50" r="44" fill="none" stroke="#000000" stroke-width="8"/><path d="M28 52 L44 68 L74 32" fill="none" stroke="#000000" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/></svg>"##;
+/// aimonitor's "safe/green" colour, for the connected-count number + check.
+const COUNT_GREEN: &str = "#21c757";
 
 /// System-font database for the tray text, loaded once (it's slow).
 fn count_fontdb() -> std::sync::Arc<resvg::usvg::fontdb::Database> {
@@ -3667,11 +3665,18 @@ fn count_fontdb() -> std::sync::Arc<resvg::usvg::fontdb::Database> {
     .clone()
 }
 
-/// One monochrome line of text as an SVG (semibold, black — the template tint
-/// comes from macOS).
-fn text_svg(s: &str, size: u32) -> String {
+/// The count as a large green number SVG (drawn big in a 512×256 box; the caller
+/// crops it tight so it fills the icon height).
+fn num_svg(count: usize) -> String {
     format!(
-        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 128"><text x="320" y="94" font-family="{COUNT_FONT}" font-size="{size}" font-weight="600" fill="#000000" text-anchor="middle">{s}</text></svg>"##
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 256"><text x="256" y="198" font-family="{COUNT_FONT}" font-size="210" font-weight="700" fill="{COUNT_GREEN}" text-anchor="middle">{count}</text></svg>"##
+    )
+}
+
+/// A green ✓ ring (circle + checkmark).
+fn check_svg() -> String {
+    format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><circle cx="50" cy="50" r="42" fill="none" stroke="{COUNT_GREEN}" stroke-width="9"/><path d="M29 51 L44 67 L73 33" fill="none" stroke="{COUNT_GREEN}" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"/></svg>"##
     )
 }
 
@@ -3730,57 +3735,40 @@ fn blit(
     );
 }
 
-/// The tray icon: two centred lines — "sshoal" over "<count> ✓" (the ✓ ring
-/// shown only when ≥1 tunnel is connected). Rendered monochrome and set as a
-/// template, so macOS tints it to the menu-bar colour (adapts light/dark).
+/// The tray icon when tunnels are connected: a large green "<count> ✓" (count +
+/// ✓ ring) on ONE line, cropped tight so it fills the icon height and stays
+/// readable at menu-bar size. `count == 0` → the plain (colourful) logo. Green
+/// reads on both light and dark menu bars, like the logo.
 fn make_icon_with_count(count: usize) -> Icon {
-    let h = TRAY_PX;
-
-    let line1 = render_svg(&text_svg("sshoal", 40), 640, h);
-    let (a0, a1, a2, a3) = content_bbox(&line1);
-    let (w1, h1) = (a2 - a0 + 1, a3 - a1 + 1);
-
-    let num = render_svg(&text_svg(&count.to_string(), 56), 640, h);
+    if count == 0 {
+        return make_icon();
+    }
+    // Big green number, cropped tight to its glyphs.
+    let num = render_svg(&num_svg(count), 512, 256);
     let (b0, b1, b2, b3) = content_bbox(&num);
     let (wn, hn) = (b2 - b0 + 1, b3 - b1 + 1);
 
-    // The ✓ ring, sized to the digit height, only when something is connected.
-    let check = (count > 0).then(|| {
-        let px = ((hn as f32) * 1.1) as u32;
-        let pm = render_svg(CHECK_SVG, px, px);
-        let bb = content_bbox(&pm);
-        (pm, bb)
-    });
-    let (wc, hc) = check
-        .as_ref()
-        .map(|(_, (c0, c1, c2, c3))| (c2 - c0 + 1, c3 - c1 + 1))
-        .unwrap_or((0, 0));
+    // Green ✓ ring, ~digit height.
+    let chk_px = ((hn as f32) * 1.05) as u32;
+    let chk = render_svg(&check_svg(), chk_px, chk_px);
+    let (c0, c1, c2, c3) = content_bbox(&chk);
+    let (wc, hc) = (c2 - c0 + 1, c3 - c1 + 1);
 
-    let gap_x = 14u32;
-    let line2_w = wn + if wc > 0 { gap_x + wc } else { 0 };
-    let gap_y = 8u32;
-    let block_h = h1 + gap_y + hn.max(hc);
-    let total_w = w1.max(line2_w) + 12;
-    let top = h.saturating_sub(block_h) / 2;
-
-    let mut canvas = resvg::tiny_skia::Pixmap::new(total_w, h).expect("alloc tray canvas");
-    // Line 1, centred.
+    // Compose [number][gap][✓] on ONE line, canvas tight to the content height so
+    // the tray shows it as large as possible; both centred vertically.
+    let gap = ((hn as f32) * 0.28) as u32;
+    let hh = hn.max(hc);
+    let ww = wn + gap + wc;
+    let mut canvas = resvg::tiny_skia::Pixmap::new(ww, hh).expect("alloc tray canvas");
+    blit(&mut canvas, &num, b0, b1, 0, ((hh - hn) / 2) as i32);
     blit(
         &mut canvas,
-        &line1,
-        a0,
-        a1,
-        ((total_w - w1) / 2) as i32,
-        top as i32,
+        &chk,
+        c0,
+        c1,
+        (wn + gap) as i32,
+        ((hh - hc) / 2) as i32,
     );
-    // Line 2: [number][gap][✓] as a group, centred; ✓ centred against the digits.
-    let gx = (total_w - line2_w) / 2;
-    let y2 = top + h1 + gap_y;
-    blit(&mut canvas, &num, b0, b1, gx as i32, y2 as i32);
-    if let Some((pm, (c0, c1, ..))) = &check {
-        let cty = y2 as i32 + (hn as i32 - hc as i32) / 2;
-        blit(&mut canvas, pm, *c0, *c1, (gx + wn + gap_x) as i32, cty);
-    }
     pixmap_to_icon(canvas)
 }
 
