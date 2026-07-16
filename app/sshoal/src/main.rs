@@ -3663,9 +3663,9 @@ fn badge_fontdb() -> std::sync::Arc<resvg::usvg::fontdb::Database> {
 /// Badge digit size — shrinks as the number grows so it stays inside the circle.
 fn badge_font_size(count: usize) -> u32 {
     match count.to_string().len() {
-        1 => 210,
-        2 => 155,
-        _ => 115,
+        1 => 260,
+        2 => 190,
+        _ => 150,
     }
 }
 
@@ -3676,10 +3676,12 @@ fn make_icon_with_badge(count: usize) -> Icon {
     if count == 0 {
         return pixmap_to_icon(base);
     }
+    // Big + green (matches the connected/Up status colour), white ring for
+    // contrast on the menu bar. Sized to stay legible at ~22–44px tray sizes.
     let badge_svg = format!(
         r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
-  <circle cx="368" cy="368" r="140" fill="#e5484d" stroke="#ffffff" stroke-width="26"/>
-  <text x="368" y="368" font-family="{BADGE_FONT}" font-size="{size}" font-weight="700" fill="#ffffff" text-anchor="middle" dominant-baseline="central">{count}</text>
+  <circle cx="340" cy="352" r="180" fill="#2ecc70" stroke="#ffffff" stroke-width="30"/>
+  <text x="340" y="352" font-family="{BADGE_FONT}" font-size="{size}" font-weight="700" fill="#ffffff" text-anchor="middle" dominant-baseline="central">{count}</text>
 </svg>"##,
         size = badge_font_size(count),
     );
