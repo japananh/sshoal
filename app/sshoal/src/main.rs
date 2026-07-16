@@ -371,6 +371,9 @@ struct App {
     /// Set when toggling "Open at login" failed (shown under the toggle); the
     /// toggle itself stays put so the UI reflects the real OS state.
     open_at_login_error: Option<String>,
+    /// Last connected-tunnel count reflected in the tray tooltip, so we only
+    /// update the tray when it actually changes.
+    tray_count: Option<usize>,
 }
 
 impl App {
@@ -506,6 +509,7 @@ fn boot(runtime: Arc<tokio::runtime::Runtime>) -> (App, Task<Message>) {
         backup: None,
         backup_status: None,
         open_at_login_error: None,
+        tray_count: None,
     };
 
     // Reconcile the persisted "Open at login" toggle with the real OS login
@@ -579,6 +583,17 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 app.tray = Some(tray);
                 app.menu = Some(menu);
                 app._hotkey = register_hotkey();
+            }
+
+            // Reflect the number of connected (Up) tunnels in the tray tooltip —
+            // hover to see the total, on both macOS and Linux. Only touch the
+            // tray when the count actually changes.
+            let connected = connected_count(app.rows.iter().map(|r| r.status));
+            if app.tray_count != Some(connected) {
+                app.tray_count = Some(connected);
+                if let Some(tray) = &app.tray {
+                    let _ = tray.set_tooltip(Some(tray_tooltip(connected)));
+                }
             }
 
             let ids = app.menu.as_ref().map(|m| {
@@ -3538,6 +3553,24 @@ fn open_window_settings() -> window::Settings {
     }
 }
 
+/// How many tunnels are actively connected (state `Up`).
+fn connected_count(statuses: impl IntoIterator<Item = TunnelState>) -> usize {
+    statuses
+        .into_iter()
+        .filter(|s| *s == TunnelState::Up)
+        .count()
+}
+
+/// The tray tooltip for a connected-tunnel count — the exact total (no "9+"
+/// cap), shown on hover on both macOS and Linux.
+fn tray_tooltip(count: usize) -> String {
+    match count {
+        0 => "sshoal — no tunnels connected".to_string(),
+        1 => "sshoal — 1 tunnel connected".to_string(),
+        n => format!("sshoal — {n} tunnels connected"),
+    }
+}
+
 fn build_tray() -> (TrayIcon, MenuIds) {
     let connect_all = MenuItem::new("Connect all", true, None);
     let open = MenuItem::new("Open sshoal", true, None);
@@ -3615,4 +3648,30 @@ fn main() -> iced::Result {
         .theme(|_app: &App, _id| Theme::Light)
         .title(|_app: &App, _id| String::from("sshoal"))
         .run()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sshoal_core::TunnelState::{Connecting, Failed, Idle, Reconnecting, Up};
+
+    #[test]
+    fn connected_count_counts_only_up() {
+        assert_eq!(connected_count([]), 0);
+        assert_eq!(connected_count([Idle, Failed, Connecting, Reconnecting]), 0);
+        assert_eq!(
+            connected_count([Up, Idle, Up, Connecting, Reconnecting, Failed, Up]),
+            3
+        );
+    }
+
+    #[test]
+    fn tray_tooltip_shows_exact_total_without_a_cap() {
+        assert_eq!(tray_tooltip(0), "sshoal — no tunnels connected");
+        assert_eq!(tray_tooltip(1), "sshoal — 1 tunnel connected");
+        assert_eq!(tray_tooltip(5), "sshoal — 5 tunnels connected");
+        // No "9+"-style cap — a large count shows the real number.
+        assert_eq!(tray_tooltip(100), "sshoal — 100 tunnels connected");
+        assert!(!tray_tooltip(100).contains('+'));
+    }
 }
