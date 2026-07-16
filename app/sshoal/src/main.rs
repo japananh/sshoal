@@ -585,13 +585,14 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 app._hotkey = register_hotkey();
             }
 
-            // Reflect the number of connected (Up) tunnels in the tray tooltip —
-            // hover to see the total, on both macOS and Linux. Only touch the
-            // tray when the count actually changes.
+            // Reflect the number of connected (Up) tunnels as a badge on the tray
+            // icon (always visible, both platforms), with the tooltip as a text
+            // fallback. Only touch the tray when the count actually changes.
             let connected = connected_count(app.rows.iter().map(|r| r.status));
             if app.tray_count != Some(connected) {
                 app.tray_count = Some(connected);
                 if let Some(tray) = &app.tray {
+                    let _ = tray.set_icon(Some(make_icon_with_badge(connected)));
                     let _ = tray.set_tooltip(Some(tray_tooltip(connected)));
                 }
             }
@@ -3602,13 +3603,12 @@ fn build_tray() -> (TrayIcon, MenuIds) {
     }
 }
 
-/// Render the bundled SVG logo to an RGBA tray icon.
-fn make_icon() -> Icon {
-    const SVG: &str = include_str!("../assets/icon.svg");
-    let size: u32 = 64;
+const ICON_SVG: &str = include_str!("../assets/icon.svg");
 
-    let tree =
-        resvg::usvg::Tree::from_str(SVG, &resvg::usvg::Options::default()).expect("parse icon svg");
+/// Render an icon-sized SVG to a 64px premultiplied pixmap.
+fn render_icon_pixmap(svg: &str, opt: &resvg::usvg::Options) -> resvg::tiny_skia::Pixmap {
+    let size: u32 = 64;
+    let tree = resvg::usvg::Tree::from_str(svg, opt).expect("parse icon svg");
     let mut pixmap = resvg::tiny_skia::Pixmap::new(size, size).expect("alloc pixmap");
     let scale = size as f32 / 512.0;
     resvg::render(
@@ -3616,8 +3616,12 @@ fn make_icon() -> Icon {
         resvg::tiny_skia::Transform::from_scale(scale, scale),
         &mut pixmap.as_mut(),
     );
+    pixmap
+}
 
-    // tiny-skia stores premultiplied alpha; tray-icon wants straight RGBA.
+/// A premultiplied pixmap → a straight-RGBA tray icon (tray-icon wants straight).
+fn pixmap_to_icon(pixmap: resvg::tiny_skia::Pixmap) -> Icon {
+    let (w, h) = (pixmap.width(), pixmap.height());
     let mut rgba = pixmap.take();
     for px in rgba.chunks_exact_mut(4) {
         let a = px[3] as u32;
@@ -3627,7 +3631,73 @@ fn make_icon() -> Icon {
             px[2] = (px[2] as u32 * 255 / a) as u8;
         }
     }
-    Icon::from_rgba(rgba, size, size).expect("valid rgba icon")
+    Icon::from_rgba(rgba, w, h).expect("valid rgba icon")
+}
+
+/// Render the bundled SVG logo to an RGBA tray icon.
+fn make_icon() -> Icon {
+    pixmap_to_icon(render_icon_pixmap(
+        ICON_SVG,
+        &resvg::usvg::Options::default(),
+    ))
+}
+
+/// A sans font reliably present on each platform, for the badge digits.
+#[cfg(target_os = "macos")]
+const BADGE_FONT: &str = "Helvetica";
+#[cfg(not(target_os = "macos"))]
+const BADGE_FONT: &str = "DejaVu Sans";
+
+/// System-font database for the badge digits, loaded once (it's slow).
+fn badge_fontdb() -> std::sync::Arc<resvg::usvg::fontdb::Database> {
+    use std::sync::{Arc, OnceLock};
+    static DB: OnceLock<Arc<resvg::usvg::fontdb::Database>> = OnceLock::new();
+    DB.get_or_init(|| {
+        let mut db = resvg::usvg::fontdb::Database::new();
+        db.load_system_fonts();
+        Arc::new(db)
+    })
+    .clone()
+}
+
+/// Badge digit size — shrinks as the number grows so it stays inside the circle.
+fn badge_font_size(count: usize) -> u32 {
+    match count.to_string().len() {
+        1 => 210,
+        2 => 155,
+        _ => 115,
+    }
+}
+
+/// The tray icon with a count badge in the bottom-right corner. `count == 0`
+/// returns the plain icon (no badge).
+fn make_icon_with_badge(count: usize) -> Icon {
+    let mut base = render_icon_pixmap(ICON_SVG, &resvg::usvg::Options::default());
+    if count == 0 {
+        return pixmap_to_icon(base);
+    }
+    let badge_svg = format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <circle cx="368" cy="368" r="140" fill="#e5484d" stroke="#ffffff" stroke-width="26"/>
+  <text x="368" y="368" font-family="{BADGE_FONT}" font-size="{size}" font-weight="700" fill="#ffffff" text-anchor="middle" dominant-baseline="central">{count}</text>
+</svg>"##,
+        size = badge_font_size(count),
+    );
+    let opt = resvg::usvg::Options {
+        fontdb: badge_fontdb(),
+        font_family: BADGE_FONT.to_string(),
+        ..Default::default()
+    };
+    let badge = render_icon_pixmap(&badge_svg, &opt);
+    base.as_mut().draw_pixmap(
+        0,
+        0,
+        badge.as_ref(),
+        &resvg::tiny_skia::PixmapPaint::default(),
+        resvg::tiny_skia::Transform::identity(),
+        None,
+    );
+    pixmap_to_icon(base)
 }
 
 fn main() -> iced::Result {
@@ -3673,5 +3743,13 @@ mod tests {
         // No "9+"-style cap — a large count shows the real number.
         assert_eq!(tray_tooltip(100), "sshoal — 100 tunnels connected");
         assert!(!tray_tooltip(100).contains('+'));
+    }
+
+    #[test]
+    fn badge_font_size_shrinks_as_digits_grow() {
+        assert_eq!(badge_font_size(1), badge_font_size(9));
+        assert!(badge_font_size(1) > badge_font_size(10));
+        assert!(badge_font_size(10) > badge_font_size(100));
+        assert_eq!(badge_font_size(10), badge_font_size(99));
     }
 }
