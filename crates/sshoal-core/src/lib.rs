@@ -8,6 +8,7 @@
 //! "drop → reconnect" or "retry with backoff" scenario verifies in microseconds
 //! without touching the network.
 
+pub mod autostart;
 pub mod config;
 pub mod import;
 pub mod supervisor;

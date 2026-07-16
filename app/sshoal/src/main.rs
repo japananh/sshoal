@@ -51,6 +51,7 @@ const TEXT_DANGER: Color = Color::from_rgb(0.9, 0.3, 0.3);
 const TEXT_SUCCESS: Color = Color::from_rgb(0.13, 0.62, 0.33);
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
+use sshoal_core::autostart;
 use sshoal_core::updater::{self, RELEASES_URL, UpdateInfo};
 use sshoal_core::{
     AppConfig, Backoff, ImportError, OpenSshTransport, PortableConfig, Settings, SshConfig,
@@ -158,6 +159,8 @@ enum Message {
     OpenPrefs,
     ClosePrefs,
     ToggleAutoUpdate(bool),
+    /// Toggle "Open at login" (register/unregister the OS login item).
+    ToggleOpenAtLogin(bool),
     /// Run an update check now (from launch or the "Check now" button).
     CheckUpdates,
     /// Result of a check — Ok(info) or a human-readable failure.
@@ -365,6 +368,9 @@ struct App {
     backup: Option<Backup>,
     /// Transient result of the last export/import, shown in Preferences.
     backup_status: Option<String>,
+    /// Set when toggling "Open at login" failed (shown under the toggle); the
+    /// toggle itself stays put so the UI reflects the real OS state.
+    open_at_login_error: Option<String>,
 }
 
 impl App {
@@ -499,7 +505,16 @@ fn boot(runtime: Arc<tokio::runtime::Runtime>) -> (App, Task<Message>) {
         update_installing: false,
         backup: None,
         backup_status: None,
+        open_at_login_error: None,
     };
+
+    // Reconcile the persisted "Open at login" toggle with the real OS login
+    // item: if the user added/removed it outside the app, trust the OS state.
+    let registered = autostart::is_enabled();
+    if registered != app.settings.open_at_login {
+        app.settings.open_at_login = registered;
+        persist_app(&app);
+    }
 
     // Show the window on launch so opening the app always surfaces it (the tray
     // icon can be hard to spot); `gain_focus` brings it to the front since we
@@ -1148,6 +1163,19 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 app.update_checking = true;
                 app.update_status = None;
                 return check_update_task(app.runtime.clone());
+            }
+            Task::none()
+        }
+        Message::ToggleOpenAtLogin(on) => {
+            match autostart::set_enabled(on) {
+                Ok(()) => {
+                    app.settings.open_at_login = on;
+                    app.open_at_login_error = None;
+                    persist_app(app);
+                }
+                // Don't flip the toggle if the OS registration failed — keep the
+                // UI honest and surface why instead.
+                Err(e) => app.open_at_login_error = Some(e.to_string()),
             }
             Task::none()
         }
@@ -2281,6 +2309,24 @@ fn prefs_view(app: &App) -> Element<'_, Message> {
     .spacing(8)
     .align_y(iced::Alignment::Center);
 
+    let open_login_row = row![
+        text("Open at login").size(14).width(Length::Fill),
+        toggler(app.settings.open_at_login)
+            .size(18)
+            .on_toggle(Message::ToggleOpenAtLogin),
+    ]
+    .align_y(iced::Alignment::Center);
+    let mut general = column![
+        open_login_row,
+        caption(
+            "Launch sshoal automatically when you log in, so your tunnels reconnect after a reboot."
+        ),
+    ]
+    .spacing(10);
+    if let Some(err) = &app.open_at_login_error {
+        general = general.push(caption(format!("Couldn't update the login item: {err}")));
+    }
+
     let auto_row = row![
         text("Automatically check for updates")
             .size(14)
@@ -2345,6 +2391,7 @@ fn prefs_view(app: &App) -> Element<'_, Message> {
     // window, governed solely by the symmetric outer padding below.
     let body = scrollable(
         column![
+            pref_section("General", general),
             pref_section("Updates", updates),
             pref_section("Backup", backup),
             pref_section("About", about),
