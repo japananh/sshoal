@@ -58,10 +58,17 @@ fn default_port() -> u16 {
     22
 }
 
+/// serde `skip_serializing_if` helper: omit `open_at_login` when it's off.
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 /// A self-contained, portable subset of a config: tunnels plus only the ssh
-/// configs they reference. `settings` are deliberately excluded — they're
-/// machine-specific (`collapsed_folders`, `skipped_version`, `auto_update_enabled`)
-/// and `AppConfig::merge` ignores incoming settings on import anyway.
+/// configs they reference. Machine-specific `settings` are excluded — with one
+/// deliberate exception, `open_at_login`, so a backup restores whether sshoal
+/// relaunches at login. The rest (`collapsed_folders`, `skipped_version`,
+/// `auto_update_enabled`) stay local, and `AppConfig::merge` ignores incoming
+/// settings on import anyway.
 ///
 /// This is a **distinct type** from [`AppConfig`] on purpose: embedded private
 /// keys live under [`PortableSsh::identity_files`], and the plain [`SshConfig`]
@@ -73,6 +80,9 @@ pub struct PortableConfig {
     pub ssh_configs: Vec<PortableSsh>,
     #[serde(default)]
     pub tunnels: Vec<Tunnel>,
+    /// The one carried setting: whether sshoal registers to open at login.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub open_at_login: bool,
 }
 
 /// An ssh config inside an export: the same fields as [`SshConfig`], plus
@@ -149,6 +159,7 @@ impl PortableConfig {
         Self {
             ssh_configs,
             tunnels,
+            open_at_login: config.settings.open_at_login,
         }
     }
 
@@ -240,7 +251,10 @@ pub fn import(bytes: &[u8], passphrase: Option<&str>) -> Result<AppConfig, Impor
     Ok(AppConfig {
         ssh_configs: p.ssh_configs_plain(),
         tunnels: p.tunnels,
-        settings: Default::default(),
+        settings: crate::config::Settings {
+            open_at_login: p.open_at_login,
+            ..Default::default()
+        },
     })
 }
 
@@ -380,6 +394,30 @@ mod tests {
             "portable file must not carry settings"
         );
         assert!(!text.contains("v9.9.9") && !text.contains("collapsed_folders"));
+    }
+
+    #[test]
+    fn open_at_login_travels_in_the_portable_file() {
+        // Off (the default) stays out of the file.
+        let off = PortableConfig::build(&full(), None, false);
+        assert!(!off.open_at_login);
+        let text = String::from_utf8(export_portable(&off, None).unwrap()).unwrap();
+        assert!(!text.contains("open_at_login"));
+
+        // On is carried in the file and surfaced on import (both as a
+        // PortableConfig and as an AppConfig).
+        let mut cfg = full();
+        cfg.settings.open_at_login = true;
+        let portable = PortableConfig::build(&cfg, None, false);
+        assert!(portable.open_at_login);
+        let blob = export_portable(&portable, None).unwrap();
+        assert!(
+            String::from_utf8(blob.clone())
+                .unwrap()
+                .contains("open_at_login: true")
+        );
+        assert!(import_portable(&blob, None).unwrap().open_at_login);
+        assert!(import(&blob, None).unwrap().settings.open_at_login);
     }
 
     #[test]

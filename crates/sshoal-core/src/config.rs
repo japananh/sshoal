@@ -80,6 +80,10 @@ fn default_true() -> bool {
     true
 }
 
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 /// App-wide preferences (not tunnels). Persisted in the same YAML file under a
 /// `settings:` key; an older config without the key still loads, defaulting
 /// every field.
@@ -98,6 +102,10 @@ pub struct Settings {
     /// where this is empty — starts with everything expanded, as before.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub collapsed_folders: Vec<String>,
+    /// Register sshoal to launch at login, so tunnels reconnect after a reboot.
+    /// Default off; kept in sync with the real OS login item on launch.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub open_at_login: bool,
 }
 
 impl Default for Settings {
@@ -106,6 +114,7 @@ impl Default for Settings {
             auto_update_enabled: true,
             skipped_version: None,
             collapsed_folders: Vec::new(),
+            open_at_login: false,
         }
     }
 }
@@ -314,6 +323,22 @@ mod tests {
         cfg.settings.collapsed_folders = vec!["gc".into(), "gc/dev".into()];
         let parsed = AppConfig::from_yaml(&cfg.to_yaml().unwrap()).unwrap();
         assert_eq!(parsed.settings.collapsed_folders, vec!["gc", "gc/dev"]);
+    }
+
+    #[test]
+    fn open_at_login_roundtrips_and_defaults_off() {
+        // A config predating the field still loads, defaulting to off.
+        let old = "tunnels: []\nsettings:\n  auto_update_enabled: true\n";
+        let cfg = AppConfig::from_yaml(old).unwrap();
+        assert!(!cfg.settings.open_at_login);
+
+        // Off is omitted from the YAML (skip_serializing_if); on roundtrips.
+        let mut cfg = sample();
+        assert!(!cfg.to_yaml().unwrap().contains("open_at_login"));
+        cfg.settings.open_at_login = true;
+        let yaml = cfg.to_yaml().unwrap();
+        assert!(yaml.contains("open_at_login: true"));
+        assert!(AppConfig::from_yaml(&yaml).unwrap().settings.open_at_login);
     }
 
     #[test]
