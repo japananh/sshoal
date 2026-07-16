@@ -3650,8 +3650,9 @@ const COUNT_FONT: &str = "Helvetica";
 #[cfg(not(target_os = "macos"))]
 const COUNT_FONT: &str = "DejaVu Sans";
 
-/// aimonitor's "safe/green" colour, for the connected-count number + check.
-const COUNT_GREEN: &str = "#21c757";
+/// aimonitor's "safe/green" (its dark-appearance variant), for the connected
+/// dot. Text is white; tuned for a dark menu bar.
+const COUNT_GREEN: &str = "#75f294";
 
 /// System-font database for the tray text, loaded once (it's slow).
 fn count_fontdb() -> std::sync::Arc<resvg::usvg::fontdb::Database> {
@@ -3669,7 +3670,7 @@ fn count_fontdb() -> std::sync::Arc<resvg::usvg::fontdb::Database> {
 /// it tight so it fills its share of the icon height).
 fn text_svg(s: &str, size: u32, weight: u32) -> String {
     format!(
-        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 256"><text x="400" y="198" font-family="{COUNT_FONT}" font-size="{size}" font-weight="{weight}" fill="{COUNT_GREEN}" text-anchor="middle">{s}</text></svg>"##
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 256"><text x="400" y="198" font-family="{COUNT_FONT}" font-size="{size}" font-weight="{weight}" fill="#ffffff" text-anchor="middle">{s}</text></svg>"##
     )
 }
 
