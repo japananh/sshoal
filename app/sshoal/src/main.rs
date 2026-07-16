@@ -585,14 +585,15 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 app._hotkey = register_hotkey();
             }
 
-            // Show the number of connected (Up) tunnels as green text beside the
-            // tray icon (always visible, both platforms), with the tooltip as a
-            // text fallback. Only touch the tray when the count actually changes.
+            // Show "sshoal" over the connected (Up) count as a monochrome
+            // template icon — macOS tints it to the menu-bar colour (adapts
+            // light/dark). Only touch the tray when the count actually changes.
             let connected = connected_count(app.rows.iter().map(|r| r.status));
             if app.tray_count != Some(connected) {
                 app.tray_count = Some(connected);
                 if let Some(tray) = &app.tray {
-                    let _ = tray.set_icon(Some(make_icon_with_count(connected)));
+                    let _ =
+                        tray.set_icon_with_as_template(Some(make_icon_with_count(connected)), true);
                     let _ = tray.set_tooltip(Some(tray_tooltip(connected)));
                 }
             }
@@ -3645,16 +3646,16 @@ fn make_icon() -> Icon {
     ))
 }
 
-/// A sans font reliably present on each platform, for the count digits.
+/// A sans font reliably present on each platform, for the tray text.
 #[cfg(target_os = "macos")]
 const COUNT_FONT: &str = "Helvetica";
 #[cfg(not(target_os = "macos"))]
 const COUNT_FONT: &str = "DejaVu Sans";
 
-/// aimonitor's "safe/green" colour, for the connected-count number.
-const COUNT_GREEN: &str = "#21c757";
+/// A ring + checkmark, monochrome (tinted by macOS as a template).
+const CHECK_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><circle cx="50" cy="50" r="44" fill="none" stroke="#000000" stroke-width="8"/><path d="M28 52 L44 68 L74 32" fill="none" stroke="#000000" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/></svg>"##;
 
-/// System-font database for the count digits, loaded once (it's slow).
+/// System-font database for the tray text, loaded once (it's slow).
 fn count_fontdb() -> std::sync::Arc<resvg::usvg::fontdb::Database> {
     use std::sync::{Arc, OnceLock};
     static DB: OnceLock<Arc<resvg::usvg::fontdb::Database>> = OnceLock::new();
@@ -3666,85 +3667,120 @@ fn count_fontdb() -> std::sync::Arc<resvg::usvg::fontdb::Database> {
     .clone()
 }
 
-/// Width of the number's (512-tall) viewBox for `digits` digits — grows with the
-/// digit count so wider numbers never clip.
-fn count_viewbox_width(digits: usize) -> u32 {
-    230 * digits as u32 + 60
+/// One monochrome line of text as an SVG (semibold, black — the template tint
+/// comes from macOS).
+fn text_svg(s: &str, size: u32) -> String {
+    format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 128"><text x="320" y="94" font-family="{COUNT_FONT}" font-size="{size}" font-weight="600" fill="#000000" text-anchor="middle">{s}</text></svg>"##
+    )
 }
 
-/// The rows (top, bottom) of `pm` that contain any non-transparent pixel — used
-/// to vertically centre the glyphs precisely (usvg's `dominant-baseline` can't
-/// be relied on to centre them).
-fn glyph_v_bounds(pm: &resvg::tiny_skia::Pixmap) -> Option<(u32, u32)> {
-    let (w, h) = (pm.width(), pm.height());
-    let data = pm.data();
-    let (mut top, mut bottom) = (None, 0u32);
-    for y in 0..h {
-        if (0..w).any(|x| data[((y * w + x) * 4 + 3) as usize] > 0) {
-            top.get_or_insert(y);
-            bottom = y;
-        }
-    }
-    top.map(|t| (t, bottom))
-}
-
-/// The tray icon with the connected count as green text to the RIGHT of the
-/// logo, vertically centred. `count == 0` → the plain (square) logo. Rendering
-/// the number beside the logo (rather than as a small corner badge) lets the
-/// tray show it at full menu-bar height, so it's actually legible.
-fn make_icon_with_count(count: usize) -> Icon {
-    let logo = render_icon_pixmap(ICON_SVG, &resvg::usvg::Options::default());
-    if count == 0 {
-        return pixmap_to_icon(logo);
-    }
-    let h = logo.height();
-    let text = count.to_string();
-    let vbw = count_viewbox_width(text.len());
-    let num_w = (h * vbw / 512).max(1);
-
-    // Semibold + aimonitor's green, matching its menu-bar number. `y`/baseline
-    // is a first guess; we re-centre precisely below via the glyph bounds.
-    let num_svg = format!(
-        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {vbw} 512"><text x="{cx}" y="256" font-family="{COUNT_FONT}" font-size="360" font-weight="600" fill="{COUNT_GREEN}" text-anchor="middle" dominant-baseline="central">{text}</text></svg>"##,
-        cx = vbw / 2,
-    );
+/// Render an SVG into a `w`x`h` pixmap, scaling its viewBox to fill.
+fn render_svg(svg: &str, w: u32, h: u32) -> resvg::tiny_skia::Pixmap {
     let opt = resvg::usvg::Options {
         fontdb: count_fontdb(),
         font_family: COUNT_FONT.to_string(),
         ..Default::default()
     };
-    let num_tree = resvg::usvg::Tree::from_str(&num_svg, &opt).expect("parse number svg");
-    let mut num_pm = resvg::tiny_skia::Pixmap::new(num_w, h).expect("alloc number pixmap");
-    let scale = h as f32 / 512.0;
+    let tree = resvg::usvg::Tree::from_str(svg, &opt).expect("parse svg");
+    let ts = tree.size();
+    let mut pm = resvg::tiny_skia::Pixmap::new(w, h).expect("alloc pixmap");
     resvg::render(
-        &num_tree,
-        resvg::tiny_skia::Transform::from_scale(scale, scale),
-        &mut num_pm.as_mut(),
+        &tree,
+        resvg::tiny_skia::Transform::from_scale(w as f32 / ts.width(), h as f32 / ts.height()),
+        &mut pm.as_mut(),
     );
-    // Shift the number so its glyphs sit at the icon's exact vertical centre.
-    let off_y = match glyph_v_bounds(&num_pm) {
-        Some((t, b)) => h as i32 / 2 - ((t + b) / 2) as i32,
-        None => 0,
-    };
+    pm
+}
 
-    // Compose [logo][gap][number] on one wide transparent canvas; tray-icon
-    // scales it to menu-bar height keeping the aspect ratio.
-    let gap: u32 = 4;
-    let total_w = logo.width() + gap + num_w;
-    let mut canvas = resvg::tiny_skia::Pixmap::new(total_w, h).expect("alloc tray canvas");
-    let paint = resvg::tiny_skia::PixmapPaint::default();
-    let identity = resvg::tiny_skia::Transform::identity();
-    canvas
-        .as_mut()
-        .draw_pixmap(0, 0, logo.as_ref(), &paint, identity, None);
+/// Content bounds (x0, y0, x1, y1 inclusive) of non-transparent pixels.
+fn content_bbox(pm: &resvg::tiny_skia::Pixmap) -> (u32, u32, u32, u32) {
+    let (w, h) = (pm.width(), pm.height());
+    let d = pm.data();
+    let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0u32, 0u32);
+    for y in 0..h {
+        for x in 0..w {
+            if d[((y * w + x) * 4 + 3) as usize] > 0 {
+                x0 = x0.min(x);
+                y0 = y0.min(y);
+                x1 = x1.max(x);
+                y1 = y1.max(y);
+            }
+        }
+    }
+    (x0, y0, x1, y1)
+}
+
+/// Blit `src`'s content so its content-top-left lands at (tx, ty) on `canvas`.
+fn blit(
+    canvas: &mut resvg::tiny_skia::Pixmap,
+    src: &resvg::tiny_skia::Pixmap,
+    bx: u32,
+    by: u32,
+    tx: i32,
+    ty: i32,
+) {
     canvas.as_mut().draw_pixmap(
-        (logo.width() + gap) as i32,
-        off_y,
-        num_pm.as_ref(),
-        &paint,
-        identity,
+        tx - bx as i32,
+        ty - by as i32,
+        src.as_ref(),
+        &resvg::tiny_skia::PixmapPaint::default(),
+        resvg::tiny_skia::Transform::identity(),
         None,
     );
+}
+
+/// The tray icon: two centred lines — "sshoal" over "<count> ✓" (the ✓ ring
+/// shown only when ≥1 tunnel is connected). Rendered monochrome and set as a
+/// template, so macOS tints it to the menu-bar colour (adapts light/dark).
+fn make_icon_with_count(count: usize) -> Icon {
+    let h = TRAY_PX;
+
+    let line1 = render_svg(&text_svg("sshoal", 40), 640, h);
+    let (a0, a1, a2, a3) = content_bbox(&line1);
+    let (w1, h1) = (a2 - a0 + 1, a3 - a1 + 1);
+
+    let num = render_svg(&text_svg(&count.to_string(), 56), 640, h);
+    let (b0, b1, b2, b3) = content_bbox(&num);
+    let (wn, hn) = (b2 - b0 + 1, b3 - b1 + 1);
+
+    // The ✓ ring, sized to the digit height, only when something is connected.
+    let check = (count > 0).then(|| {
+        let px = ((hn as f32) * 1.1) as u32;
+        let pm = render_svg(CHECK_SVG, px, px);
+        let bb = content_bbox(&pm);
+        (pm, bb)
+    });
+    let (wc, hc) = check
+        .as_ref()
+        .map(|(_, (c0, c1, c2, c3))| (c2 - c0 + 1, c3 - c1 + 1))
+        .unwrap_or((0, 0));
+
+    let gap_x = 14u32;
+    let line2_w = wn + if wc > 0 { gap_x + wc } else { 0 };
+    let gap_y = 8u32;
+    let block_h = h1 + gap_y + hn.max(hc);
+    let total_w = w1.max(line2_w) + 12;
+    let top = h.saturating_sub(block_h) / 2;
+
+    let mut canvas = resvg::tiny_skia::Pixmap::new(total_w, h).expect("alloc tray canvas");
+    // Line 1, centred.
+    blit(
+        &mut canvas,
+        &line1,
+        a0,
+        a1,
+        ((total_w - w1) / 2) as i32,
+        top as i32,
+    );
+    // Line 2: [number][gap][✓] as a group, centred; ✓ centred against the digits.
+    let gx = (total_w - line2_w) / 2;
+    let y2 = top + h1 + gap_y;
+    blit(&mut canvas, &num, b0, b1, gx as i32, y2 as i32);
+    if let Some((pm, (c0, c1, ..))) = &check {
+        let cty = y2 as i32 + (hn as i32 - hc as i32) / 2;
+        blit(&mut canvas, pm, *c0, *c1, (gx + wn + gap_x) as i32, cty);
+    }
     pixmap_to_icon(canvas)
 }
 
@@ -3791,16 +3827,5 @@ mod tests {
         // No "9+"-style cap — a large count shows the real number.
         assert_eq!(tray_tooltip(100), "sshoal — 100 tunnels connected");
         assert!(!tray_tooltip(100).contains('+'));
-    }
-
-    #[test]
-    fn count_viewbox_width_grows_with_digits() {
-        assert!(count_viewbox_width(2) > count_viewbox_width(1));
-        assert!(count_viewbox_width(3) > count_viewbox_width(2));
-        // Linear: each extra digit adds the same width.
-        assert_eq!(
-            count_viewbox_width(2) - count_viewbox_width(1),
-            count_viewbox_width(3) - count_viewbox_width(2),
-        );
     }
 }
