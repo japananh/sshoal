@@ -3741,8 +3741,8 @@ fn blit(
 /// number dominates and the canvas is cropped tight, so it stays as readable as
 /// possible at menu-bar height. Green reads on both light and dark menu bars.
 fn make_icon_with_count(count: usize) -> Icon {
-    // Line 1: the "sshoal" label.
-    let l1 = render_svg(&text_svg("sshoal", 150, 600), 800, 256);
+    // Line 1: the "sshoal" label (regular weight).
+    let l1 = render_svg(&text_svg("sshoal", 150, 400), 800, 256);
     let (p0, p1, p2, p3) = content_bbox(&l1);
     let (w1, h1) = (p2 - p0 + 1, p3 - p1 + 1);
 
@@ -3766,7 +3766,7 @@ fn make_icon_with_count(count: usize) -> Icon {
     let gap_x = ((hn as f32) * 0.28) as u32;
     let line2_w = wn + if wc > 0 { gap_x + wc } else { 0 };
     let line2_h = hn.max(hc);
-    let gap_y = ((hn as f32) * 0.12) as u32;
+    let gap_y = ((hn as f32) * 0.12) as u32 + 6; // ≈ +1px at menu-bar scale
     let ww = w1.max(line2_w);
     let hh = h1 + gap_y + line2_h;
 
