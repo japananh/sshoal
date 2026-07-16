@@ -3673,10 +3673,10 @@ fn text_svg(s: &str, size: u32, weight: u32) -> String {
     )
 }
 
-/// A green ✓ ring (circle + checkmark).
-fn check_svg() -> String {
+/// A solid green filled circle (dot).
+fn dot_svg() -> String {
     format!(
-        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><circle cx="50" cy="50" r="42" fill="none" stroke="{COUNT_GREEN}" stroke-width="9"/><path d="M29 51 L44 67 L73 33" fill="none" stroke="{COUNT_GREEN}" stroke-width="11" stroke-linecap="round" stroke-linejoin="round"/></svg>"##
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><circle cx="50" cy="50" r="46" fill="{COUNT_GREEN}"/></svg>"##
     )
 }
 
@@ -3740,8 +3740,8 @@ fn blit(
 /// number dominates and the canvas is cropped tight, so it stays as readable as
 /// possible at menu-bar height. Green reads on both light and dark menu bars.
 fn make_icon_with_count(count: usize) -> Icon {
-    // Line 1: small "sshoal" label.
-    let l1 = render_svg(&text_svg("sshoal", 95, 600), 800, 256);
+    // Line 1: the "sshoal" label.
+    let l1 = render_svg(&text_svg("sshoal", 150, 600), 800, 256);
     let (p0, p1, p2, p3) = content_bbox(&l1);
     let (w1, h1) = (p2 - p0 + 1, p3 - p1 + 1);
 
@@ -3750,14 +3750,14 @@ fn make_icon_with_count(count: usize) -> Icon {
     let (b0, b1, b2, b3) = content_bbox(&num);
     let (wn, hn) = (b2 - b0 + 1, b3 - b1 + 1);
 
-    // Green ✓ ring beside the number, ~digit height, only when connected.
-    let check = (count > 0).then(|| {
-        let px = ((hn as f32) * 1.05) as u32;
-        let pm = render_svg(&check_svg(), px, px);
+    // Solid green dot beside the number (~0.7× digit height), only when connected.
+    let dot = (count > 0).then(|| {
+        let px = ((hn as f32) * 0.7) as u32;
+        let pm = render_svg(&dot_svg(), px, px);
         let bb = content_bbox(&pm);
         (pm, bb)
     });
-    let (wc, hc) = check
+    let (wc, hc) = dot
         .as_ref()
         .map(|(_, (c0, c1, c2, c3))| (c2 - c0 + 1, c3 - c1 + 1))
         .unwrap_or((0, 0));
@@ -3783,7 +3783,7 @@ fn make_icon_with_count(count: usize) -> Icon {
         gx as i32,
         (y2 + (line2_h - hn) / 2) as i32,
     );
-    if let Some((pm, (c0, c1, ..))) = &check {
+    if let Some((pm, (c0, c1, ..))) = &dot {
         blit(
             &mut canvas,
             pm,
