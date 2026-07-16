@@ -585,14 +585,14 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 app._hotkey = register_hotkey();
             }
 
-            // Reflect the number of connected (Up) tunnels as a badge on the tray
-            // icon (always visible, both platforms), with the tooltip as a text
-            // fallback. Only touch the tray when the count actually changes.
+            // Show the number of connected (Up) tunnels as green text beside the
+            // tray icon (always visible, both platforms), with the tooltip as a
+            // text fallback. Only touch the tray when the count actually changes.
             let connected = connected_count(app.rows.iter().map(|r| r.status));
             if app.tray_count != Some(connected) {
                 app.tray_count = Some(connected);
                 if let Some(tray) = &app.tray {
-                    let _ = tray.set_icon(Some(make_icon_with_badge(connected)));
+                    let _ = tray.set_icon(Some(make_icon_with_count(connected)));
                     let _ = tray.set_tooltip(Some(tray_tooltip(connected)));
                 }
             }
@@ -3642,14 +3642,17 @@ fn make_icon() -> Icon {
     ))
 }
 
-/// A sans font reliably present on each platform, for the badge digits.
+/// A sans font reliably present on each platform, for the count digits.
 #[cfg(target_os = "macos")]
-const BADGE_FONT: &str = "Helvetica";
+const COUNT_FONT: &str = "Helvetica";
 #[cfg(not(target_os = "macos"))]
-const BADGE_FONT: &str = "DejaVu Sans";
+const COUNT_FONT: &str = "DejaVu Sans";
 
-/// System-font database for the badge digits, loaded once (it's slow).
-fn badge_fontdb() -> std::sync::Arc<resvg::usvg::fontdb::Database> {
+/// aimonitor's "safe/green" colour, for the connected-count number.
+const COUNT_GREEN: &str = "#21c757";
+
+/// System-font database for the count digits, loaded once (it's slow).
+fn count_fontdb() -> std::sync::Arc<resvg::usvg::fontdb::Database> {
     use std::sync::{Arc, OnceLock};
     static DB: OnceLock<Arc<resvg::usvg::fontdb::Database>> = OnceLock::new();
     DB.get_or_init(|| {
@@ -3660,46 +3663,64 @@ fn badge_fontdb() -> std::sync::Arc<resvg::usvg::fontdb::Database> {
     .clone()
 }
 
-/// Badge digit size — shrinks as the number grows so it stays inside the circle.
-fn badge_font_size(count: usize) -> u32 {
-    match count.to_string().len() {
-        1 => 260,
-        2 => 190,
-        _ => 150,
-    }
+/// Width of the number's (512-tall) viewBox for `digits` digits — grows with the
+/// digit count so wider numbers never clip.
+fn count_viewbox_width(digits: usize) -> u32 {
+    230 * digits as u32 + 60
 }
 
-/// The tray icon with a count badge in the bottom-right corner. `count == 0`
-/// returns the plain icon (no badge).
-fn make_icon_with_badge(count: usize) -> Icon {
-    let mut base = render_icon_pixmap(ICON_SVG, &resvg::usvg::Options::default());
+/// The tray icon with the connected count as green text to the RIGHT of the
+/// logo, vertically centred. `count == 0` → the plain (square) logo. Rendering
+/// the number beside the logo (rather than as a small corner badge) lets the
+/// tray show it at full menu-bar height, so it's actually legible.
+fn make_icon_with_count(count: usize) -> Icon {
+    let logo = render_icon_pixmap(ICON_SVG, &resvg::usvg::Options::default());
     if count == 0 {
-        return pixmap_to_icon(base);
+        return pixmap_to_icon(logo);
     }
-    // Big + green (matches the connected/Up status colour), white ring for
-    // contrast on the menu bar. Sized to stay legible at ~22–44px tray sizes.
-    let badge_svg = format!(
-        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
-  <circle cx="340" cy="352" r="180" fill="#2ecc70" stroke="#ffffff" stroke-width="30"/>
-  <text x="340" y="352" font-family="{BADGE_FONT}" font-size="{size}" font-weight="700" fill="#ffffff" text-anchor="middle" dominant-baseline="central">{count}</text>
-</svg>"##,
-        size = badge_font_size(count),
+    let h = logo.height();
+    let text = count.to_string();
+    let vbw = count_viewbox_width(text.len());
+    let num_w = (h * vbw / 512).max(1);
+
+    // The number, vertically centred in its own (tall) box, at ~74% height.
+    let num_svg = format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {vbw} 512"><text x="{cx}" y="256" font-family="{COUNT_FONT}" font-size="380" font-weight="700" fill="{COUNT_GREEN}" text-anchor="middle" dominant-baseline="central">{text}</text></svg>"##,
+        cx = vbw / 2,
     );
     let opt = resvg::usvg::Options {
-        fontdb: badge_fontdb(),
-        font_family: BADGE_FONT.to_string(),
+        fontdb: count_fontdb(),
+        font_family: COUNT_FONT.to_string(),
         ..Default::default()
     };
-    let badge = render_icon_pixmap(&badge_svg, &opt);
-    base.as_mut().draw_pixmap(
+    let num_tree = resvg::usvg::Tree::from_str(&num_svg, &opt).expect("parse number svg");
+    let mut num_pm = resvg::tiny_skia::Pixmap::new(num_w, h).expect("alloc number pixmap");
+    let scale = h as f32 / 512.0;
+    resvg::render(
+        &num_tree,
+        resvg::tiny_skia::Transform::from_scale(scale, scale),
+        &mut num_pm.as_mut(),
+    );
+
+    // Compose [logo][gap][number] on one wide transparent canvas; tray-icon
+    // scales it to menu-bar height keeping the aspect ratio.
+    let gap: u32 = 4;
+    let total_w = logo.width() + gap + num_w;
+    let mut canvas = resvg::tiny_skia::Pixmap::new(total_w, h).expect("alloc tray canvas");
+    let paint = resvg::tiny_skia::PixmapPaint::default();
+    let identity = resvg::tiny_skia::Transform::identity();
+    canvas
+        .as_mut()
+        .draw_pixmap(0, 0, logo.as_ref(), &paint, identity, None);
+    canvas.as_mut().draw_pixmap(
+        (logo.width() + gap) as i32,
         0,
-        0,
-        badge.as_ref(),
-        &resvg::tiny_skia::PixmapPaint::default(),
-        resvg::tiny_skia::Transform::identity(),
+        num_pm.as_ref(),
+        &paint,
+        identity,
         None,
     );
-    pixmap_to_icon(base)
+    pixmap_to_icon(canvas)
 }
 
 fn main() -> iced::Result {
@@ -3748,10 +3769,13 @@ mod tests {
     }
 
     #[test]
-    fn badge_font_size_shrinks_as_digits_grow() {
-        assert_eq!(badge_font_size(1), badge_font_size(9));
-        assert!(badge_font_size(1) > badge_font_size(10));
-        assert!(badge_font_size(10) > badge_font_size(100));
-        assert_eq!(badge_font_size(10), badge_font_size(99));
+    fn count_viewbox_width_grows_with_digits() {
+        assert!(count_viewbox_width(2) > count_viewbox_width(1));
+        assert!(count_viewbox_width(3) > count_viewbox_width(2));
+        // Linear: each extra digit adds the same width.
+        assert_eq!(
+            count_viewbox_width(2) - count_viewbox_width(1),
+            count_viewbox_width(3) - count_viewbox_width(2),
+        );
     }
 }
