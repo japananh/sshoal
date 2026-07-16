@@ -3665,11 +3665,11 @@ fn count_fontdb() -> std::sync::Arc<resvg::usvg::fontdb::Database> {
     .clone()
 }
 
-/// The count as a large green number SVG (drawn big in a 512×256 box; the caller
-/// crops it tight so it fills the icon height).
-fn num_svg(count: usize) -> String {
+/// One green text line as an SVG (drawn big in an 800×256 box; the caller crops
+/// it tight so it fills its share of the icon height).
+fn text_svg(s: &str, size: u32, weight: u32) -> String {
     format!(
-        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 256"><text x="256" y="198" font-family="{COUNT_FONT}" font-size="210" font-weight="700" fill="{COUNT_GREEN}" text-anchor="middle">{count}</text></svg>"##
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 256"><text x="400" y="198" font-family="{COUNT_FONT}" font-size="{size}" font-weight="{weight}" fill="{COUNT_GREEN}" text-anchor="middle">{s}</text></svg>"##
     )
 }
 
@@ -3735,40 +3735,64 @@ fn blit(
     );
 }
 
-/// The tray icon when tunnels are connected: a large green "<count> ✓" (count +
-/// ✓ ring) on ONE line, cropped tight so it fills the icon height and stays
-/// readable at menu-bar size. `count == 0` → the plain (colourful) logo. Green
-/// reads on both light and dark menu bars, like the logo.
+/// The tray icon: two green lines — a small "sshoal" label over a big
+/// "<count> ✓" (count + ✓ ring; the ring only when ≥1 tunnel is connected). The
+/// number dominates and the canvas is cropped tight, so it stays as readable as
+/// possible at menu-bar height. Green reads on both light and dark menu bars.
 fn make_icon_with_count(count: usize) -> Icon {
-    if count == 0 {
-        return make_icon();
-    }
-    // Big green number, cropped tight to its glyphs.
-    let num = render_svg(&num_svg(count), 512, 256);
+    // Line 1: small "sshoal" label.
+    let l1 = render_svg(&text_svg("sshoal", 95, 600), 800, 256);
+    let (p0, p1, p2, p3) = content_bbox(&l1);
+    let (w1, h1) = (p2 - p0 + 1, p3 - p1 + 1);
+
+    // Line 2: big number.
+    let num = render_svg(&text_svg(&count.to_string(), 210, 700), 800, 256);
     let (b0, b1, b2, b3) = content_bbox(&num);
     let (wn, hn) = (b2 - b0 + 1, b3 - b1 + 1);
 
-    // Green ✓ ring, ~digit height.
-    let chk_px = ((hn as f32) * 1.05) as u32;
-    let chk = render_svg(&check_svg(), chk_px, chk_px);
-    let (c0, c1, c2, c3) = content_bbox(&chk);
-    let (wc, hc) = (c2 - c0 + 1, c3 - c1 + 1);
+    // Green ✓ ring beside the number, ~digit height, only when connected.
+    let check = (count > 0).then(|| {
+        let px = ((hn as f32) * 1.05) as u32;
+        let pm = render_svg(&check_svg(), px, px);
+        let bb = content_bbox(&pm);
+        (pm, bb)
+    });
+    let (wc, hc) = check
+        .as_ref()
+        .map(|(_, (c0, c1, c2, c3))| (c2 - c0 + 1, c3 - c1 + 1))
+        .unwrap_or((0, 0));
 
-    // Compose [number][gap][✓] on ONE line, canvas tight to the content height so
-    // the tray shows it as large as possible; both centred vertically.
-    let gap = ((hn as f32) * 0.28) as u32;
-    let hh = hn.max(hc);
-    let ww = wn + gap + wc;
+    let gap_x = ((hn as f32) * 0.28) as u32;
+    let line2_w = wn + if wc > 0 { gap_x + wc } else { 0 };
+    let line2_h = hn.max(hc);
+    let gap_y = ((hn as f32) * 0.12) as u32;
+    let ww = w1.max(line2_w);
+    let hh = h1 + gap_y + line2_h;
+
     let mut canvas = resvg::tiny_skia::Pixmap::new(ww, hh).expect("alloc tray canvas");
-    blit(&mut canvas, &num, b0, b1, 0, ((hh - hn) / 2) as i32);
+    // Line 1, centred at the top.
+    blit(&mut canvas, &l1, p0, p1, ((ww - w1) / 2) as i32, 0);
+    // Line 2: [number][gap][✓] group, centred, below line 1.
+    let gx = (ww - line2_w) / 2;
+    let y2 = h1 + gap_y;
     blit(
         &mut canvas,
-        &chk,
-        c0,
-        c1,
-        (wn + gap) as i32,
-        ((hh - hc) / 2) as i32,
+        &num,
+        b0,
+        b1,
+        gx as i32,
+        (y2 + (line2_h - hn) / 2) as i32,
     );
+    if let Some((pm, (c0, c1, ..))) = &check {
+        blit(
+            &mut canvas,
+            pm,
+            *c0,
+            *c1,
+            (gx + wn + gap_x) as i32,
+            (y2 + (line2_h - hc) / 2) as i32,
+        );
+    }
     pixmap_to_icon(canvas)
 }
 
