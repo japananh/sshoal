@@ -3605,12 +3605,15 @@ fn build_tray() -> (TrayIcon, MenuIds) {
 
 const ICON_SVG: &str = include_str!("../assets/icon.svg");
 
-/// Render an icon-sized SVG to a 64px premultiplied pixmap.
+/// Tray icon render height in px. Higher than the ~18pt display size so the
+/// downscale the OS does stays crisp (the number especially).
+const TRAY_PX: u32 = 128;
+
+/// Render a square icon-sized SVG (512 viewBox) to a `TRAY_PX` premultiplied pixmap.
 fn render_icon_pixmap(svg: &str, opt: &resvg::usvg::Options) -> resvg::tiny_skia::Pixmap {
-    let size: u32 = 64;
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(TRAY_PX, TRAY_PX).expect("alloc pixmap");
     let tree = resvg::usvg::Tree::from_str(svg, opt).expect("parse icon svg");
-    let mut pixmap = resvg::tiny_skia::Pixmap::new(size, size).expect("alloc pixmap");
-    let scale = size as f32 / 512.0;
+    let scale = TRAY_PX as f32 / 512.0;
     resvg::render(
         &tree,
         resvg::tiny_skia::Transform::from_scale(scale, scale),
@@ -3669,6 +3672,22 @@ fn count_viewbox_width(digits: usize) -> u32 {
     230 * digits as u32 + 60
 }
 
+/// The rows (top, bottom) of `pm` that contain any non-transparent pixel — used
+/// to vertically centre the glyphs precisely (usvg's `dominant-baseline` can't
+/// be relied on to centre them).
+fn glyph_v_bounds(pm: &resvg::tiny_skia::Pixmap) -> Option<(u32, u32)> {
+    let (w, h) = (pm.width(), pm.height());
+    let data = pm.data();
+    let (mut top, mut bottom) = (None, 0u32);
+    for y in 0..h {
+        if (0..w).any(|x| data[((y * w + x) * 4 + 3) as usize] > 0) {
+            top.get_or_insert(y);
+            bottom = y;
+        }
+    }
+    top.map(|t| (t, bottom))
+}
+
 /// The tray icon with the connected count as green text to the RIGHT of the
 /// logo, vertically centred. `count == 0` → the plain (square) logo. Rendering
 /// the number beside the logo (rather than as a small corner badge) lets the
@@ -3683,9 +3702,10 @@ fn make_icon_with_count(count: usize) -> Icon {
     let vbw = count_viewbox_width(text.len());
     let num_w = (h * vbw / 512).max(1);
 
-    // The number, vertically centred in its own (tall) box, at ~74% height.
+    // Semibold + aimonitor's green, matching its menu-bar number. `y`/baseline
+    // is a first guess; we re-centre precisely below via the glyph bounds.
     let num_svg = format!(
-        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {vbw} 512"><text x="{cx}" y="256" font-family="{COUNT_FONT}" font-size="380" font-weight="700" fill="{COUNT_GREEN}" text-anchor="middle" dominant-baseline="central">{text}</text></svg>"##,
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {vbw} 512"><text x="{cx}" y="256" font-family="{COUNT_FONT}" font-size="360" font-weight="600" fill="{COUNT_GREEN}" text-anchor="middle" dominant-baseline="central">{text}</text></svg>"##,
         cx = vbw / 2,
     );
     let opt = resvg::usvg::Options {
@@ -3701,6 +3721,11 @@ fn make_icon_with_count(count: usize) -> Icon {
         resvg::tiny_skia::Transform::from_scale(scale, scale),
         &mut num_pm.as_mut(),
     );
+    // Shift the number so its glyphs sit at the icon's exact vertical centre.
+    let off_y = match glyph_v_bounds(&num_pm) {
+        Some((t, b)) => h as i32 / 2 - ((t + b) / 2) as i32,
+        None => 0,
+    };
 
     // Compose [logo][gap][number] on one wide transparent canvas; tray-icon
     // scales it to menu-bar height keeping the aspect ratio.
@@ -3714,7 +3739,7 @@ fn make_icon_with_count(count: usize) -> Icon {
         .draw_pixmap(0, 0, logo.as_ref(), &paint, identity, None);
     canvas.as_mut().draw_pixmap(
         (logo.width() + gap) as i32,
-        0,
+        off_y,
         num_pm.as_ref(),
         &paint,
         identity,
