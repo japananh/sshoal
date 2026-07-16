@@ -1343,7 +1343,9 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             let cfg = AppConfig {
                 ssh_configs: app.ssh_configs.clone(),
                 tunnels: app.rows.iter().map(|r| r.tunnel.clone()).collect(),
-                settings: Settings::default(),
+                // Live settings so the export carries `open_at_login` (the only
+                // setting `PortableConfig::build` reads).
+                settings: app.settings.clone(),
             };
             let portable = PortableConfig::build(&cfg, None, false);
             app.backup = None;
@@ -1721,6 +1723,7 @@ fn do_export(
 /// new ssh configs + tunnels (skipping conflicts, so running tunnels and existing
 /// entries are untouched), reconcile collapse state, and persist.
 fn apply_import(app: &mut App, mut portable: PortableConfig) -> Task<Message> {
+    let restore_login = portable.open_at_login;
     let wrote = cli::materialize_keys(&mut portable, false);
     for c in portable.ssh_configs_plain() {
         if !app.ssh_configs.iter().any(|x| x.name == c.name) {
@@ -1741,6 +1744,16 @@ fn apply_import(app: &mut App, mut portable: PortableConfig) -> Task<Message> {
         });
         added += 1;
     }
+    // Restore the "open at login" preference from the backup (additive — never
+    // turns it off). Register the OS login item so it takes effect and survives
+    // the launch-time reconciliation.
+    let login_note =
+        if restore_login && !app.settings.open_at_login && autostart::set_enabled(true).is_ok() {
+            app.settings.open_at_login = true;
+            ", enabled open-at-login"
+        } else {
+            ""
+        };
     reconcile_collapsed(app);
     persist_app(app);
     let keys = if wrote > 0 {
@@ -1748,7 +1761,7 @@ fn apply_import(app: &mut App, mut portable: PortableConfig) -> Task<Message> {
     } else {
         String::new()
     };
-    app.backup_status = Some(format!("Imported {added} new tunnel(s){keys}"));
+    app.backup_status = Some(format!("Imported {added} new tunnel(s){keys}{login_note}"));
     Task::none()
 }
 
@@ -2386,30 +2399,34 @@ fn prefs_view(app: &App) -> Element<'_, Message> {
     ]
     .spacing(10);
 
-    // No right-only inset here (that's the tunnel list's trick to clear its
-    // scrollbar): the cards should sit with equal left/right margins from the
-    // window, governed solely by the symmetric outer padding below.
+    // Inset the cards from the right so the thin overlay scrollbar sits in a
+    // gutter clear of them (same trick as the tunnel list); the slim outer right
+    // padding below keeps the scrollbar close to the window edge.
     let body = scrollable(
-        column![
-            pref_section("General", general),
-            pref_section("Updates", updates),
-            pref_section("Backup", backup),
-            pref_section("About", about),
-        ]
-        .spacing(18),
+        container(
+            column![
+                pref_section("General", general),
+                pref_section("Updates", updates),
+                pref_section("Backup", backup),
+                pref_section("About", about),
+            ]
+            .spacing(18),
+        )
+        .padding(pad_r(16.0)),
     )
     .direction(thin_scrollbar())
     .style(scroll_style)
     .height(Length::Fill);
 
-    // A small muted footer pinning the running version to the bottom of the
-    // window, so it's visible at a glance without scrolling into the About card.
-    let footer = caption(format!("sshoal v{VERSION}"));
-
     // Same white backdrop as the main screen — sections are set apart by the
     // white cards' border + soft shadow, not by a different screen colour.
-    container(column![header, body, footer].spacing(12))
-        .padding(14)
+    container(column![header, body].spacing(12))
+        .padding(iced::Padding {
+            top: 14.0,
+            right: 2.0,
+            bottom: 14.0,
+            left: 14.0,
+        })
         .into()
 }
 
