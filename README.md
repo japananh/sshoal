@@ -15,10 +15,11 @@ macOS (Tahoe+) · Ubuntu (22.04+)
 ## Features
 
 - 🔌 **Auto-reconnecting tunnels** with live health — a backoff supervisor keeps each one up and surfaces failures inline.
+- 🚀 **Open at login** — optionally relaunch sshoal when you log in (Preferences → General), so your tunnels come back after a reboot.
 - 🗂️ **Tree view** by `path` (ordered dev → staging → prod); filter by name, folder, or port.
 - ✅ **Multi-select & bulk** Connect / Disconnect / Delete; open a terminal to any tunnel's host.
 - 🔑 **In-app SSH configs**; import hosts from `~/.ssh/config` and tunnels from `opentunnels.sh` files.
-- 💾 **Portable config** — one YAML file; encrypted export/import via [`age`](https://github.com/FiloSottile/age).
+- 💾 **Portable config** — one YAML file; passphrase-encrypted export/import (Argon2id + XChaCha20-Poly1305), optionally bundling the referenced private keys.
 - 🔄 **Update check** — pings GitHub Releases on launch (opt-out in Preferences) and shows a banner; never auto-installs.
 - 🔒 **Local-only** — no account, no telemetry; shells out to your system `ssh` (`~/.ssh/config`, ProxyJump, agent all work).
 
