@@ -12,6 +12,8 @@
 
 mod cli;
 mod logging;
+#[cfg(target_os = "macos")]
+mod menubar;
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -371,6 +373,9 @@ struct App {
     /// Set when toggling "Open at login" failed (shown under the toggle); the
     /// toggle itself stays put so the UI reflects the real OS state.
     open_at_login_error: Option<String>,
+    /// Last connected-tunnel count reflected in the tray tooltip, so we only
+    /// update the tray when it actually changes.
+    tray_count: Option<usize>,
 }
 
 impl App {
@@ -506,6 +511,7 @@ fn boot(runtime: Arc<tokio::runtime::Runtime>) -> (App, Task<Message>) {
         backup: None,
         backup_status: None,
         open_at_login_error: None,
+        tray_count: None,
     };
 
     // Reconcile the persisted "Open at login" toggle with the real OS login
@@ -579,6 +585,25 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 app.tray = Some(tray);
                 app.menu = Some(menu);
                 app._hotkey = register_hotkey();
+            }
+
+            // Show the connected (Up) count. On macOS, draw a native 2-line
+            // title ("sshoal" / "<n> ●") straight on the status-bar button —
+            // bigger + crisper than the 18pt-capped image, no fork. Fall back to
+            // the image if the button can't be reached (and on Linux).
+            let connected = connected_count(app.rows.iter().map(|r| r.status));
+            if app.tray_count != Some(connected) {
+                app.tray_count = Some(connected);
+                if let Some(tray) = &app.tray {
+                    #[cfg(target_os = "macos")]
+                    let native = menubar::set_count(connected);
+                    #[cfg(not(target_os = "macos"))]
+                    let native = false;
+                    if !native {
+                        let _ = tray.set_icon(Some(make_icon_with_count(connected)));
+                    }
+                    let _ = tray.set_tooltip(Some(tray_tooltip(connected)));
+                }
             }
 
             let ids = app.menu.as_ref().map(|m| {
@@ -3538,6 +3563,24 @@ fn open_window_settings() -> window::Settings {
     }
 }
 
+/// How many tunnels are actively connected (state `Up`).
+fn connected_count(statuses: impl IntoIterator<Item = TunnelState>) -> usize {
+    statuses
+        .into_iter()
+        .filter(|s| *s == TunnelState::Up)
+        .count()
+}
+
+/// The tray tooltip for a connected-tunnel count — the exact total (no "9+"
+/// cap), shown on hover on both macOS and Linux.
+fn tray_tooltip(count: usize) -> String {
+    match count {
+        0 => "sshoal — no tunnels connected".to_string(),
+        1 => "sshoal — 1 tunnel connected".to_string(),
+        n => format!("sshoal — {n} tunnels connected"),
+    }
+}
+
 fn build_tray() -> (TrayIcon, MenuIds) {
     let connect_all = MenuItem::new("Connect all", true, None);
     let open = MenuItem::new("Open sshoal", true, None);
@@ -3569,22 +3612,28 @@ fn build_tray() -> (TrayIcon, MenuIds) {
     }
 }
 
-/// Render the bundled SVG logo to an RGBA tray icon.
-fn make_icon() -> Icon {
-    const SVG: &str = include_str!("../assets/icon.svg");
-    let size: u32 = 64;
+const ICON_SVG: &str = include_str!("../assets/icon.svg");
 
-    let tree =
-        resvg::usvg::Tree::from_str(SVG, &resvg::usvg::Options::default()).expect("parse icon svg");
-    let mut pixmap = resvg::tiny_skia::Pixmap::new(size, size).expect("alloc pixmap");
-    let scale = size as f32 / 512.0;
+/// Tray icon render height in px. Higher than the ~18pt display size so the
+/// downscale the OS does stays crisp (the number especially).
+const TRAY_PX: u32 = 128;
+
+/// Render a square icon-sized SVG (512 viewBox) to a `TRAY_PX` premultiplied pixmap.
+fn render_icon_pixmap(svg: &str, opt: &resvg::usvg::Options) -> resvg::tiny_skia::Pixmap {
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(TRAY_PX, TRAY_PX).expect("alloc pixmap");
+    let tree = resvg::usvg::Tree::from_str(svg, opt).expect("parse icon svg");
+    let scale = TRAY_PX as f32 / 512.0;
     resvg::render(
         &tree,
         resvg::tiny_skia::Transform::from_scale(scale, scale),
         &mut pixmap.as_mut(),
     );
+    pixmap
+}
 
-    // tiny-skia stores premultiplied alpha; tray-icon wants straight RGBA.
+/// A premultiplied pixmap → a straight-RGBA tray icon (tray-icon wants straight).
+fn pixmap_to_icon(pixmap: resvg::tiny_skia::Pixmap) -> Icon {
+    let (w, h) = (pixmap.width(), pixmap.height());
     let mut rgba = pixmap.take();
     for px in rgba.chunks_exact_mut(4) {
         let a = px[3] as u32;
@@ -3594,7 +3643,168 @@ fn make_icon() -> Icon {
             px[2] = (px[2] as u32 * 255 / a) as u8;
         }
     }
-    Icon::from_rgba(rgba, size, size).expect("valid rgba icon")
+    Icon::from_rgba(rgba, w, h).expect("valid rgba icon")
+}
+
+/// Render the bundled SVG logo to an RGBA tray icon.
+fn make_icon() -> Icon {
+    pixmap_to_icon(render_icon_pixmap(
+        ICON_SVG,
+        &resvg::usvg::Options::default(),
+    ))
+}
+
+/// A sans font reliably present on each platform, for the tray text.
+#[cfg(target_os = "macos")]
+const COUNT_FONT: &str = "Helvetica";
+#[cfg(not(target_os = "macos"))]
+const COUNT_FONT: &str = "DejaVu Sans";
+
+/// aimonitor's "safe/green" (its dark-appearance variant), for the connected
+/// dot. Text is white; tuned for a dark menu bar.
+const COUNT_GREEN: &str = "#75f294";
+
+/// System-font database for the tray text, loaded once (it's slow).
+fn count_fontdb() -> std::sync::Arc<resvg::usvg::fontdb::Database> {
+    use std::sync::{Arc, OnceLock};
+    static DB: OnceLock<Arc<resvg::usvg::fontdb::Database>> = OnceLock::new();
+    DB.get_or_init(|| {
+        let mut db = resvg::usvg::fontdb::Database::new();
+        db.load_system_fonts();
+        Arc::new(db)
+    })
+    .clone()
+}
+
+/// One green text line as an SVG (drawn big in an 800×256 box; the caller crops
+/// it tight so it fills its share of the icon height).
+fn text_svg(s: &str, size: u32, weight: u32) -> String {
+    format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 256"><text x="400" y="198" font-family="{COUNT_FONT}" font-size="{size}" font-weight="{weight}" fill="#ffffff" text-anchor="middle">{s}</text></svg>"##
+    )
+}
+
+/// A solid green filled circle (dot).
+fn dot_svg() -> String {
+    format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><circle cx="50" cy="50" r="46" fill="{COUNT_GREEN}"/></svg>"##
+    )
+}
+
+/// Render an SVG into a `w`x`h` pixmap, scaling its viewBox to fill.
+fn render_svg(svg: &str, w: u32, h: u32) -> resvg::tiny_skia::Pixmap {
+    let opt = resvg::usvg::Options {
+        fontdb: count_fontdb(),
+        font_family: COUNT_FONT.to_string(),
+        ..Default::default()
+    };
+    let tree = resvg::usvg::Tree::from_str(svg, &opt).expect("parse svg");
+    let ts = tree.size();
+    let mut pm = resvg::tiny_skia::Pixmap::new(w, h).expect("alloc pixmap");
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::from_scale(w as f32 / ts.width(), h as f32 / ts.height()),
+        &mut pm.as_mut(),
+    );
+    pm
+}
+
+/// Content bounds (x0, y0, x1, y1 inclusive) of non-transparent pixels.
+fn content_bbox(pm: &resvg::tiny_skia::Pixmap) -> (u32, u32, u32, u32) {
+    let (w, h) = (pm.width(), pm.height());
+    let d = pm.data();
+    let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0u32, 0u32);
+    for y in 0..h {
+        for x in 0..w {
+            if d[((y * w + x) * 4 + 3) as usize] > 0 {
+                x0 = x0.min(x);
+                y0 = y0.min(y);
+                x1 = x1.max(x);
+                y1 = y1.max(y);
+            }
+        }
+    }
+    (x0, y0, x1, y1)
+}
+
+/// Blit `src`'s content so its content-top-left lands at (tx, ty) on `canvas`.
+fn blit(
+    canvas: &mut resvg::tiny_skia::Pixmap,
+    src: &resvg::tiny_skia::Pixmap,
+    bx: u32,
+    by: u32,
+    tx: i32,
+    ty: i32,
+) {
+    canvas.as_mut().draw_pixmap(
+        tx - bx as i32,
+        ty - by as i32,
+        src.as_ref(),
+        &resvg::tiny_skia::PixmapPaint::default(),
+        resvg::tiny_skia::Transform::identity(),
+        None,
+    );
+}
+
+/// The tray icon: two green lines — a small "sshoal" label over a big
+/// "<count> ✓" (count + ✓ ring; the ring only when ≥1 tunnel is connected). The
+/// number dominates and the canvas is cropped tight, so it stays as readable as
+/// possible at menu-bar height. Green reads on both light and dark menu bars.
+fn make_icon_with_count(count: usize) -> Icon {
+    // Line 1: the "sshoal" label (regular weight).
+    let l1 = render_svg(&text_svg("sshoal", 150, 400), 800, 256);
+    let (p0, p1, p2, p3) = content_bbox(&l1);
+    let (w1, h1) = (p2 - p0 + 1, p3 - p1 + 1);
+
+    // Line 2: big number.
+    let num = render_svg(&text_svg(&count.to_string(), 210, 700), 800, 256);
+    let (b0, b1, b2, b3) = content_bbox(&num);
+    let (wn, hn) = (b2 - b0 + 1, b3 - b1 + 1);
+
+    // Solid green dot beside the number (~0.7× digit height), only when connected.
+    let dot = (count > 0).then(|| {
+        let px = ((hn as f32) * 0.7) as u32;
+        let pm = render_svg(&dot_svg(), px, px);
+        let bb = content_bbox(&pm);
+        (pm, bb)
+    });
+    let (wc, hc) = dot
+        .as_ref()
+        .map(|(_, (c0, c1, c2, c3))| (c2 - c0 + 1, c3 - c1 + 1))
+        .unwrap_or((0, 0));
+
+    let gap_x = ((hn as f32) * 0.28) as u32;
+    let line2_w = wn + if wc > 0 { gap_x + wc } else { 0 };
+    let line2_h = hn.max(hc);
+    let gap_y = ((hn as f32) * 0.12) as u32 + 6; // ≈ +1px at menu-bar scale
+    let ww = w1.max(line2_w);
+    let hh = h1 + gap_y + line2_h;
+
+    let mut canvas = resvg::tiny_skia::Pixmap::new(ww, hh).expect("alloc tray canvas");
+    // Line 1, centred at the top.
+    blit(&mut canvas, &l1, p0, p1, ((ww - w1) / 2) as i32, 0);
+    // Line 2: [number][gap][✓] group, centred, below line 1.
+    let gx = (ww - line2_w) / 2;
+    let y2 = h1 + gap_y;
+    blit(
+        &mut canvas,
+        &num,
+        b0,
+        b1,
+        gx as i32,
+        (y2 + (line2_h - hn) / 2) as i32,
+    );
+    if let Some((pm, (c0, c1, ..))) = &dot {
+        blit(
+            &mut canvas,
+            pm,
+            *c0,
+            *c1,
+            (gx + wn + gap_x) as i32,
+            (y2 + (line2_h - hc) / 2) as i32,
+        );
+    }
+    pixmap_to_icon(canvas)
 }
 
 fn main() -> iced::Result {
@@ -3615,4 +3825,30 @@ fn main() -> iced::Result {
         .theme(|_app: &App, _id| Theme::Light)
         .title(|_app: &App, _id| String::from("sshoal"))
         .run()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sshoal_core::TunnelState::{Connecting, Failed, Idle, Reconnecting, Up};
+
+    #[test]
+    fn connected_count_counts_only_up() {
+        assert_eq!(connected_count([]), 0);
+        assert_eq!(connected_count([Idle, Failed, Connecting, Reconnecting]), 0);
+        assert_eq!(
+            connected_count([Up, Idle, Up, Connecting, Reconnecting, Failed, Up]),
+            3
+        );
+    }
+
+    #[test]
+    fn tray_tooltip_shows_exact_total_without_a_cap() {
+        assert_eq!(tray_tooltip(0), "sshoal — no tunnels connected");
+        assert_eq!(tray_tooltip(1), "sshoal — 1 tunnel connected");
+        assert_eq!(tray_tooltip(5), "sshoal — 5 tunnels connected");
+        // No "9+"-style cap — a large count shows the real number.
+        assert_eq!(tray_tooltip(100), "sshoal — 100 tunnels connected");
+        assert!(!tray_tooltip(100).contains('+'));
+    }
 }

@@ -34,3 +34,30 @@ resvg = "0.47.0"
 global-hotkey = "0.8.0"
 # Native open/save file dialogs for Export… / Import… in Preferences.
 rfd = "0.15"
+
+# macOS only: reach the tray's NSStatusBarButton to draw a native 2-line title
+# (not capped at 18pt like the tray-icon image). objc2 versions match tray-icon.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = [
+    "NSString",
+    "NSAttributedString",
+    "NSArray",
+    "NSValue",
+] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSApplication",
+    "NSResponder",
+    "NSView",
+    "NSControl",
+    "NSButton",
+    "NSCell",
+    "NSStatusBar",
+    "NSStatusBarButton",
+    "NSWindow",
+    "NSFont",
+    "NSColor",
+    "NSParagraphStyle",
+    "NSText",
+    "NSAttributedString",
+] }
