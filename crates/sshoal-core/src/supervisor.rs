@@ -433,4 +433,39 @@ mod tests {
 
         sup.stop().await;
     }
+
+    #[test]
+    fn backoff_default_values() {
+        let b = Backoff::default();
+        assert_eq!(b.base, Duration::from_millis(500));
+        assert_eq!(b.max, Duration::from_secs(30));
+        assert_eq!(b.stable_after, Duration::from_secs(5));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn last_error_is_set_on_connect_failure() {
+        // A transport whose connects keep failing.
+        let transport = FakeTransport::new(1000);
+        let sup = TunnelSupervisor::spawn(
+            transport.clone(),
+            tunnel(),
+            ssh(),
+            Backoff::new(Duration::from_millis(10), Duration::from_millis(100)),
+        );
+        let mut states = sup.subscribe();
+        wait_state(&mut states, TunnelState::Failed).await;
+        assert!(sup.last_error().is_some());
+        sup.stop().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancel_winds_the_task_down() {
+        let transport = FakeTransport::new(0);
+        let sup = TunnelSupervisor::spawn(transport.clone(), tunnel(), ssh(), Backoff::default());
+        let mut states = sup.subscribe();
+        wait_state(&mut states, TunnelState::Up).await;
+        // Fire-and-forget cancel (no await); the task tears down and goes Idle.
+        sup.cancel();
+        wait_state(&mut states, TunnelState::Idle).await;
+    }
 }

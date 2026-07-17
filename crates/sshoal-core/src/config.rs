@@ -510,4 +510,25 @@ mod tests {
         assert_eq!(base.tunnels[0].local_port, 59999); // replaced
         assert_eq!(base.ssh_configs[0].host, "9.9.9.9");
     }
+
+    #[test]
+    fn defaults_fill_omitted_fields() {
+        // `port` omitted on the ssh config, and `settings` an empty map so
+        // `auto_update_enabled` is absent — exercises the serde default helpers.
+        let yaml = "ssh_configs:\n  - name: h\n    host: example.com\ntunnels: []\nsettings: {}\n";
+        let cfg = AppConfig::from_yaml(yaml).unwrap();
+        assert_eq!(cfg.ssh_configs[0].port, 22);
+        assert!(cfg.settings.auto_update_enabled);
+    }
+
+    #[test]
+    fn save_creates_dirs_and_load_roundtrips() {
+        let dir = std::env::temp_dir().join(format!("sshoal-cfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("nested/servers.yaml"); // nested → exercises create_dir_all
+        let cfg = sample();
+        cfg.save(&path).unwrap();
+        assert_eq!(AppConfig::load(&path).unwrap(), cfg);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

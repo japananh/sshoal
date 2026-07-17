@@ -279,4 +279,69 @@ Host *
         assert_eq!(slugify("App-api"), "app-api");
         assert_eq!(slugify("  weird/name! "), "weird-name");
     }
+
+    #[test]
+    fn ssh_configs_for_resolves_hosts_dedups_and_falls_back() {
+        let mut hosts = HashMap::new();
+        hosts.insert(
+            "known".to_string(),
+            SshHost {
+                host: "10.0.0.1".into(),
+                user: Some("deploy".into()),
+                port: 2222,
+                identity_file: Some("~/.ssh/k.pem".into()),
+            },
+        );
+        let t = |ssh: &str| Tunnel {
+            path: "p".into(),
+            ssh: ssh.into(),
+            local_port: 1,
+            remote_host: "h".into(),
+            remote_port: 2,
+        };
+        // "known" appears twice (must dedup); "unknown" isn't in the map.
+        let configs = ssh_configs_for(&[t("known"), t("unknown"), t("known")], &hosts);
+        assert_eq!(configs.len(), 2);
+        let known = configs.iter().find(|c| c.name == "known").unwrap();
+        assert_eq!(known.host, "10.0.0.1");
+        assert_eq!(known.port, 2222);
+        assert_eq!(known.user.as_deref(), Some("deploy"));
+        let unknown = configs.iter().find(|c| c.name == "unknown").unwrap();
+        assert_eq!(unknown.host, "unknown"); // alias fallback
+        assert_eq!(unknown.port, 22);
+    }
+
+    #[test]
+    fn ssh_config_skips_comments_and_blank_lines() {
+        let cfg = "\
+# a comment
+
+Host only
+  HostName 1.1.1.1
+";
+        let hosts = parse_ssh_config(cfg);
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts["only"].host, "1.1.1.1");
+    }
+
+    #[test]
+    fn tunnel_file_skips_bad_lines_and_reads_bind_form() {
+        // A comment, a blank line, a spec with too few parts, a spec with a
+        // non-numeric port (both skipped), then a valid 4-part `bind:...` form.
+        let file = "\
+# comment
+
+notaspec gemx
+1.2:bad:port gemx
+bind:5000:db:5432 gemx-pro
+";
+        // "gemx" has no known suffix → split_stem falls back to (gemx, "").
+        let tunnels = parse_tunnel_file("gemx", file, None);
+        assert_eq!(tunnels.len(), 1);
+        assert_eq!(tunnels[0].ssh, "gemx-pro");
+        assert_eq!(tunnels[0].local_port, 5000);
+        assert_eq!(tunnels[0].remote_host, "db");
+        assert_eq!(tunnels[0].remote_port, 5432);
+        assert_eq!(tunnels[0].path, "gemx/5000"); // no label → port as leaf
+    }
 }

@@ -543,4 +543,12 @@ mod tests {
             ImportError::Decrypt
         ));
     }
+
+    #[test]
+    fn portable_ssh_port_defaults_to_22() {
+        // A portable file whose ssh config omits `port` → the serde default.
+        let yaml = "ssh_configs:\n  - name: h\n    host: example.com\ntunnels: []\n";
+        let p = import_portable(yaml.as_bytes(), None).unwrap();
+        assert_eq!(p.ssh_configs[0].port, 22);
+    }
 }
