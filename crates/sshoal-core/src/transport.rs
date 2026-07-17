@@ -321,4 +321,36 @@ mod tests {
         let mut child = tokio::process::Command::new("true").spawn().unwrap();
         assert!(wait_forward_ready(&mut child, port).await.is_err());
     }
+
+    #[test]
+    fn args_expand_tilde_identity_and_carry_port_and_user() {
+        let ssh = SshConfig {
+            name: "h".into(),
+            host: "example.com".into(),
+            port: 2200, // non-default → -p
+            user: Some("bob".into()),
+            identity_file: Some("~/.ssh/id".into()), // ~/ → expanded via HOME
+        };
+        let tunnel = Tunnel {
+            path: "p".into(),
+            ssh: "h".into(),
+            local_port: 8080,
+            remote_host: "10.0.0.5".into(),
+            remote_port: 80,
+        };
+        let args = build_ssh_args(&tunnel, &ssh);
+        let home = std::env::var("HOME").unwrap();
+        assert!(args.iter().any(|a| a == &format!("{home}/.ssh/id")));
+        assert!(args.iter().any(|a| a == "IdentitiesOnly=yes"));
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["-p".to_string(), "2200".to_string()])
+        );
+        assert_eq!(args.last().unwrap(), "bob@example.com");
+    }
+
+    #[tokio::test]
+    async fn free_local_port_returns_a_port() {
+        assert!(free_local_port().await.is_some_and(|p| p > 0));
+    }
 }
