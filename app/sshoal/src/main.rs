@@ -12,6 +12,8 @@
 
 mod cli;
 mod logging;
+#[cfg(target_os = "macos")]
+mod menubar;
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -585,13 +587,21 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                 app._hotkey = register_hotkey();
             }
 
-            // Show the connected (Up) count as a large green "<n> ✓" beside/over
-            // the icon; plain logo at 0. Only touch the tray when it changes.
+            // Show the connected (Up) count. On macOS, draw a native 2-line
+            // title ("sshoal" / "<n> ●") straight on the status-bar button —
+            // bigger + crisper than the 18pt-capped image, no fork. Fall back to
+            // the image if the button can't be reached (and on Linux).
             let connected = connected_count(app.rows.iter().map(|r| r.status));
             if app.tray_count != Some(connected) {
                 app.tray_count = Some(connected);
                 if let Some(tray) = &app.tray {
-                    let _ = tray.set_icon(Some(make_icon_with_count(connected)));
+                    #[cfg(target_os = "macos")]
+                    let native = menubar::set_count(connected);
+                    #[cfg(not(target_os = "macos"))]
+                    let native = false;
+                    if !native {
+                        let _ = tray.set_icon(Some(make_icon_with_count(connected)));
+                    }
                     let _ = tray.set_tooltip(Some(tray_tooltip(connected)));
                 }
             }
