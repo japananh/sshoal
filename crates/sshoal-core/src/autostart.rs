@@ -194,4 +194,13 @@ mod tests {
         assert!(is_enabled_in(&home));
         let _ = std::fs::remove_dir_all(&home);
     }
+
+    #[test]
+    fn read_only_public_helpers_are_safe_to_call() {
+        // `home()` reads $HOME and `is_enabled()` only checks whether the
+        // login-item file exists — both read-only, no side effects. (We don't
+        // call `set_enabled`, which would write to the real ~/Library.)
+        let _ = home();
+        let _ = is_enabled();
+    }
 }

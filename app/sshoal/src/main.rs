@@ -2172,16 +2172,16 @@ fn tunnels_base(app: &App) -> Element<'_, Message> {
     let header = row![
         search,
         tip(
-            icon_button(ICON_SLIDERS, 18.0, Message::OpenPrefs),
-            "Preferences"
+            icon_button(ICON_PLUS, 18.0, Message::StartAdd),
+            "Add tunnel"
         ),
         tip(
             icon_button(ICON_SETTINGS, 18.0, Message::OpenSshConfigs),
             "SSH configs"
         ),
         tip(
-            icon_button(ICON_PLUS, 18.0, Message::StartAdd),
-            "Add tunnel"
+            icon_button(ICON_SLIDERS, 18.0, Message::OpenPrefs),
+            "Preferences"
         ),
     ]
     .spacing(6)

@@ -436,4 +436,54 @@ mod tests {
         assert_eq!(info.latest, "");
         assert_eq!(info.url, RELEASES_URL);
     }
+
+    #[test]
+    fn asset_suffix_matches_platform() {
+        if cfg!(target_os = "macos") {
+            assert_eq!(asset_suffix(), ".dmg");
+        } else {
+            assert_eq!(asset_suffix(), "linux-x86_64.tar.gz");
+        }
+    }
+
+    #[test]
+    fn scratch_dir_creates_and_removes_on_drop() {
+        let path = {
+            let scratch = scratch_dir().unwrap();
+            assert!(scratch.0.exists());
+            scratch.0.clone()
+        };
+        assert!(!path.exists(), "ScratchDir should remove its dir on drop");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn running_app_bundle_errs_outside_a_bundle() {
+        // The test binary isn't inside a `.app`, so this reports an error.
+        assert!(running_app_bundle().is_err());
+    }
+
+    #[test]
+    fn semver_and_prerelease_edge_cases() {
+        // Parseable vs unparseable, both directions.
+        assert_eq!(compare_semver("0.0.1", "dev"), Ordering::Greater);
+        // A bare "v" strips to an empty (unparseable) core.
+        assert_eq!(compare_semver("v", "1.0.0"), Ordering::Less);
+        // A final release ranks above its own pre-release.
+        assert_eq!(compare_semver("1.0.0", "1.0.0-beta.1"), Ordering::Greater);
+        // Numeric pre-release identifiers rank below alphanumeric ones.
+        assert_eq!(compare_semver("1.0.0-1", "1.0.0-alpha"), Ordering::Less);
+        assert_eq!(compare_semver("1.0.0-alpha", "1.0.0-1"), Ordering::Greater);
+        // Two alphanumeric identifiers compare lexically.
+        assert_eq!(compare_semver("1.0.0-alpha", "1.0.0-beta"), Ordering::Less);
+        // A shorter pre-release sorts below a longer one sharing its prefix.
+        assert_eq!(
+            compare_semver("1.0.0-alpha", "1.0.0-alpha.1"),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_semver("1.0.0-alpha.1", "1.0.0-alpha"),
+            Ordering::Greater
+        );
+    }
 }
