@@ -43,7 +43,13 @@ pub fn set_count(count: usize) -> bool {
         return false;
     };
 
-    let text = format!("sshoal\n{count} ●");
+    // Show the green ● only when something is connected; at 0 it's just "0".
+    let has_dot = count > 0;
+    let text = if has_dot {
+        format!("sshoal\n{count} ●")
+    } else {
+        format!("sshoal\n{count}")
+    };
     let ns = NSString::from_str(&text);
     let len = ns.length();
     let attr = NSMutableAttributedString::from_nsstring(&ns);
@@ -51,7 +57,6 @@ pub fn set_count(count: usize) -> bool {
     let name_len = "sshoal\n".len(); // 7 (ASCII + \n → UTF-16 units match)
     let name = NSRange::new(0, name_len);
     let num = NSRange::new(name_len, len - name_len);
-    let dot = NSRange::new(len - 1, 1); // the "●" (1 UTF-16 unit)
 
     // aimonitor's exact recipe: per-line paragraph styles (name line 11pt, number
     // line 12pt, 1px gap) so the bigger number line isn't clamped to the name's
@@ -81,7 +86,10 @@ pub fn set_count(count: usize) -> bool {
         attr.addAttribute_value_range(NSParagraphStyleAttributeName, &para_name, name);
         attr.addAttribute_value_range(NSFontAttributeName, &num_font, num);
         attr.addAttribute_value_range(NSParagraphStyleAttributeName, &para_num, num);
-        attr.addAttribute_value_range(NSForegroundColorAttributeName, &green, dot);
+        if has_dot {
+            let dot = NSRange::new(len - 1, 1); // the "●" (1 UTF-16 unit)
+            attr.addAttribute_value_range(NSForegroundColorAttributeName, &green, dot);
+        }
         btn.setImage(None);
         btn.setAttributedTitle(&attr);
     }
