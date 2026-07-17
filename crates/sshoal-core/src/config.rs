@@ -106,6 +106,16 @@ pub struct Settings {
     /// Default off; kept in sync with the real OS login item on launch.
     #[serde(default, skip_serializing_if = "is_false")]
     pub open_at_login: bool,
+    /// Reconnect, on the next launch, the tunnels that were connected when the
+    /// app last quit ("resume where I left off"). Default off; when on,
+    /// `connected_paths` is kept in step with what's up and replayed at startup.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub resume_on_launch: bool,
+    /// Tunnel paths that were connected when the app last quit, replayed on the
+    /// next launch when `resume_on_launch` is on. Machine-local (never exported);
+    /// stale paths are pruned as tunnels come and go.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub connected_paths: Vec<String>,
 }
 
 impl Default for Settings {
@@ -115,6 +125,8 @@ impl Default for Settings {
             skipped_version: None,
             collapsed_folders: Vec::new(),
             open_at_login: false,
+            resume_on_launch: false,
+            connected_paths: Vec::new(),
         }
     }
 }
@@ -519,6 +531,27 @@ mod tests {
         let cfg = AppConfig::from_yaml(yaml).unwrap();
         assert_eq!(cfg.ssh_configs[0].port, 22);
         assert!(cfg.settings.auto_update_enabled);
+    }
+
+    #[test]
+    fn resume_fields_default_off_and_survive_a_roundtrip() {
+        // Omitted from an older config → default off / empty.
+        let cfg = AppConfig::from_yaml("tunnels: []\nsettings: {}\n").unwrap();
+        assert!(!cfg.settings.resume_on_launch);
+        assert!(cfg.settings.connected_paths.is_empty());
+
+        // Off + empty are skipped from the serialized form (no clutter).
+        let clean = AppConfig::default().to_yaml().unwrap();
+        assert!(!clean.contains("resume_on_launch"));
+        assert!(!clean.contains("connected_paths"));
+
+        // Set → persisted and read back verbatim.
+        let mut on = AppConfig::default();
+        on.settings.resume_on_launch = true;
+        on.settings.connected_paths = vec!["gc/dev/a".into(), "gc/prod/b".into()];
+        let yaml = on.to_yaml().unwrap();
+        assert!(yaml.contains("resume_on_launch: true"));
+        assert_eq!(AppConfig::from_yaml(&yaml).unwrap(), on);
     }
 
     #[test]

@@ -15,7 +15,7 @@ macOS (Tahoe+) · Ubuntu (22.04+)
 ## Features
 
 - 🔌 **Auto-reconnecting tunnels** with live health — a backoff supervisor keeps each one up and surfaces failures inline.
-- 🚀 **Open at login** — optionally relaunch sshoal when you log in (Preferences → General), so your tunnels come back after a reboot.
+- 🚀 **Open at login & resume** — optionally relaunch sshoal when you log in and reconnect the tunnels that were up when you last quit (Preferences → General), so your session is back after a reboot.
 - 🗂️ **Tree view** by `path` (ordered dev → staging → prod); filter by name, folder, or port.
 - ✅ **Multi-select & bulk** Connect / Disconnect / Delete; open a terminal to any tunnel's host.
 - 🔑 **In-app SSH configs**; import hosts from `~/.ssh/config` and tunnels from `opentunnels.sh` files.
@@ -55,7 +55,7 @@ Building on Ubuntu also needs the `-dev` packages: `libgtk-3-dev libayatana-appi
 
 - **Tray icon** — left-click toggles the window, right-click opens the menu; **⌃⌘S** summons it anywhere. Closing only hides; tunnels keep running.
 - **A row** — the toggle connects/disconnects, the terminal icon opens a shell. Click to select; ⌘/Shift-click (or ↑/↓, Shift+↑/↓) to select more; right-click for actions; **Enter** to edit.
-- **Config** lives in `~/.config/sshoal/servers.yaml`. Bring in what you have with `sshoal import-ssh --prefix gc FILE…`; back up or move a machine with `sshoal export` / `sshoal import` — or **Preferences → Backup** in the app. Exports are encrypted by default (`--plaintext` to skip); `--include-keys` also bundles the referenced private keys and restores them on import.
+- **Config** lives in `~/.config/sshoal/servers.yaml`. Bring in what you have with `sshoal import-ssh --prefix gc FILE…`; back up or move a machine with `sshoal export` / `sshoal import` — or **Preferences → Backup** in the app. Exports are encrypted by default (`--plaintext` to skip); `--include-keys` also bundles the referenced private keys and restores them on import. A backup also carries your open-at-login / resume preferences (and which tunnels were connected), so a restore brings your setup back.
 
 ## How it works
 
