@@ -45,8 +45,8 @@ fn print_usage() {
          sshoal export [--out FILE] [--all | --path PREFIX]\n  \
          \\              [--plaintext] [--strip-identity | --include-keys]\n  \
          \\                                  export tunnels + the ssh configs they use to FILE\n  \
-         \\                                  or stdout; self-contained, no settings. ENCRYPTED\n  \
-         \\                                  by default (Argon2id); --plaintext to opt out.\n  \
+         \\                                  or stdout (plus the open-at-login / resume prefs).\n  \
+         \\                                  ENCRYPTED by default (Argon2id); --plaintext to opt out.\n  \
          \\                                  --include-keys embeds private keys in the file\n  \
          sshoal import FILE [--overwrite | --skip]   merge tunnels from FILE\n  \
          \\                                  (default --skip: keep current on conflict)\n  \
@@ -289,6 +289,8 @@ fn run_import(args: &[String]) -> i32 {
         Err(e) => return fail(format!("loading config: {e}")),
     };
     let added = incoming.tunnels.len();
+    let restore_resume = incoming.resume_on_launch;
+    let restore_paths = std::mem::take(&mut incoming.connected_paths);
     // Only tunnels + ssh configs (paths) reach the config — `ssh_configs_plain`
     // drops every embedded key, so contents can never land in servers.yaml.
     current.merge(
@@ -299,6 +301,18 @@ fn run_import(args: &[String]) -> i32 {
         },
         overwrite,
     );
+    // `merge` ignores incoming settings, so restore the backup's "resume" state
+    // by hand: enable it additively and union in the connected set. The next
+    // `sshoal` launch reconnects them (boot-resume). `open_at_login` needs OS
+    // registration and isn't handled here.
+    if restore_resume {
+        current.settings.resume_on_launch = true;
+        for p in restore_paths {
+            if !current.settings.connected_paths.contains(&p) {
+                current.settings.connected_paths.push(p);
+            }
+        }
+    }
     if let Err(e) = current.save(config_path()) {
         return fail(format!("saving config: {e}"));
     }
@@ -307,8 +321,13 @@ fn run_import(args: &[String]) -> i32 {
     } else {
         format!(", wrote {written} key file(s)")
     };
+    let resume = if restore_resume {
+        ", enabled resume-on-launch"
+    } else {
+        ""
+    };
     eprintln!(
-        "imported {added} tunnel(s) into {} (now {} total){keys}",
+        "imported {added} tunnel(s) into {} (now {} total){keys}{resume}",
         config_path().display(),
         current.tunnels.len()
     );

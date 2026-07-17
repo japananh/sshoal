@@ -163,6 +163,9 @@ enum Message {
     ToggleAutoUpdate(bool),
     /// Toggle "Open at login" (register/unregister the OS login item).
     ToggleOpenAtLogin(bool),
+    /// Toggle "Resume where I left off" (reconnect on launch the tunnels that
+    /// were up when the app last quit).
+    ToggleResumeOnLaunch(bool),
     /// Run an update check now (from launch or the "Check now" button).
     CheckUpdates,
     /// Result of a check — Ok(info) or a human-readable failure.
@@ -522,6 +525,19 @@ fn boot(runtime: Arc<tokio::runtime::Runtime>) -> (App, Task<Message>) {
         persist_app(&app);
     }
 
+    // "Resume where I left off": reconnect the tunnels that were up when the app
+    // last quit. The supervisor's backoff handles any host that's unreachable
+    // right now, so a resumed tunnel simply retries instead of failing hard.
+    if app.settings.resume_on_launch {
+        let resume = resume_indices(
+            app.rows.iter().map(|r| r.tunnel.path.as_str()),
+            &app.settings.connected_paths,
+        );
+        for i in resume {
+            set_enabled(&mut app, i, true);
+        }
+    }
+
     // Show the window on launch so opening the app always surfaces it (the tray
     // icon can be hard to spot); `gain_focus` brings it to the front since we
     // run as a menu-bar accessory with no Dock icon.
@@ -575,6 +591,18 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                     && shown.elapsed() > Duration::from_secs(3)
                 {
                     row.notice = None;
+                }
+            }
+
+            // While "resume where I left off" is on, keep the saved set in step
+            // with what's up, so a relaunch restores exactly these tunnels. The
+            // enabled() set changes only on connect/disconnect, so this compares
+            // equal (no write) on virtually every tick.
+            if app.settings.resume_on_launch {
+                let live = live_connected_paths(app);
+                if live != app.settings.connected_paths {
+                    app.settings.connected_paths = live;
+                    persist_app(app);
                 }
             }
 
@@ -1204,6 +1232,18 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             }
             Task::none()
         }
+        Message::ToggleResumeOnLaunch(on) => {
+            app.settings.resume_on_launch = on;
+            // Snapshot the current connected set on opt-in (so it's captured even
+            // if the app quits before the next tick); forget it on opt-out.
+            app.settings.connected_paths = if on {
+                live_connected_paths(app)
+            } else {
+                Vec::new()
+            };
+            persist_app(app);
+            Task::none()
+        }
         Message::CheckUpdates => {
             if app.update_checking {
                 return Task::none();
@@ -1749,6 +1789,8 @@ fn do_export(
 /// entries are untouched), reconcile collapse state, and persist.
 fn apply_import(app: &mut App, mut portable: PortableConfig) -> Task<Message> {
     let restore_login = portable.open_at_login;
+    let restore_resume = portable.resume_on_launch;
+    let reconnect = std::mem::take(&mut portable.connected_paths);
     let wrote = cli::materialize_keys(&mut portable, false);
     for c in portable.ssh_configs_plain() {
         if !app.ssh_configs.iter().any(|x| x.name == c.name) {
@@ -1769,6 +1811,23 @@ fn apply_import(app: &mut App, mut portable: PortableConfig) -> Task<Message> {
         });
         added += 1;
     }
+    // Bring back the connections the backup had up (for tunnels that exist here
+    // now and aren't already connected) — a restore resumes your session, not
+    // just the tunnel list. Bounded: `reconnect` is non-empty only when the
+    // backup had resume-on-launch on.
+    if !reconnect.is_empty() {
+        let want: HashSet<&str> = reconnect.iter().map(String::as_str).collect();
+        let idxs: Vec<usize> = app
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| !r.enabled() && want.contains(r.tunnel.path.as_str()))
+            .map(|(i, _)| i)
+            .collect();
+        for i in idxs {
+            set_enabled(app, i, true);
+        }
+    }
     // Restore the "open at login" preference from the backup (additive — never
     // turns it off). Register the OS login item so it takes effect and survives
     // the launch-time reconciliation.
@@ -1779,6 +1838,18 @@ fn apply_import(app: &mut App, mut portable: PortableConfig) -> Task<Message> {
         } else {
             ""
         };
+    // Same for "resume where I left off" (additive). Then, if resume is on
+    // (just enabled or already), snapshot the now-live set so the reconnected
+    // tunnels persist immediately and survive the next launch.
+    let resume_note = if restore_resume && !app.settings.resume_on_launch {
+        app.settings.resume_on_launch = true;
+        ", enabled resume-on-launch"
+    } else {
+        ""
+    };
+    if app.settings.resume_on_launch {
+        app.settings.connected_paths = live_connected_paths(app);
+    }
     reconcile_collapsed(app);
     persist_app(app);
     let keys = if wrote > 0 {
@@ -1786,7 +1857,9 @@ fn apply_import(app: &mut App, mut portable: PortableConfig) -> Task<Message> {
     } else {
         String::new()
     };
-    app.backup_status = Some(format!("Imported {added} new tunnel(s){keys}{login_note}"));
+    app.backup_status = Some(format!(
+        "Imported {added} new tunnel(s){keys}{login_note}{resume_note}"
+    ));
     Task::none()
 }
 
@@ -1865,6 +1938,33 @@ fn rename_folder(app: &mut App) {
     info!(from = %folder_path, to = %new_folder_path, "rename folder");
     app.renaming = None;
     persist_app(app);
+}
+
+/// The paths of tunnels currently kept up (a supervisor is attached), in row
+/// order — the set persisted for "resume where I left off".
+fn live_connected_paths(app: &App) -> Vec<String> {
+    app.rows
+        .iter()
+        .filter(|r| r.enabled())
+        .map(|r| r.tunnel.path.clone())
+        .collect()
+}
+
+/// Row indices to reconnect on launch: those whose tunnel `path` is in the saved
+/// `connected` set. Order follows `paths` (row order) so the first status sync
+/// after boot just normalizes the set rather than rewriting it; a saved path
+/// with no matching tunnel is silently skipped.
+fn resume_indices<'a>(
+    paths: impl IntoIterator<Item = &'a str>,
+    connected: &[String],
+) -> Vec<usize> {
+    let want: HashSet<&str> = connected.iter().map(String::as_str).collect();
+    paths
+        .into_iter()
+        .enumerate()
+        .filter(|(_, p)| want.contains(p))
+        .map(|(i, _)| i)
+        .collect()
 }
 
 /// Spawn or tear down the supervisor for one tunnel row.
@@ -2354,10 +2454,19 @@ fn prefs_view(app: &App) -> Element<'_, Message> {
             .on_toggle(Message::ToggleOpenAtLogin),
     ]
     .align_y(iced::Alignment::Center);
+    let resume_row = row![
+        text("Resume where I left off").size(14).width(Length::Fill),
+        toggler(app.settings.resume_on_launch)
+            .size(18)
+            .on_toggle(Message::ToggleResumeOnLaunch),
+    ]
+    .align_y(iced::Alignment::Center);
     let mut general = column![
         open_login_row,
+        caption("Launch sshoal automatically when you log in."),
+        resume_row,
         caption(
-            "Launch sshoal automatically when you log in, so your tunnels reconnect after a reboot."
+            "When sshoal starts, reconnect the tunnels that were connected the last time you quit. Pair with “Open at login” to bring everything back after a reboot."
         ),
     ]
     .spacing(10);
@@ -3850,5 +3959,17 @@ mod tests {
         // No "9+"-style cap — a large count shows the real number.
         assert_eq!(tray_tooltip(100), "sshoal — 100 tunnels connected");
         assert!(!tray_tooltip(100).contains('+'));
+    }
+
+    #[test]
+    fn resume_indices_picks_saved_paths_in_row_order_and_skips_missing() {
+        let paths = ["gc/dev/a", "gc/dev/b", "gc/prod/c"];
+        // Saved set (any order) → row-order indices; a stale path is dropped.
+        let connected = vec!["gc/prod/c".into(), "gc/dev/a".into(), "gone".into()];
+        assert_eq!(resume_indices(paths, &connected), vec![0, 2]);
+        // Nothing saved → nothing to resume.
+        assert!(resume_indices(paths, &[]).is_empty());
+        // A saved path that matches no tunnel resumes nothing.
+        assert!(resume_indices(paths, &["nope".into()]).is_empty());
     }
 }

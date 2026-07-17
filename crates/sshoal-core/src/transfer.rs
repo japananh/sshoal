@@ -64,11 +64,12 @@ fn is_false(b: &bool) -> bool {
 }
 
 /// A self-contained, portable subset of a config: tunnels plus only the ssh
-/// configs they reference. Machine-specific `settings` are excluded — with one
-/// deliberate exception, `open_at_login`, so a backup restores whether sshoal
-/// relaunches at login. The rest (`collapsed_folders`, `skipped_version`,
-/// `auto_update_enabled`) stay local, and `AppConfig::merge` ignores incoming
-/// settings on import anyway.
+/// configs they reference. Most machine-specific `settings` stay local
+/// (`collapsed_folders`, `skipped_version`, `auto_update_enabled`), but a backup
+/// carries the pieces needed to bring your session back on another machine:
+/// `open_at_login`, `resume_on_launch`, and the `connected_paths` that were up.
+/// (`AppConfig::merge` ignores incoming settings, so the CLI and the in-app
+/// importer restore these fields explicitly.)
 ///
 /// This is a **distinct type** from [`AppConfig`] on purpose: embedded private
 /// keys live under [`PortableSsh::identity_files`], and the plain [`SshConfig`]
@@ -80,9 +81,18 @@ pub struct PortableConfig {
     pub ssh_configs: Vec<PortableSsh>,
     #[serde(default)]
     pub tunnels: Vec<Tunnel>,
-    /// The one carried setting: whether sshoal registers to open at login.
+    /// A carried setting: whether sshoal registers to open at login.
     #[serde(default, skip_serializing_if = "is_false")]
     pub open_at_login: bool,
+    /// A carried setting: whether sshoal reconnects the previously-connected
+    /// tunnels on launch.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub resume_on_launch: bool,
+    /// The tunnel paths that were connected when the backup was made, so a
+    /// restore can bring them back up. Only ever populated when
+    /// `resume_on_launch` is on, and filtered to the exported tunnels.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub connected_paths: Vec<String>,
 }
 
 /// An ssh config inside an export: the same fields as [`SshConfig`], plus
@@ -156,10 +166,23 @@ impl PortableConfig {
                 PortableSsh::from_ssh_config(c)
             })
             .collect();
+        // Carry the connected set, but only for tunnels this export includes —
+        // a prefix export shouldn't reference tunnels it left behind.
+        let exported: std::collections::HashSet<&str> =
+            tunnels.iter().map(|t| t.path.as_str()).collect();
+        let connected_paths = config
+            .settings
+            .connected_paths
+            .iter()
+            .filter(|p| exported.contains(p.as_str()))
+            .cloned()
+            .collect();
         Self {
             ssh_configs,
             tunnels,
             open_at_login: config.settings.open_at_login,
+            resume_on_launch: config.settings.resume_on_launch,
+            connected_paths,
         }
     }
 
@@ -253,6 +276,8 @@ pub fn import(bytes: &[u8], passphrase: Option<&str>) -> Result<AppConfig, Impor
         tunnels: p.tunnels,
         settings: crate::config::Settings {
             open_at_login: p.open_at_login,
+            resume_on_launch: p.resume_on_launch,
+            connected_paths: p.connected_paths,
             ..Default::default()
         },
     })
@@ -418,6 +443,35 @@ mod tests {
         );
         assert!(import_portable(&blob, None).unwrap().open_at_login);
         assert!(import(&blob, None).unwrap().settings.open_at_login);
+    }
+
+    #[test]
+    fn resume_config_travels_in_the_portable_file() {
+        // Off (the default) → nothing about resume in the file.
+        let off = PortableConfig::build(&full(), None, false);
+        assert!(!off.resume_on_launch && off.connected_paths.is_empty());
+        let text = String::from_utf8(export_portable(&off, None).unwrap()).unwrap();
+        assert!(!text.contains("resume_on_launch") && !text.contains("connected_paths"));
+
+        // On, with a connected set → both the preference and the set travel and
+        // are restored on import. A stray path (no matching exported tunnel) is
+        // dropped so a backup never references tunnels it doesn't carry.
+        let mut cfg = full();
+        cfg.settings.resume_on_launch = true;
+        cfg.settings.connected_paths = vec![
+            "gc/dev/db".into(),
+            "gc/prod/db".into(),
+            "not/exported".into(),
+        ];
+        let portable = PortableConfig::build(&cfg, None, false);
+        assert!(portable.resume_on_launch);
+        assert_eq!(portable.connected_paths, vec!["gc/dev/db", "gc/prod/db"]);
+        let blob = export_portable(&portable, None).unwrap();
+        let text = String::from_utf8(blob.clone()).unwrap();
+        assert!(text.contains("resume_on_launch: true") && text.contains("connected_paths"));
+        let restored = import(&blob, None).unwrap().settings;
+        assert!(restored.resume_on_launch);
+        assert_eq!(restored.connected_paths, vec!["gc/dev/db", "gc/prod/db"]);
     }
 
     #[test]
