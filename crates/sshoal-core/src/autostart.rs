@@ -98,8 +98,44 @@ fn xml_escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
+#[cfg(target_os = "macos")]
+fn xml_unescape(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+/// The executable the first `ProgramArguments` / `Exec=` entry points at, or
+/// `None` if the file is missing or unparseable. Lets the caller notice a
+/// *stale* login item — the referenced binary was moved or deleted (e.g. a dev
+/// build replaced by the installed `.app`) — and re-point it.
+fn parse_program_path(text: &str) -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    let parsed = {
+        let after = text.split_once("ProgramArguments")?.1;
+        let inner = after.split_once("<string>")?.1.split_once("</string>")?.0;
+        Some(PathBuf::from(xml_unescape(inner.trim())))
+    };
+    #[cfg(target_os = "linux")]
+    let parsed = text
+        .lines()
+        .find_map(|l| l.strip_prefix("Exec="))
+        .map(|s| PathBuf::from(s.trim()));
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let parsed = {
+        let _ = text;
+        None
+    };
+    parsed
+}
+
 fn is_enabled_in(home: &Path) -> bool {
     login_item_path_in(home).is_some_and(|p| p.exists())
+}
+
+fn registered_exe_in(home: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(login_item_path_in(home)?).ok()?;
+    parse_program_path(&text)
 }
 
 fn set_enabled_in(home: &Path, exe: &Path, on: bool) -> Result<(), AutostartError> {
@@ -139,6 +175,13 @@ fn home() -> Option<PathBuf> {
 /// Whether sshoal is currently registered to open at login.
 pub fn is_enabled() -> bool {
     home().is_some_and(|h| is_enabled_in(&h))
+}
+
+/// The executable the current login item launches, if registered. A caller can
+/// compare it against the running binary (or just check it still exists) to
+/// heal a stale entry left pointing at a moved/deleted build.
+pub fn registered_exe() -> Option<PathBuf> {
+    home().and_then(|h| registered_exe_in(&h))
 }
 
 /// Register (`on = true`) or unregister (`on = false`) sshoal from launching at
@@ -192,6 +235,27 @@ mod tests {
         // Neither Library/LaunchAgents nor .config/autostart exists yet.
         set_enabled_in(&home, Path::new("/usr/local/bin/sshoal"), true).unwrap();
         assert!(is_enabled_in(&home));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn registered_exe_reads_back_the_written_path() {
+        let home = temp_home("registered");
+        // A path with a space and an '&' exercises the plist XML (un)escaping.
+        let exe = Path::new("/Applications/My & Tools/sshoal.app/Contents/MacOS/sshoal");
+
+        assert!(registered_exe_in(&home).is_none(), "none when unregistered");
+
+        set_enabled_in(&home, exe, true).unwrap();
+        assert_eq!(
+            registered_exe_in(&home).as_deref(),
+            Some(exe),
+            "round-trips"
+        );
+
+        set_enabled_in(&home, exe, false).unwrap();
+        assert!(registered_exe_in(&home).is_none(), "none after removal");
+
         let _ = std::fs::remove_dir_all(&home);
     }
 
