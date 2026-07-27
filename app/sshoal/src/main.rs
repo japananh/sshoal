@@ -525,6 +525,18 @@ fn boot(runtime: Arc<tokio::runtime::Runtime>) -> (App, Task<Message>) {
         persist_app(&app);
     }
 
+    // Self-heal a stale login item: if it's on but points at a binary that no
+    // longer exists (e.g. a dev build that was replaced by the installed .app),
+    // re-point it at the running executable so it actually launches next login.
+    // Only when the target is *missing* — never when it's simply a different
+    // valid binary — so a one-off dev run can't hijack the installed entry.
+    if app.settings.open_at_login
+        && autostart::registered_exe().is_some_and(|exe| !exe.exists())
+        && let Err(e) = autostart::set_enabled(true)
+    {
+        tracing::warn!(error = %e, "could not refresh a stale login item");
+    }
+
     // "Resume where I left off": reconnect the tunnels that were up when the app
     // last quit. The supervisor's backoff handles any host that's unreachable
     // right now, so a resumed tunnel simply retries instead of failing hard.
@@ -3916,9 +3928,73 @@ fn make_icon_with_count(count: usize) -> Icon {
     pixmap_to_icon(canvas)
 }
 
+/// Outcome of trying to claim the single-instance lock.
+#[cfg(unix)]
+enum Instance {
+    /// We hold it — keep this file alive for the whole process.
+    Held(std::fs::File),
+    /// Another daemon already holds it → this launch should bow out.
+    Busy,
+    /// The lock couldn't be set up (no HOME, unwritable dir); proceed unguarded
+    /// rather than refuse to start.
+    Unavailable,
+}
+
+/// Claim an exclusive lock so only one tray daemon runs at a time. A second
+/// launch — the login item firing while the app is already open, a stray double
+/// click, `open`-ing it again — would otherwise bind a second tray icon,
+/// re-register the ⌃⌘S hotkey, and have two daemons fight over `servers.yaml`
+/// and local ports. `flock` releases automatically when the process exits (even
+/// on a crash), so the lock never goes stale.
+#[cfg(unix)]
+fn single_instance() -> Instance {
+    use std::os::unix::io::AsRawFd;
+    let path = config_path();
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false) // a lock file we never write to — nothing to truncate
+        .open(path.with_file_name(".instance.lock"))
+    else {
+        return Instance::Unavailable;
+    };
+    // Retry briefly on contention rather than bowing out on the first attempt:
+    // the in-app updater relaunches by spawning the new binary while this
+    // process is still exiting (and still holding the lock), so the child has to
+    // wait out the handoff. A genuine second launch just spends a few seconds
+    // waiting — invisibly, since nobody's watching that process — then gives up.
+    for attempt in 0..100 {
+        match unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } {
+            0 => return Instance::Held(file),
+            _ if std::io::Error::last_os_error().raw_os_error() == Some(libc::EWOULDBLOCK) => {
+                if attempt < 99 {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
+            // Some other flock error (unusual FS, etc.): don't block startup.
+            _ => return Instance::Unavailable,
+        }
+    }
+    Instance::Busy
+}
+
 fn main() -> iced::Result {
     cli::maybe_run();
     logging::init();
+
+    // Keep this alive for the whole run: dropping it releases the flock.
+    #[cfg(unix)]
+    let _instance = match single_instance() {
+        Instance::Busy => {
+            info!("another sshoal instance is already running; exiting");
+            return Ok(());
+        }
+        Instance::Held(file) => Some(file),
+        Instance::Unavailable => None,
+    };
 
     let runtime = Arc::new(
         tokio::runtime::Builder::new_multi_thread()

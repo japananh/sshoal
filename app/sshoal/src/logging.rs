@@ -13,6 +13,9 @@
 //! quoting.
 
 use std::fmt;
+use std::fs::{self, OpenOptions};
+use std::io::Write as _;
+use std::path::PathBuf;
 
 use tracing::field::{Field, Visit};
 use tracing::{Event, Subscriber};
@@ -21,9 +24,37 @@ use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields};
 use tracing_subscriber::registry::LookupSpan;
 
-/// Installs the global subscriber. Honors `RUST_LOG`; by default shows our own
-/// crates down to `debug` and silences chatty dependencies below `warn`.
+/// User-visible log location: rolling `sshoal.log` plus append-only `crash.log`.
+/// macOS keeps user logs under ~/Library/Logs; elsewhere sit beside the config.
+pub fn log_dir() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    #[cfg(target_os = "macos")]
+    return home.join("Library/Logs/sshoal");
+    #[cfg(not(target_os = "macos"))]
+    return home.join(".config/sshoal/logs");
+}
+
+/// Installs the global subscriber, a crash-logging panic hook, and — when there
+/// is no terminal (i.e. launched as an app) — redirects stdout/stderr to a file.
+/// Honors `RUST_LOG`; by default shows our own crates down to `debug` and
+/// silences chatty dependencies below `warn`.
 pub fn init() {
+    let dir = log_dir();
+    let _ = fs::create_dir_all(&dir);
+    install_panic_hook(dir.join("crash.log"));
+
+    // A tray daemon has no console, so its stdout/stderr — tracing output *and*
+    // the panic message on an unwind — would vanish, leaving a crash untraceable
+    // (`panic = "unwind"` writes no macOS crash report). Redirect both to a file
+    // so the next quit is diagnosable. Skip it under a terminal (a dev run) so
+    // logs still stream to the console.
+    #[cfg(unix)]
+    if unsafe { libc::isatty(1) } == 0 {
+        redirect_stdio(&dir);
+    }
+
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("warn,sshoal=debug,sshoal_core=debug"));
 
@@ -31,6 +62,71 @@ pub fn init() {
         .event_format(Logrus)
         .with_env_filter(filter)
         .init();
+}
+
+/// Append a structured record to `crash.log` on every panic — the daemon's only
+/// durable evidence of an unwind. Chains the previous hook so the default
+/// message still reaches stderr (→ the redirected log). The panic *location*
+/// (file:line) is embedded regardless of `strip`, so it pins the site even with
+/// release symbols stripped.
+fn install_panic_hook(crash_log: PathBuf) {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let now = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%:z");
+        let thread = std::thread::current()
+            .name()
+            .unwrap_or("<unnamed>")
+            .to_string();
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let message = info
+            .payload_as_str()
+            .unwrap_or("<non-string panic payload>");
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        let record = format!(
+            "\n===== PANIC {now} =====\n\
+             thread:    {thread}\n\
+             location:  {location}\n\
+             message:   {message}\n\
+             backtrace:\n{backtrace}\n"
+        );
+        if let Ok(mut f) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&crash_log)
+        {
+            let _ = f.write_all(record.as_bytes());
+        }
+        previous(info);
+    }));
+}
+
+/// Point fd 1 and 2 at `dir/sshoal.log` (append), rolling one generation past
+/// ~5 MB so it can't grow without bound. Rust's `Stdout` is line-buffered and
+/// `Stderr` unbuffered, so each log line and the panic message hit disk before
+/// an unwind exits — nothing is lost.
+#[cfg(unix)]
+fn redirect_stdio(dir: &std::path::Path) {
+    use std::os::unix::io::AsRawFd;
+    let path = dir.join("sshoal.log");
+    if fs::metadata(&path)
+        .map(|m| m.len() > 5 * 1024 * 1024)
+        .unwrap_or(false)
+    {
+        let _ = fs::rename(&path, dir.join("sshoal.log.1"));
+    }
+    let Ok(file) = OpenOptions::new().create(true).append(true).open(&path) else {
+        return;
+    };
+    // dup2 gives fds 1/2 their own descriptor onto this file; dropping `file`
+    // then closes only the original, leaving stdout/stderr valid.
+    let fd = file.as_raw_fd();
+    unsafe {
+        libc::dup2(fd, 1);
+        libc::dup2(fd, 2);
+    }
 }
 
 struct Logrus;
@@ -126,5 +222,32 @@ fn quote(s: &str) -> String {
     } else {
         let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
         format!("\"{escaped}\"")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The panic hook writing crash.log is the whole point of this module — a
+    // silent unwind leaves no other trace — so prove it actually records the
+    // message and the source location. It installs a process-global hook; other
+    // tests don't panic, so the append-only file only gets our synthetic record.
+    #[test]
+    fn panic_hook_writes_a_crash_record() {
+        let dir = std::env::temp_dir().join(format!("sshoal-crash-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("crash.log");
+        let _ = std::fs::remove_file(&log);
+
+        install_panic_hook(log.clone());
+        // Swallow the unwind so the test itself survives; the hook still fires.
+        let _ = std::panic::catch_unwind(|| panic!("synthetic-crash-marker"));
+
+        let text = std::fs::read_to_string(&log).expect("crash.log written");
+        assert!(text.contains("synthetic-crash-marker"), "message captured");
+        assert!(text.contains("logging.rs"), "location captured");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

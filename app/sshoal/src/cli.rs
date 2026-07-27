@@ -22,10 +22,13 @@ fn home() -> String {
 /// so we refuse obviously weak ones. A few random words easily clears this.
 pub(crate) const MIN_PASSPHRASE_LEN: usize = 12;
 
-/// If invoked as a CLI subcommand, run it and exit the process. Otherwise return.
+/// If invoked as a CLI subcommand, run it and exit the process. Otherwise return
+/// and let the tray app launch.
 pub fn maybe_run() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
+        // No args → launch the tray app (the normal case, incl. login-item/GUI).
+        None => {}
         Some("export") => std::process::exit(run_export(&args[2..])),
         Some("import") => std::process::exit(run_import(&args[2..])),
         Some("import-ssh") => std::process::exit(run_import_ssh(&args[2..])),
@@ -33,7 +36,21 @@ pub fn maybe_run() {
             print_usage();
             std::process::exit(0);
         }
-        _ => {}
+        Some("--version" | "-V" | "version") => {
+            println!("sshoal {}", env!("CARGO_PKG_VERSION"));
+            std::process::exit(0);
+        }
+        // A serial-number arg some macOS launch paths still prepend → ignore it
+        // and launch normally rather than treating it as a bad command.
+        Some(a) if a.starts_with("-psn_") => {}
+        // An unrecognized argument used to fall through and silently launch a
+        // second daemon (e.g. `sshoal --version` before this arm existed). Fail
+        // loudly instead.
+        Some(other) => {
+            eprintln!("sshoal: unrecognized argument '{other}'\n");
+            print_usage();
+            std::process::exit(2);
+        }
     }
 }
 
@@ -51,7 +68,8 @@ fn print_usage() {
          sshoal import FILE [--overwrite | --skip]   merge tunnels from FILE\n  \
          \\                                  (default --skip: keep current on conflict)\n  \
          sshoal import-ssh TUNNELFILE...    import opentunnels.sh tunnel files\n  \
-         \\                                  ([--prefix gc] [--dry-run] [--no-overwrite])\n\n\
+         \\                                  ([--prefix gc] [--dry-run] [--no-overwrite])\n  \
+         sshoal --version                   print the version and exit\n\n\
          Passphrase is read from $SSHOAL_PASSPHRASE, else prompted."
     );
 }
