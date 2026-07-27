@@ -24,8 +24,9 @@ use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields};
 use tracing_subscriber::registry::LookupSpan;
 
-/// User-visible log location: rolling `sshoal.log` plus append-only `crash.log`.
-/// macOS keeps user logs under ~/Library/Logs; elsewhere sit beside the config.
+/// User-visible log location: date-stamped `sshoal-<date>.log` (pruned after 30
+/// days) plus append-only `crash.log`. macOS keeps user logs under
+/// ~/Library/Logs; elsewhere they sit beside the config.
 pub fn log_dir() -> PathBuf {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -103,20 +104,16 @@ fn install_panic_hook(crash_log: PathBuf) {
     }));
 }
 
-/// Point fd 1 and 2 at `dir/sshoal.log` (append), rolling one generation past
-/// ~5 MB so it can't grow without bound. Rust's `Stdout` is line-buffered and
-/// `Stderr` unbuffered, so each log line and the panic message hit disk before
-/// an unwind exits — nothing is lost.
+/// Point fd 1 and 2 at a date-stamped `sshoal-<date>.log` (append), after
+/// pruning logs older than 30 days so the dir can't accumulate across restarts.
+/// Rust's `Stdout` is line-buffered and `Stderr` unbuffered, so each log line
+/// and the panic message hit disk before an unwind exits — nothing is lost.
 #[cfg(unix)]
 fn redirect_stdio(dir: &std::path::Path) {
     use std::os::unix::io::AsRawFd;
-    let path = dir.join("sshoal.log");
-    if fs::metadata(&path)
-        .map(|m| m.len() > 5 * 1024 * 1024)
-        .unwrap_or(false)
-    {
-        let _ = fs::rename(&path, dir.join("sshoal.log.1"));
-    }
+    prune_old_logs(dir);
+    let today = chrono::Local::now().format("%Y-%m-%d");
+    let path = dir.join(format!("sshoal-{today}.log"));
     let Ok(file) = OpenOptions::new().create(true).append(true).open(&path) else {
         return;
     };
@@ -126,6 +123,31 @@ fn redirect_stdio(dir: &std::path::Path) {
     unsafe {
         libc::dup2(fd, 1);
         libc::dup2(fd, 2);
+    }
+}
+
+/// Delete rolling `sshoal*.log` files last modified more than 30 days ago.
+/// `crash.log` is deliberately spared — crashes are rare, tiny, and worth
+/// keeping regardless of age.
+#[cfg(unix)]
+fn prune_old_logs(dir: &std::path::Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 24 * 60 * 60);
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !(name.starts_with("sshoal") && name.ends_with(".log")) {
+            continue;
+        }
+        if entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .is_ok_and(|mtime| mtime < cutoff)
+        {
+            let _ = fs::remove_file(entry.path());
+        }
     }
 }
 
@@ -247,6 +269,41 @@ mod tests {
         let text = std::fs::read_to_string(&log).expect("crash.log written");
         assert!(text.contains("synthetic-crash-marker"), "message captured");
         assert!(text.contains("logging.rs"), "location captured");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prune_removes_only_old_rolling_logs() {
+        use std::time::{Duration, SystemTime};
+        let dir = std::env::temp_dir().join(format!("sshoal-prune-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mk = |name: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, b"x").unwrap();
+            p
+        };
+        let old = mk("sshoal-2000-01-01.log");
+        let fresh = mk("sshoal-2100-01-01.log");
+        let crash = mk("crash.log");
+
+        // Backdate the old rolling log and crash.log past the 30-day cutoff.
+        let ancient = SystemTime::now() - Duration::from_secs(40 * 24 * 60 * 60);
+        for p in [&old, &crash] {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(p)
+                .unwrap()
+                .set_modified(ancient)
+                .unwrap();
+        }
+
+        prune_old_logs(&dir);
+
+        assert!(!old.exists(), "old rolling log pruned");
+        assert!(fresh.exists(), "fresh rolling log kept");
+        assert!(crash.exists(), "crash.log spared even when old");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
