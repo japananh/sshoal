@@ -55,6 +55,7 @@ Building on Ubuntu also needs the `-dev` packages: `libgtk-3-dev libayatana-appi
 
 - **Tray icon** — left-click toggles the window, right-click opens the menu; **⌃⌘S** summons it anywhere. Closing only hides; tunnels keep running.
 - **A row** — the toggle connects/disconnects, the terminal icon opens a shell. Click to select; ⌘/Shift-click (or ↑/↓, Shift+↑/↓) to select more; right-click for actions; **Enter** to edit.
+- **From the CLI** — drive the running app without opening it: `sshoal list`, `sshoal connect PATH`, `sshoal disconnect PATH`, `sshoal status PATH`. `PATH` is a full tunnel path or a folder (connects everything under it). `connect` waits until each tunnel is up and exits non-zero if any didn't (so scripts and agents can gate on it); `--no-wait` to fire-and-forget. Needs the app running (over a private per-user socket at `~/.config/sshoal/control.sock`).
 - **Config** lives in `~/.config/sshoal/servers.yaml`. Bring in what you have with `sshoal import-ssh --prefix gc FILE…`; back up or move a machine with `sshoal export` / `sshoal import` — or **Preferences → Backup** in the app. Exports are encrypted by default (`--plaintext` to skip); `--include-keys` also bundles the referenced private keys and restores them on import. A backup also carries your open-at-login / resume preferences (and which tunnels were connected), so a restore brings your setup back.
 
 ## How it works
