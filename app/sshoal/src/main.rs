@@ -65,9 +65,10 @@ use tracing::info;
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Field {
-    Path,
+    Folder,
+    Name,
     Ssh,
     LocalPort,
     RemoteHost,
@@ -108,6 +109,9 @@ enum Message {
     StartAdd,
     StartEdit(usize),
     EditField(Field, String),
+    /// A folder path picked from the Path autocomplete — fills the field and
+    /// refocuses it so you can keep typing the leaf.
+    FolderSuggestion(String),
     SaveEdit,
     CancelEdit,
     /// Run a one-shot connectivity test against the form's current values.
@@ -135,6 +139,9 @@ enum Message {
     Escape,
     Resized(f32),
     SelectDelta(i32),
+    /// Tab / Shift+Tab: move focus to the next (`true`) or previous field and,
+    /// while editing a tunnel, validate the field being left.
+    FocusAdjacentField(bool),
     ModifiersChanged(iced::keyboard::Modifiers),
     CursorMoved(iced::Point),
     CloseContextMenu,
@@ -242,17 +249,33 @@ impl TunnelRow {
 #[derive(Default)]
 struct EditForm {
     target: Option<usize>, // Some(idx) = editing existing, None = adding new
-    path: String,
+    /// Folder the tunnel lives under (may be empty → the tunnel sits at the
+    /// root). Autocompletes against existing folders.
+    folder: String,
+    /// Leaf name — required, unique within `folder`. Together they form the
+    /// tunnel's full `path` (`folder/name`, or just `name` at the root).
+    name: String,
     ssh: String,
     local_port: String,
     remote_host: String,
     remote_port: String,
-    error: Option<String>,
     /// A "Test connection" probe is in flight (disables the button).
     testing: bool,
     /// Result of the last probe: `Ok(())` = reachable, `Err(reason)` = failed.
     /// Cleared whenever a field changes (so a stale verdict never lingers).
     test_result: Option<Result<(), String>>,
+    /// Highlighted entry in the Path autocomplete dropdown (arrow-key nav), or
+    /// `None` until an arrow is pressed so Enter doesn't apply a stray one.
+    path_hint: Option<usize>,
+    /// Force every field's error to show (set on a failed Save).
+    show_errors: bool,
+    /// The field the cursor is in — set on typing/Tab/suggestion (iced gives no
+    /// focus event for clicks). Used to know which field you're *leaving*.
+    active_field: Option<Field>,
+    /// Fields you've been in and moved on from — only these show inline errors
+    /// (plus everything on a Save attempt). A field you never visit stays quiet
+    /// until Save.
+    touched: std::collections::HashSet<Field>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -781,31 +804,46 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
         Message::StartAdd => {
             app.editing = Some(EditForm {
                 ssh: "gemx-dev".to_string(),
+                active_field: Some(Field::Folder), // start in Folder so Tab works
                 ..EditForm::default()
             });
-            Task::none()
+            iced::widget::operation::focus(FOLDER_ID)
         }
         Message::StartEdit(i) => {
             app.context_menu = None;
             if let Some(row) = app.rows.get(i) {
                 let t = &row.tunnel;
+                let (folder, name) = split_folder_name(&t.path);
                 app.editing = Some(EditForm {
                     target: Some(i),
-                    path: t.path.clone(),
+                    folder,
+                    name,
                     ssh: t.ssh.clone(),
                     local_port: t.local_port.to_string(),
                     remote_host: t.remote_host.clone(),
                     remote_port: t.remote_port.to_string(),
-                    error: None,
+                    active_field: Some(Field::Folder),
                     ..EditForm::default()
                 });
+                return iced::widget::operation::focus(FOLDER_ID);
             }
             Task::none()
         }
         Message::EditField(field, value) => {
             if let Some(form) = &mut app.editing {
+                // Typing in a different field means you left the previous one.
+                if let Some(prev) = form.active_field
+                    && prev != field
+                {
+                    form.touched.insert(prev);
+                }
+                form.active_field = Some(field);
                 match field {
-                    Field::Path => form.path = value,
+                    Field::Folder => {
+                        form.folder = value;
+                        form.path_hint = None; // typing resets the dropdown highlight
+                    }
+                    Field::Name => form.name = value,
                     Field::Ssh => form.ssh = value,
                     Field::LocalPort => form.local_port = value,
                     Field::RemoteHost => form.remote_host = value,
@@ -816,6 +854,17 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             }
             Task::none()
         }
+        Message::FolderSuggestion(value) => {
+            if let Some(form) = &mut app.editing {
+                form.folder = value;
+                form.path_hint = None;
+                form.active_field = Some(Field::Folder); // still editing the folder
+                form.touched.remove(&Field::Folder);
+                form.test_result = None;
+            }
+            // Put the cursor back in the Folder field to keep going.
+            iced::widget::operation::focus(FOLDER_ID)
+        }
         Message::CancelEdit => {
             app.editing = None;
             Task::none()
@@ -825,19 +874,23 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::TestConnection => {
+            // Clicking Test always reveals every field's error (like Save) so a
+            // probe that can't run explains itself, instead of a dead button.
+            match &mut app.editing {
+                Some(form) if form.testing => return Task::none(),
+                Some(form) => form.show_errors = true,
+                None => return Task::none(),
+            }
             // Probe the in-form values without saving. Needs a valid ssh target,
-            // remote host and remote port; the local port is irrelevant (the test
-            // uses a throwaway one).
+            // remote host and remote port (local port is irrelevant — the test
+            // uses a throwaway one). If those aren't ready, the errors we just
+            // revealed already say what's missing.
             let Some((tunnel, ssh)) = form_test_target(app) else {
                 return Task::none();
             };
-            match &mut app.editing {
-                Some(form) if form.testing => return Task::none(),
-                Some(form) => {
-                    form.testing = true;
-                    form.test_result = None;
-                }
-                None => return Task::none(),
+            if let Some(form) = &mut app.editing {
+                form.testing = true;
+                form.test_result = None;
             }
             let runtime = app.runtime.clone();
             let transport = app.transport.clone();
@@ -1006,10 +1059,29 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             Task::none()
         }
         Message::ActivateSelected => {
+            // While editing, Enter applies the highlighted Folder suggestion.
+            if app.editing.is_some() {
+                let folders = folder_prefixes(app.rows.iter().map(|r| r.tunnel.path.as_str()));
+                let apply = app.editing.as_ref().and_then(|form| {
+                    let sugg = path_suggestions(&folders, &form.folder);
+                    form.path_hint
+                        .filter(|&i| i < sugg.len())
+                        .map(|i| sugg[i].clone())
+                });
+                if let Some(val) = apply {
+                    return update(app, Message::FolderSuggestion(val));
+                }
+                // Enter with no suggestion open → commit (validate) the field.
+                if let Some(form) = &mut app.editing
+                    && let Some(f) = form.active_field
+                {
+                    form.touched.insert(f);
+                }
+                return Task::none();
+            }
             // Enter on the selection: edit a single tunnel, or toggle a single
-            // folder. Ignored while a form/menu is up.
-            if app.editing.is_some()
-                || app.editing_ssh.is_some()
+            // folder. Ignored while another form/menu is up.
+            if app.editing_ssh.is_some()
                 || app.confirm_delete.is_some()
                 || app.renaming.is_some()
                 || app.managing_ssh
@@ -1026,11 +1098,53 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             }
             Task::none()
         }
+        Message::FocusAdjacentField(forward) => {
+            // Tab moves between the form's fields (iced doesn't do this itself).
+            // Leaving a field commits it (shows its error); focus by known id so
+            // we can track which field is now active.
+            if let Some(form) = &mut app.editing {
+                if let Some(cur) = form.active_field {
+                    form.touched.insert(cur);
+                }
+                let n = TAB_ORDER.len();
+                // SSH isn't in the tab cycle; treat it as sitting between Name(1)
+                // and Local port(2) so Tab out of it lands on the right neighbour.
+                let idx = match form.active_field {
+                    Some(Field::Ssh) => Some(if forward { 1 } else { 2 }),
+                    other => other.and_then(|f| TAB_ORDER.iter().position(|&x| x == f)),
+                };
+                let next = match idx {
+                    Some(i) if forward => (i + 1) % n,
+                    Some(i) => (i + n - 1) % n,
+                    None if forward => 0,
+                    None => n - 1,
+                };
+                let target = TAB_ORDER[next];
+                form.active_field = Some(target);
+                return iced::widget::operation::focus(field_id(target));
+            }
+            Task::none()
+        }
         Message::SelectDelta(delta) => {
+            // While editing, arrows move the Path autocomplete highlight (wrapping;
+            // first press picks the top or bottom depending on direction).
+            if app.editing.is_some() {
+                let folders = folder_prefixes(app.rows.iter().map(|r| r.tunnel.path.as_str()));
+                if let Some(form) = &mut app.editing {
+                    let n = path_suggestions(&folders, &form.folder).len();
+                    if n > 0 {
+                        form.path_hint = Some(match form.path_hint {
+                            Some(cur) => (cur as i32 + delta).rem_euclid(n as i32) as usize,
+                            None if delta > 0 => 0,
+                            None => n - 1,
+                        });
+                    }
+                }
+                return Task::none();
+            }
             // Arrow-key navigation: move the single selection through the visible
-            // tunnels. Ignored while a form/menu is up.
-            if app.editing.is_some()
-                || app.editing_ssh.is_some()
+            // tunnels. Ignored while another form/menu is up.
+            if app.editing_ssh.is_some()
                 || app.confirm_delete.is_some()
                 || app.renaming.is_some()
                 || app.managing_ssh
@@ -1546,14 +1660,22 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             iced::widget::operation::focus(FILTER_ID)
         }
         Message::WindowClosed(id) => {
-            // Forget the window so the next "Open" can spawn a fresh one, and
-            // drop any selection so reopening starts clean.
+            // Forget the window so the next "Open" spawns a fresh one, and reset
+            // to the home list — closing dismisses any in-progress screen (add/
+            // edit form, prefs, backup, …) so reopening never lands mid-task.
             if app.window == Some(id) {
                 app.window = None;
                 app.checked.clear();
                 app.select_anchor = None;
                 app.select_cursor = None;
                 app.context_menu = None;
+                app.editing = None;
+                app.editing_ssh = None;
+                app.renaming = None;
+                app.confirm_delete = None;
+                app.backup = None;
+                app.managing_ssh = false;
+                app.managing_prefs = false;
             }
             Task::none()
         }
@@ -1566,6 +1688,35 @@ const FILTER_ID: &str = "filter";
 
 /// Widget id for the rename-folder field, focused when the popover opens.
 const RENAME_ID: &str = "rename-folder";
+
+/// Widget ids for the tunnel form's text fields, so Tab can move focus between
+/// them and picking a folder suggestion can refocus the Folder field.
+const FOLDER_ID: &str = "tunnel-folder";
+const NAME_ID: &str = "tunnel-name";
+const LOCAL_PORT_ID: &str = "tunnel-local-port";
+const REMOTE_HOST_ID: &str = "tunnel-remote-host";
+const REMOTE_PORT_ID: &str = "tunnel-remote-port";
+
+/// Tab order for the tunnel form (the SSH config is a dropdown — pick it with
+/// the mouse; it isn't in the keyboard tab cycle).
+const TAB_ORDER: [Field; 5] = [
+    Field::Folder,
+    Field::Name,
+    Field::LocalPort,
+    Field::RemoteHost,
+    Field::RemotePort,
+];
+
+fn field_id(field: Field) -> &'static str {
+    match field {
+        Field::Folder => FOLDER_ID,
+        Field::Name => NAME_ID,
+        Field::LocalPort => LOCAL_PORT_ID,
+        Field::RemoteHost => REMOTE_HOST_ID,
+        Field::RemotePort => REMOTE_PORT_ID,
+        Field::Ssh => FOLDER_ID, // not tab-focusable; never used
+    }
+}
 
 /// Row indices the selection resolves to: tunnels checked directly, plus every
 /// tunnel under a checked folder path.
@@ -1625,6 +1776,49 @@ fn context_folder(app: &App) -> Option<String> {
 }
 
 /// Row indices whose tunnel sits at or under `folder_path`.
+/// Distinct ancestor-folder paths across all tunnel paths, sorted — e.g. a
+/// tunnel at `gc/prod/db/app-api` contributes `gc`, `gc/prod`, `gc/prod/db`.
+/// Used to autocomplete the Path field so new tunnels land in existing folders.
+fn folder_prefixes<'a>(paths: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut set = std::collections::BTreeSet::new();
+    for path in paths {
+        let segs: Vec<&str> = path.split('/').collect();
+        for end in 1..segs.len() {
+            set.insert(segs[..end].join("/"));
+        }
+    }
+    set.into_iter().collect()
+}
+
+/// Folder prefixes that continue the typed path — the autocomplete candidates
+/// for `typed`. Empty when nothing's typed yet (no dropdown on an empty field).
+fn path_suggestions<'a>(folders: &'a [String], typed: &str) -> Vec<&'a String> {
+    if typed.is_empty() {
+        return Vec::new();
+    }
+    let typed = typed.to_lowercase();
+    folders
+        .iter()
+        .filter(|p| {
+            let pl = p.to_lowercase();
+            pl.starts_with(&typed) && pl != typed
+        })
+        .take(6)
+        .collect()
+}
+
+/// The first existing path that clashes with `path` on the same tree branch —
+/// equal, or one a folder-prefix of the other. Such a pair makes the tree show a
+/// leaf and a folder at the same path, which selection (keyed by path) can't
+/// tell apart, so we forbid it at save time.
+fn clashing_path<'a>(existing: impl IntoIterator<Item = &'a str>, path: &str) -> Option<&'a str> {
+    existing.into_iter().find(|other| {
+        *other == path
+            || other.starts_with(&format!("{path}/"))
+            || path.starts_with(&format!("{other}/"))
+    })
+}
+
 fn descendant_indices(rows: &[TunnelRow], folder_path: &str) -> Vec<usize> {
     let prefix = format!("{folder_path}/");
     rows.iter()
@@ -1705,58 +1899,153 @@ fn form_test_target(app: &App) -> Option<(Tunnel, SshConfig)> {
     Some((tunnel, ssh))
 }
 
-/// Whether the edit form has enough to run a "Test connection" probe (mirrors
-/// the checks in [`form_test_target`], for enabling/disabling the button).
-fn test_ready(form: &EditForm) -> bool {
-    !form.ssh.trim().is_empty()
-        && !form.remote_host.trim().is_empty()
-        && form.remote_port.trim().parse::<u16>().is_ok()
+/// Trim each path segment so " gc / dev / app-api " becomes "gc/dev/app-api"
+/// and no segment has stray whitespace.
+fn normalize_path(p: &str) -> String {
+    p.split('/')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn port_error(val: &str, which: &str) -> Option<String> {
+    let v = val.trim();
+    if v.is_empty() {
+        Some(format!("{which} port is required"))
+    } else if v.parse::<u16>().map(|p| p >= 1).unwrap_or(false) {
+        None
+    } else {
+        Some(format!("{which} port must be 1–65535"))
+    }
+}
+
+/// Split a full tunnel path into (folder, leaf name): `gc/prod/db/app-api` →
+/// (`gc/prod/db`, `app-api`); a root tunnel `app-api` → (``, `app-api`).
+fn split_folder_name(path: &str) -> (String, String) {
+    match path.rsplit_once('/') {
+        Some((folder, name)) => (folder.to_string(), name.to_string()),
+        None => (String::new(), path.to_string()),
+    }
+}
+
+/// Recombine a (folder, name) into the tunnel's full path (`folder/name`, or
+/// just `name` when the folder is empty).
+fn full_path(folder: &str, name: &str) -> String {
+    let folder = normalize_path(folder);
+    let name = name.trim();
+    if folder.is_empty() {
+        name.to_string()
+    } else {
+        format!("{folder}/{name}")
+    }
+}
+
+/// The current field's raw value, for the "is it non-empty yet?" check.
+fn field_value(form: &EditForm, field: Field) -> &str {
+    match field {
+        Field::Folder => &form.folder,
+        Field::Name => &form.name,
+        Field::Ssh => &form.ssh,
+        Field::LocalPort => &form.local_port,
+        Field::RemoteHost => &form.remote_host,
+        Field::RemotePort => &form.remote_port,
+    }
+}
+
+/// A field's validation error, computed purely from the form's current values.
+/// `other_paths` are the paths of every *other* tunnel (for the clash check).
+fn tunnel_field_error(field: Field, form: &EditForm, other_paths: &[String]) -> Option<String> {
+    match field {
+        // Folder is optional (empty → the tunnel sits at the root).
+        Field::Folder => None,
+        Field::Name => {
+            let name = form.name.trim();
+            if name.is_empty() {
+                Some("Name is required".into())
+            } else if name.contains('/') {
+                Some("Name can’t contain “/” — put folders in the Folder field".into())
+            } else {
+                // The folder+name must be unique and mustn't sit on the same
+                // branch as another tunnel (a leaf sharing a folder's path).
+                let full = full_path(&form.folder, name);
+                clashing_path(other_paths.iter().map(String::as_str), &full).map(|other| {
+                    if other == full {
+                        "A tunnel with this name already exists here".to_string()
+                    } else {
+                        format!("Clashes with “{other}” — pick another name or folder")
+                    }
+                })
+            }
+        }
+        Field::Ssh => form
+            .ssh
+            .trim()
+            .is_empty()
+            .then(|| "SSH config is required".into()),
+        Field::RemoteHost => form
+            .remote_host
+            .trim()
+            .is_empty()
+            .then(|| "Remote host is required".into()),
+        Field::LocalPort => port_error(&form.local_port, "Local"),
+        Field::RemotePort => port_error(&form.remote_port, "Remote"),
+    }
+}
+
+/// The error to actually *display* under a field: only once you've visited and
+/// left the field (`touched`), never while you're still in it, and everything on
+/// a Save attempt. A field you never visit stays quiet until Save.
+fn shown_field_error(form: &EditForm, other_paths: &[String], field: Field) -> Option<String> {
+    let err = tunnel_field_error(field, form, other_paths)?;
+    if form.show_errors {
+        return Some(err);
+    }
+    (form.touched.contains(&field) && form.active_field != Some(field)).then_some(err)
+}
+
+const TUNNEL_FIELDS: [Field; 6] = [
+    Field::Folder,
+    Field::Name,
+    Field::Ssh,
+    Field::LocalPort,
+    Field::RemoteHost,
+    Field::RemotePort,
+];
+
+/// Every other tunnel's path (excludes the row being edited), for clash checks.
+fn other_tunnel_paths(app: &App, editing: Option<usize>) -> Vec<String> {
+    app.rows
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| editing != Some(*i))
+        .map(|(_, r)| r.tunnel.path.clone())
+        .collect()
 }
 
 /// Validate the edit form and apply it (replace or append a tunnel), then save.
 fn save_edit(app: &mut App) {
     let Some(form) = &app.editing else { return };
 
-    let parse_port = |s: &str| s.trim().parse::<u16>().ok();
-    // Trim each path segment so " gc / dev / app-api " becomes "gc/dev/app-api"
-    // and the leaf name has no stray leading/trailing spaces.
-    let path = form
-        .path
-        .split('/')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("/");
-    let ssh = form.ssh.trim().to_string();
-    let remote_host = form.remote_host.trim().to_string();
-
-    let error = if path.is_empty() {
-        Some("Path is required")
-    } else if ssh.is_empty() {
-        Some("SSH target is required")
-    } else if remote_host.is_empty() {
-        Some("Remote host is required")
-    } else if parse_port(&form.local_port).is_none() {
-        Some("Local port must be 1–65535")
-    } else if parse_port(&form.remote_port).is_none() {
-        Some("Remote port must be 1–65535")
-    } else {
-        None
-    };
-
-    if let Some(msg) = error {
+    let other_paths = other_tunnel_paths(app, form.target);
+    // Any field invalid → surface every field's error inline and don't save.
+    if TUNNEL_FIELDS
+        .iter()
+        .any(|&f| tunnel_field_error(f, form, &other_paths).is_some())
+    {
         if let Some(form) = &mut app.editing {
-            form.error = Some(msg.to_string());
+            form.show_errors = true;
         }
         return;
     }
 
+    // All valid — the unwraps below can't fail (port_error guaranteed a parse).
     let tunnel = Tunnel {
-        path,
-        ssh,
-        local_port: parse_port(&form.local_port).unwrap(),
-        remote_host,
-        remote_port: parse_port(&form.remote_port).unwrap(),
+        path: full_path(&form.folder, &form.name),
+        ssh: form.ssh.trim().to_string(),
+        local_port: form.local_port.trim().parse().unwrap(),
+        remote_host: form.remote_host.trim().to_string(),
+        remote_port: form.remote_port.trim().parse().unwrap(),
     };
 
     match form.target {
@@ -2300,7 +2589,8 @@ fn view(app: &App, _window: window::Id) -> Element<'_, Message> {
         return ssh_edit_view(form);
     }
     if let Some(form) = &app.editing {
-        return edit_view(form, &app.ssh_names());
+        let others = other_tunnel_paths(app, form.target);
+        return edit_view(form, &app.ssh_names(), &others);
     }
 
     // The base screen: Preferences, SSH-config list, or the tunnel tree.
@@ -2999,6 +3289,18 @@ fn row_plain(_theme: &iced::Theme, status: button::Status) -> iced::widget::butt
     row_style(bg, 6.0)
 }
 
+/// Path-autocomplete row: blue when keyboard-highlighted, faint on hover.
+fn suggestion_style(active: bool, status: button::Status) -> iced::widget::button::Style {
+    let bg = if active {
+        Some(Color::from_rgb(0.82, 0.89, 0.99))
+    } else if matches!(status, button::Status::Hovered) {
+        Some(Color::from_rgb(0.95, 0.95, 0.97))
+    } else {
+        None
+    };
+    row_style(bg, 4.0)
+}
+
 /// Wrap a control with a hover tooltip.
 fn tip<'a>(content: impl Into<Element<'a, Message>>, label: &'a str) -> Element<'a, Message> {
     tip_text(content, label.to_string())
@@ -3271,52 +3573,98 @@ fn pill(base: iced::widget::button::Style) -> iced::widget::button::Style {
     }
 }
 
-fn edit_view<'a>(form: &'a EditForm, ssh_names: &[String]) -> Element<'a, Message> {
+fn edit_view<'a>(
+    form: &'a EditForm,
+    ssh_names: &[String],
+    other_paths: &[String],
+) -> Element<'a, Message> {
     let title = if form.target.is_some() {
         "Edit tunnel"
     } else {
         "New tunnel"
     };
+    let folders = folder_prefixes(other_paths.iter().map(String::as_str));
 
-    let field = |label: &'a str, value: &'a str, f: Field, placeholder: &'a str| {
-        labeled_field(
-            label,
-            text_field(placeholder, value, move |s| Message::EditField(f, s)),
-        )
+    // A field's inline error, indented to sit under the input (past the 110px
+    // label + 8px gap). None until the field is non-empty or a Save was tried.
+    let err_row = |f: Field| {
+        shown_field_error(form, other_paths, f)
+            .map(|e| row![space().width(Length::Fixed(118.0)), error_text(e).size(11)])
     };
 
+    // A labeled text field (with a Tab-focusable id) stacked over its error.
+    let field = |label: &'a str, f: Field, placeholder: &'a str| {
+        let input = text_input(placeholder, field_value(form, f))
+            .id(field_id(f))
+            .size(13)
+            .padding([6, 9])
+            .style(rounded_input)
+            .on_input(move |s| Message::EditField(f, s));
+        let mut c = column![labeled_field(label, input)].spacing(2);
+        if let Some(e) = err_row(f) {
+            c = c.push(e);
+        }
+        c
+    };
+
+    // Folder field (optional) with a folder-autocomplete dropdown. The input
+    // carries an id so picking a suggestion can refocus it.
+    let folder_input = text_input("optional — e.g. gc/prod/db", &form.folder)
+        .id(FOLDER_ID)
+        .size(13)
+        .padding([6, 9])
+        .style(rounded_input)
+        .on_input(|s| Message::EditField(Field::Folder, s));
+    let mut folder_block = column![labeled_field("Folder", folder_input)].spacing(3);
+    let matches = path_suggestions(&folders, &form.folder);
+    if !matches.is_empty() {
+        let hint = form.path_hint.filter(|&i| i < matches.len());
+        let mut menu = column![].spacing(0);
+        for (i, p) in matches.iter().enumerate() {
+            let active = hint == Some(i);
+            menu = menu.push(
+                button(text((*p).clone()).size(12))
+                    .style(move |_t, status| suggestion_style(active, status))
+                    .width(Length::Fill)
+                    .padding([4, 9])
+                    .on_press(Message::FolderSuggestion((*p).clone())),
+            );
+        }
+        let panel = container(menu).style(menu_box_style).padding(2);
+        folder_block = folder_block.push(row![space().width(Length::Fixed(118.0)), panel]);
+    }
+    if let Some(e) = err_row(Field::Folder) {
+        folder_block = folder_block.push(e);
+    }
+
     // SSH config: a dropdown of known configs (plus the current value if it
-    // names an alias that isn't a saved config).
+    // names an alias that isn't a saved config), stacked over its inline error.
     let mut options = ssh_names.to_vec();
     if !form.ssh.is_empty() && !options.contains(&form.ssh) {
         options.push(form.ssh.clone());
     }
     let selected = (!form.ssh.is_empty()).then(|| form.ssh.clone());
-    let ssh_field = labeled_field(
+    let mut ssh_block = column![labeled_field(
         "SSH config",
         dropdown(options, selected, "choose an SSH config", |name| {
             Message::EditField(Field::Ssh, name)
         }),
-    );
+    )]
+    .spacing(2);
+    if let Some(e) = err_row(Field::Ssh) {
+        ssh_block = ssh_block.push(e);
+    }
 
     let mut col = column![
         screen_title(title),
-        field("Path", &form.path, Field::Path, "gc/dev/db/app-api"),
-        ssh_field,
-        field("Local port", &form.local_port, Field::LocalPort, "54321"),
-        field(
-            "Remote host",
-            &form.remote_host,
-            Field::RemoteHost,
-            "db.internal"
-        ),
-        field("Remote port", &form.remote_port, Field::RemotePort, "5432"),
+        folder_block,
+        field("Name", Field::Name, "app-api"),
+        ssh_block,
+        field("Local port", Field::LocalPort, "54321"),
+        field("Remote host", Field::RemoteHost, "db.internal"),
+        field("Remote port", Field::RemotePort, "5432"),
     ]
-    .spacing(10);
-
-    if let Some(err) = &form.error {
-        col = col.push(error_text(err.clone()));
-    }
+    .spacing(8);
 
     // Verify the SSH target is reachable before saving. The button disables while
     // a probe runs or the form lacks an ssh target / remote host / remote port.
@@ -3327,7 +3675,7 @@ fn edit_view<'a>(form: &'a EditForm, ssh_names: &[String]) -> Element<'a, Messag
     };
     let test_btn = secondary_button(
         test_label,
-        (!form.testing && test_ready(form)).then_some(Message::TestConnection),
+        (!form.testing).then_some(Message::TestConnection),
     );
     let mut test_row = row![test_btn].spacing(8).align_y(iced::Alignment::Center);
     match &form.test_result {
@@ -3350,7 +3698,9 @@ fn edit_view<'a>(form: &'a EditForm, ssh_names: &[String]) -> Element<'a, Messag
     }
     col = col.push(buttons);
 
-    container(col).padding(16).into()
+    // Scroll if the form (with inline errors) is taller than the shortened
+    // window, so Save/Cancel can never get pushed off-screen.
+    iced::widget::scrollable(container(col).padding(16)).into()
 }
 
 fn save_ssh(app: &mut App) {
@@ -3717,6 +4067,11 @@ fn subscription(_app: &App) -> Subscription<Message> {
                     key: Key::Named(Named::Escape),
                     ..
                 }) => Some(Message::Escape),
+                iced::Event::Keyboard(Kbd::KeyPressed {
+                    key: Key::Named(Named::Tab),
+                    modifiers,
+                    ..
+                }) => Some(Message::FocusAdjacentField(!modifiers.shift())),
                 iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
                     Some(Message::CursorMoved(position))
                 }
@@ -3789,8 +4144,8 @@ fn register_hotkey() -> Option<GlobalHotKeyManager> {
 
 fn open_window_settings() -> window::Settings {
     window::Settings {
-        size: Size::new(360.0, 620.0),
-        min_size: Some(Size::new(300.0, 380.0)),
+        size: Size::new(360.0, 500.0),
+        min_size: Some(Size::new(300.0, 340.0)),
         ..window::Settings::default()
     }
 }
@@ -4158,5 +4513,104 @@ mod tests {
         assert!(resume_indices(paths, &[]).is_empty());
         // A saved path that matches no tunnel resumes nothing.
         assert!(resume_indices(paths, &["nope".into()]).is_empty());
+    }
+
+    #[test]
+    fn folder_prefixes_and_suggestions() {
+        let paths = ["gc/dev/db/app", "gc/prod/db/auth", "gc/prod/redis/cache"];
+        let folders = folder_prefixes(paths);
+        // Ancestor folders only — never the full leaf path, deduped + sorted.
+        assert_eq!(
+            folders,
+            vec![
+                "gc",
+                "gc/dev",
+                "gc/dev/db",
+                "gc/prod",
+                "gc/prod/db",
+                "gc/prod/redis",
+            ]
+        );
+
+        // Typing narrows to matching folders (case-insensitive), excluding an
+        // exact match; an empty field offers nothing.
+        let sug = |t: &str| -> Vec<String> {
+            path_suggestions(&folders, t).into_iter().cloned().collect()
+        };
+        assert_eq!(sug("gc/prod"), vec!["gc/prod/db", "gc/prod/redis"]);
+        assert_eq!(sug("GC/DE"), vec!["gc/dev", "gc/dev/db"]);
+        assert!(sug("gc/prod/db").iter().all(|p| p != "gc/prod/db")); // no exact self
+        assert!(sug("").is_empty());
+        assert!(sug("zzz").is_empty());
+    }
+
+    #[test]
+    fn clashing_path_flags_same_branch_only() {
+        let existing = ["gc/prod/db/app-api", "gc/prod/db/auth", "gc/dev/redis"];
+        // A leaf at a folder path clashes with its children.
+        assert_eq!(
+            clashing_path(existing, "gc/prod/db"),
+            Some("gc/prod/db/app-api")
+        );
+        // A leaf nested under an existing leaf clashes with it.
+        assert_eq!(
+            clashing_path(existing, "gc/dev/redis/0"),
+            Some("gc/dev/redis"),
+        );
+        // Exact duplicate clashes.
+        assert_eq!(
+            clashing_path(existing, "gc/prod/db/auth"),
+            Some("gc/prod/db/auth")
+        );
+        // Siblings and unrelated paths are fine.
+        assert_eq!(clashing_path(existing, "gc/prod/db/new"), None);
+        assert_eq!(clashing_path(existing, "gc/staging/db"), None);
+        // A shared name prefix that isn't a folder boundary is fine.
+        assert_eq!(clashing_path(existing, "gc/prod/dbx"), None);
+    }
+
+    #[test]
+    fn folder_name_split_and_join() {
+        assert_eq!(
+            split_folder_name("gc/prod/db/app-api"),
+            ("gc/prod/db".to_string(), "app-api".to_string())
+        );
+        assert_eq!(
+            split_folder_name("root-tunnel"),
+            (String::new(), "root-tunnel".to_string())
+        );
+        assert_eq!(full_path("gc/prod/db", "app-api"), "gc/prod/db/app-api");
+        assert_eq!(full_path("", "root"), "root");
+        assert_eq!(full_path(" gc / prod ", "x"), "gc/prod/x"); // normalized
+    }
+
+    #[test]
+    fn name_field_validation() {
+        let others = [
+            "gc/prod/db/app-api".to_string(),
+            "gc/prod/db/auth".to_string(),
+        ];
+        let mk = |folder: &str, name: &str| EditForm {
+            folder: folder.into(),
+            name: name.into(),
+            ..EditForm::default()
+        };
+        let err = |folder, name| tunnel_field_error(Field::Name, &mk(folder, name), &others);
+
+        assert!(err("gc/prod/db", "").unwrap().contains("required"));
+        assert!(err("gc/prod/db", "a/b").unwrap().contains('/'));
+        // Duplicate name in the same folder.
+        assert!(
+            err("gc/prod/db", "app-api")
+                .unwrap()
+                .contains("already exists")
+        );
+        // A fresh name, an empty (root) folder — both fine.
+        assert!(err("gc/prod/db", "reports").is_none());
+        assert!(err("", "standalone").is_none());
+        // folder=gc/prod, name=db ⇒ gc/prod/db, which is a folder of others → clash.
+        assert!(err("gc/prod", "db").unwrap().contains("Clashes"));
+        // The Folder field never errors on its own (it's optional).
+        assert!(tunnel_field_error(Field::Folder, &mk("whatever", "x"), &others).is_none());
     }
 }
