@@ -40,6 +40,15 @@ pub fn maybe_run() {
             println!("sshoal {}", env!("CARGO_PKG_VERSION"));
             std::process::exit(0);
         }
+        // Drive the running tray daemon over its control socket.
+        #[cfg(unix)]
+        Some("connect") => std::process::exit(crate::control::run_connect(&args[2..])),
+        #[cfg(unix)]
+        Some("disconnect") => std::process::exit(crate::control::run_disconnect(&args[2..])),
+        #[cfg(unix)]
+        Some("status") => std::process::exit(crate::control::run_status(&args[2..])),
+        #[cfg(unix)]
+        Some("list") => std::process::exit(crate::control::run_list()),
         // A serial-number arg some macOS launch paths still prepend → ignore it
         // and launch normally rather than treating it as a bad command.
         Some(a) if a.starts_with("-psn_") => {}
@@ -68,7 +77,13 @@ fn print_usage() {
          sshoal import FILE [--overwrite | --skip]   merge tunnels from FILE\n  \
          \\                                  (default --skip: keep current on conflict)\n  \
          sshoal import-ssh TUNNELFILE...    import opentunnels.sh tunnel files\n  \
-         \\                                  ([--prefix gc] [--dry-run] [--no-overwrite])\n  \
+         \\                                  ([--prefix gc] [--dry-run] [--no-overwrite])\n\n\
+         Control the running app (a tunnel PATH is a full path or a folder):\n  \
+         sshoal list                        list every tunnel and its state\n  \
+         sshoal status PATH                 show state of the tunnel(s) under PATH\n  \
+         sshoal connect PATH [--no-wait] [--timeout N]\n  \
+         \\                                  bring up the tunnel(s); waits until up\n  \
+         sshoal disconnect PATH             tear down the tunnel(s) under PATH\n  \
          sshoal --version                   print the version and exit\n\n\
          Passphrase is read from $SSHOAL_PASSPHRASE, else prompted."
     );

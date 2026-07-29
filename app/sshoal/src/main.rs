@@ -11,6 +11,8 @@
 //! changes are written back to the config file.
 
 mod cli;
+#[cfg(unix)]
+mod control;
 mod logging;
 #[cfg(target_os = "macos")]
 mod menubar;
@@ -319,6 +321,10 @@ struct App {
     _hotkey: Option<GlobalHotKeyManager>,
     window: Option<window::Id>,
     runtime: Arc<tokio::runtime::Runtime>,
+    /// Commands parked by the control socket (`sshoal connect …`), drained each
+    /// tick — the only place allowed to touch `App`.
+    #[cfg(unix)]
+    control_queue: control::Queue,
     transport: Arc<dyn Transport>,
     ssh_configs: Vec<SshConfig>,
     rows: Vec<TunnelRow>,
@@ -479,12 +485,21 @@ fn boot(runtime: Arc<tokio::runtime::Runtime>) -> (App, Task<Message>) {
         .cloned()
         .collect();
 
+    // Control socket: let `sshoal connect/disconnect …` drive this running
+    // daemon from the CLI. Spawn the listener before `runtime` moves into `App`.
+    #[cfg(unix)]
+    let control_queue: control::Queue = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    #[cfg(unix)]
+    control::spawn_listener(&runtime, control_queue.clone());
+
     let mut app = App {
         tray: None,
         menu: None,
         _hotkey: None,
         window: None,
         runtime,
+        #[cfg(unix)]
+        control_queue,
         transport: Arc::new(OpenSshTransport),
         ssh_configs,
         rows,
@@ -603,6 +618,22 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                     && shown.elapsed() > Duration::from_secs(3)
                 {
                     row.notice = None;
+                }
+            }
+
+            // Apply any commands from the control socket (`sshoal connect …`).
+            // This is the only place that may touch `App`, and it runs before the
+            // resume block below so a CLI connect lands in the persisted set at
+            // once. Collect out of the lock first, then mutate `app`.
+            #[cfg(unix)]
+            {
+                let pending: Vec<control::ControlRequest> = match app.control_queue.lock() {
+                    Ok(mut q) => q.drain(..).collect(),
+                    Err(_) => Vec::new(),
+                };
+                for req in pending {
+                    let resp = handle_control(app, &req.cmd);
+                    let _ = req.reply.send(resp);
                 }
             }
 
@@ -2021,6 +2052,86 @@ fn set_enabled(app: &mut App, i: usize, on: bool) {
         row.status = TunnelState::Idle;
         info!(tunnel = %row.tunnel.path, "disconnect");
     }
+}
+
+// ---- control socket (`sshoal connect/disconnect/status/list`) ----
+
+/// Apply one control command against the live app and return the wire response.
+/// Runs on the update thread (drained from the queue each tick), so it must not
+/// block — the CLI does any waiting by polling `status`. A PATH matches an exact
+/// tunnel or a whole folder (`descendant_indices` handles both).
+#[cfg(unix)]
+fn handle_control(app: &mut App, line: &str) -> String {
+    let mut parts = line.splitn(2, ' ');
+    let verb = parts.next().unwrap_or("");
+    let arg = parts.next().unwrap_or("").trim();
+
+    match verb {
+        "list" => control_ok(app, &(0..app.rows.len()).collect::<Vec<_>>()),
+        "status" if arg.is_empty() => control_ok(app, &(0..app.rows.len()).collect::<Vec<_>>()),
+        "status" | "connect" | "disconnect" => {
+            if arg.is_empty() {
+                return ctrl_err(&format!("{verb} needs a tunnel path or folder"));
+            }
+            let idx = descendant_indices(&app.rows, arg);
+            if idx.is_empty() {
+                return ctrl_err(&format!("no tunnel matches \"{arg}\""));
+            }
+            if verb == "connect" {
+                for &i in &idx {
+                    set_enabled(app, i, true);
+                }
+            } else if verb == "disconnect" {
+                for &i in &idx {
+                    set_enabled(app, i, false);
+                }
+            }
+            control_ok(app, &idx)
+        }
+        other => ctrl_err(&format!("unknown command \"{other}\"")),
+    }
+}
+
+#[cfg(unix)]
+fn ctrl_err(msg: &str) -> String {
+    format!("ERR\t{msg}\n")
+}
+
+/// An `OK` response listing the given rows as `<state>\t<path>\t<port>\t<note>`.
+#[cfg(unix)]
+fn control_ok(app: &App, idx: &[usize]) -> String {
+    let mut out = String::from("OK\n");
+    for &i in idx {
+        let r = &app.rows[i];
+        // No supervisor ⇒ `off`: a terminal state the CLI can stop waiting on
+        // (it will never come up), distinct from a transient `idle` during the
+        // spawn→Connecting race of a tunnel that *is* enabled. This is also more
+        // honest than `idle` for a plainly disconnected row.
+        let state = if !r.enabled() {
+            "off"
+        } else {
+            match r.status {
+                TunnelState::Idle => "idle",
+                TunnelState::Connecting => "connecting",
+                TunnelState::Up => "up",
+                TunnelState::Reconnecting => "reconnecting",
+                TunnelState::Failed => "failed",
+            }
+        };
+        // Prefer the live error; fall back to a transient notice (port conflict).
+        let note = r
+            .supervisor
+            .as_ref()
+            .and_then(|s| s.last_error())
+            .or_else(|| r.notice.as_ref().map(|(m, _)| m.clone()))
+            .unwrap_or_default();
+        let note = note.replace(['\t', '\n'], " ");
+        out.push_str(&format!(
+            "{state}\t{}\t{}\t{note}\n",
+            r.tunnel.path, r.tunnel.local_port
+        ));
+    }
+    out
 }
 
 // ---- tree construction ----
