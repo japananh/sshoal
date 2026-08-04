@@ -2351,13 +2351,20 @@ fn set_enabled(app: &mut App, i: usize, on: bool) {
 /// tunnel or a whole folder (`descendant_indices` handles both).
 #[cfg(unix)]
 fn handle_control(app: &mut App, line: &str) -> String {
-    let mut parts = line.splitn(2, ' ');
-    let verb = parts.next().unwrap_or("");
-    let arg = parts.next().unwrap_or("").trim();
+    // `set` carries tab-separated `key=value` fields (values may contain spaces);
+    // the other verbs take a single space-separated path.
+    let (verb, rest) = line.split_once([' ', '\t']).unwrap_or((line, ""));
+    let arg = rest.trim();
 
     match verb {
         "list" => control_ok(app, &(0..app.rows.len()).collect::<Vec<_>>()),
         "status" if arg.is_empty() => control_ok(app, &(0..app.rows.len()).collect::<Vec<_>>()),
+        "set" => {
+            let mut fields = rest.split('\t');
+            let path = fields.next().unwrap_or("").trim();
+            let pairs: Vec<&str> = fields.collect();
+            control_set(app, path, &pairs)
+        }
         "status" | "connect" | "disconnect" => {
             if arg.is_empty() {
                 return ctrl_err(&format!("{verb} needs a tunnel path or folder"));
@@ -2379,6 +2386,109 @@ fn handle_control(app: &mut App, line: &str) -> String {
         }
         other => ctrl_err(&format!("unknown command \"{other}\"")),
     }
+}
+
+/// Apply `key=value` edits onto a form pre-filled with a tunnel's current
+/// values. Mirrors the fields of the in-app edit screen.
+#[cfg(unix)]
+fn apply_set_pairs(form: &mut EditForm, pairs: &[&str]) -> Result<(), String> {
+    if pairs.is_empty() {
+        return Err("set needs at least one field, e.g. local-port=54321".into());
+    }
+    for pair in pairs {
+        let Some((key, value)) = pair.split_once('=') else {
+            return Err(format!("expected key=value, got \"{pair}\""));
+        };
+        let value = value.to_string();
+        match key.trim() {
+            "folder" => form.folder = value,
+            "name" => form.name = value,
+            "ssh" => form.ssh = value,
+            "local-port" => form.local_port = value,
+            "remote-host" => form.remote_host = value,
+            "remote-port" => form.remote_port = value,
+            other => {
+                return Err(format!(
+                    "unknown field \"{other}\" (want folder, name, ssh, local-port, \
+                     remote-host or remote-port)"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `set PATH key=value…` — edit a tunnel exactly like the in-app form does,
+/// reusing the same per-field validation. A tunnel that was connected is
+/// reconnected with the new settings (the app's edit screen just drops it).
+#[cfg(unix)]
+fn control_set(app: &mut App, path: &str, pairs: &[&str]) -> String {
+    if path.is_empty() {
+        return ctrl_err("set needs a tunnel path");
+    }
+    // An exact tunnel only — editing a whole folder at once would be ambiguous.
+    let Some(i) = app.rows.iter().position(|r| r.tunnel.path == path) else {
+        return ctrl_err(&format!("no tunnel at \"{path}\""));
+    };
+
+    let t = &app.rows[i].tunnel;
+    let (folder, name) = split_folder_name(&t.path);
+    let mut form = EditForm {
+        target: Some(i),
+        folder,
+        name,
+        ssh: t.ssh.clone(),
+        local_port: t.local_port.to_string(),
+        remote_host: t.remote_host.clone(),
+        remote_port: t.remote_port.to_string(),
+        ..EditForm::default()
+    };
+    if let Err(e) = apply_set_pairs(&mut form, pairs) {
+        return ctrl_err(&e);
+    }
+
+    let others = other_tunnel_paths(app, Some(i));
+    for f in TUNNEL_FIELDS {
+        if let Some(e) = tunnel_field_error(f, &form, &others) {
+            return ctrl_err(&e);
+        }
+    }
+
+    // Refuse a local port a *running* tunnel already holds: the supervisor would
+    // decline to start and leave this tunnel down while we reported success.
+    let port: u16 = form.local_port.trim().parse().unwrap();
+    if let Some(j) = (0..app.rows.len())
+        .find(|&j| j != i && app.rows[j].enabled() && app.rows[j].local_port() == port)
+    {
+        return ctrl_err(&format!(
+            "local port {port} is already in use by \"{}\"",
+            app.rows[j].tunnel.path
+        ));
+    }
+
+    // Valid — the parses can't fail (port_error already checked them).
+    let tunnel = Tunnel {
+        path: full_path(&form.folder, &form.name),
+        ssh: form.ssh.trim().to_string(),
+        local_port: form.local_port.trim().parse().unwrap(),
+        remote_host: form.remote_host.trim().to_string(),
+        remote_port: form.remote_port.trim().parse().unwrap(),
+    };
+    let was_enabled = app.rows[i].enabled();
+    if let Some(sup) = app.rows[i].supervisor.take() {
+        sup.cancel();
+    }
+    app.rows[i].status = TunnelState::Idle;
+    info!(from = %app.rows[i].tunnel.path, to = %tunnel.path, "set tunnel");
+    app.rows[i].tunnel = tunnel;
+    // Bring it back up on the new settings so a live tunnel isn't silently lost.
+    if was_enabled {
+        set_enabled(app, i, true);
+    }
+
+    reconcile_collapsed(app);
+    persist_app(app);
+    control_ok(app, &[i])
 }
 
 #[cfg(unix)]
@@ -4567,6 +4677,43 @@ mod tests {
         assert_eq!(clashing_path(existing, "gc/staging/db"), None);
         // A shared name prefix that isn't a folder boundary is fine.
         assert_eq!(clashing_path(existing, "gc/prod/dbx"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn set_pairs_overlay_the_current_values() {
+        let mut form = EditForm {
+            folder: "gc/dev".into(),
+            name: "db".into(),
+            ssh: "gemx-dev".into(),
+            local_port: "54321".into(),
+            remote_host: "old.internal".into(),
+            remote_port: "5432".into(),
+            ..EditForm::default()
+        };
+        apply_set_pairs(&mut form, &["local-port=6001", "remote-host=new.internal"]).unwrap();
+        assert_eq!(form.local_port, "6001");
+        assert_eq!(form.remote_host, "new.internal");
+        // Untouched fields keep the tunnel's current values.
+        assert_eq!(form.folder, "gc/dev");
+        assert_eq!(form.name, "db");
+        assert_eq!(form.remote_port, "5432");
+
+        // An `=` inside the value is preserved; only the first splits.
+        apply_set_pairs(&mut form, &["name=a=b"]).unwrap();
+        assert_eq!(form.name, "a=b");
+
+        assert!(apply_set_pairs(&mut form, &[]).is_err());
+        assert!(
+            apply_set_pairs(&mut form, &["bogus=1"])
+                .unwrap_err()
+                .contains("unknown field")
+        );
+        assert!(
+            apply_set_pairs(&mut form, &["noequals"])
+                .unwrap_err()
+                .contains("key=value")
+        );
     }
 
     #[test]
