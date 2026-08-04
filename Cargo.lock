@@ -3854,7 +3854,7 @@ dependencies = [
 
 [[package]]
 name = "sshoal"
-version = "0.0.10"
+version = "0.0.11"
 dependencies = [
  "chrono",
  "global-hotkey",
@@ -3875,7 +3875,7 @@ dependencies = [
 
 [[package]]
 name = "sshoal-core"
-version = "0.0.10"
+version = "0.0.11"
 dependencies = [
  "anyhow",
  "argon2",

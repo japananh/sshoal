@@ -243,6 +243,85 @@ pub fn run_status(args: &[String]) -> i32 {
     }
 }
 
+/// The `--flag VALUE` pairs `sshoal set` accepts, mapped to wire field names.
+const SET_FLAGS: [(&str, &str); 6] = [
+    ("--folder", "folder"),
+    ("--name", "name"),
+    ("--ssh", "ssh"),
+    ("--local-port", "local-port"),
+    ("--remote-host", "remote-host"),
+    ("--remote-port", "remote-port"),
+];
+
+/// Turn `--local-port 6000 …` into wire `key=value` fields. `Err` is a message
+/// for the user (unknown flag, missing value, or an unusable character).
+fn parse_set_args(args: &[String]) -> Result<(Option<String>, Vec<String>), String> {
+    let mut path: Option<String> = None;
+    let mut pairs = Vec::new();
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        if let Some((_, key)) = SET_FLAGS.iter().find(|(flag, _)| flag == arg) {
+            let Some(value) = it.next() else {
+                return Err(format!("{arg} needs a value"));
+            };
+            // Tabs/newlines are the wire framing — refuse rather than corrupt it.
+            if value.contains(['\t', '\n']) {
+                return Err(format!("{arg} value can't contain tabs or newlines"));
+            }
+            pairs.push(format!("{key}={value}"));
+        } else if arg.starts_with('-') {
+            return Err(format!("unknown option \"{arg}\""));
+        } else if path.is_none() {
+            path = Some(arg.clone());
+        } else {
+            return Err(format!("unexpected argument \"{arg}\""));
+        }
+    }
+    Ok((path, pairs))
+}
+
+/// `sshoal set PATH --local-port N …` — edit a tunnel's fields (the same ones
+/// the in-app edit screen has). A connected tunnel is reconnected on the new
+/// settings.
+pub fn run_set(args: &[String]) -> i32 {
+    let (path, pairs) = match parse_set_args(args) {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("sshoal set: {msg}");
+            return 2;
+        }
+    };
+    let Some(path) = path else {
+        eprintln!(
+            "sshoal set: needs a tunnel path\n  \
+             e.g. sshoal set gc/dev/db/app-api --local-port 54399"
+        );
+        return 2;
+    };
+    if pairs.is_empty() {
+        eprintln!(
+            "sshoal set: needs at least one field to change\n  \
+             --folder --name --ssh --local-port --remote-host --remote-port"
+        );
+        return 2;
+    }
+
+    let request = format!("set\t{path}\t{}", pairs.join("\t"));
+    match send(&request) {
+        Err(_) => not_running(),
+        Ok(resp) => match parse(&resp) {
+            Ok(rows) => {
+                print_table(&rows);
+                0
+            }
+            Err(msg) => {
+                eprintln!("sshoal: {msg}");
+                1
+            }
+        },
+    }
+}
+
 /// `sshoal disconnect PATH` — tear down the tunnel(s) under PATH.
 pub fn run_disconnect(args: &[String]) -> i32 {
     let Some(path) = args.iter().find(|a| !a.starts_with('-')) else {
@@ -354,5 +433,30 @@ mod tests {
             "no tunnel matches \"x\""
         );
         assert!(parse("").is_err());
+    }
+
+    #[test]
+    fn set_args_become_wire_pairs() {
+        let args: Vec<String> = ["gc/dev/db", "--local-port", "6001", "--remote-host", "a b"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (path, pairs) = parse_set_args(&args).expect("parses");
+        assert_eq!(path.as_deref(), Some("gc/dev/db"));
+        // Values keep spaces; order follows the command line.
+        assert_eq!(pairs, vec!["local-port=6001", "remote-host=a b"]);
+
+        let err = |a: &[&str]| {
+            parse_set_args(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap_err()
+        };
+        assert!(err(&["p", "--nope", "1"]).contains("unknown option"));
+        assert!(err(&["p", "--local-port"]).contains("needs a value"));
+        assert!(err(&["p", "--name", "a\tb"]).contains("tabs"));
+        assert!(err(&["p", "q"]).contains("unexpected argument"));
+
+        // A bare path with no flags parses, but yields nothing to change.
+        let (p, pairs) = parse_set_args(&["p".to_string()]).unwrap();
+        assert_eq!(p.as_deref(), Some("p"));
+        assert!(pairs.is_empty());
     }
 }

@@ -49,6 +49,8 @@ pub fn maybe_run() {
         Some("status") => std::process::exit(crate::control::run_status(&args[2..])),
         #[cfg(unix)]
         Some("list") => std::process::exit(crate::control::run_list()),
+        #[cfg(unix)]
+        Some("set") => std::process::exit(crate::control::run_set(&args[2..])),
         // A serial-number arg some macOS launch paths still prepend → ignore it
         // and launch normally rather than treating it as a bad command.
         Some(a) if a.starts_with("-psn_") => {}
@@ -84,6 +86,10 @@ fn print_usage() {
          sshoal connect PATH [--no-wait] [--timeout N]\n  \
          \\                                  bring up the tunnel(s); waits until up\n  \
          sshoal disconnect PATH             tear down the tunnel(s) under PATH\n  \
+         sshoal set PATH [--folder F] [--name N] [--ssh S]\n  \
+         \\             [--local-port N] [--remote-host H] [--remote-port N]\n  \
+         \\                                  edit one tunnel (same fields as the app);\n  \
+         \\                                  a connected tunnel reconnects on the new settings\n  \
          sshoal --version                   print the version and exit\n\n\
          Passphrase is read from $SSHOAL_PASSPHRASE, else prompted."
     );
