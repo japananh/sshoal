@@ -714,16 +714,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                     break;
                 };
                 if event.id == *open {
-                    if app.window.is_none() {
-                        let (id, task) = window::open(open_window_settings());
-                        app.window = Some(id);
-                        return Task::batch([
-                            task.map(Message::WindowOpened),
-                            window::gain_focus(id),
-                        ]);
-                    } else if let Some(id) = app.window {
-                        return window::gain_focus(id);
-                    }
+                    return surface_window(app);
                 } else if event.id == *prefs {
                     // Surface the window (creating it if needed) on the Preferences
                     // screen, clearing any other screen/form so it lands clean.
@@ -732,16 +723,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                     app.editing = None;
                     app.editing_ssh = None;
                     app.context_menu = None;
-                    if app.window.is_none() {
-                        let (id, task) = window::open(open_window_settings());
-                        app.window = Some(id);
-                        return Task::batch([
-                            task.map(Message::WindowOpened),
-                            window::gain_focus(id),
-                        ]);
-                    } else if let Some(id) = app.window {
-                        return window::gain_focus(id);
-                    }
+                    return surface_window(app);
                 } else if event.id == *quit {
                     info!("quitting");
                     return iced::exit();
@@ -768,9 +750,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
                     if let Some(id) = app.window {
                         return window::close(id);
                     }
-                    let (id, task) = window::open(open_window_settings());
-                    app.window = Some(id);
-                    return Task::batch([task.map(Message::WindowOpened), window::gain_focus(id)]);
+                    return surface_window(app);
                 }
             }
 
@@ -778,16 +758,7 @@ fn update(app: &mut App, message: Message) -> Task<Message> {
             let hk_rx = GlobalHotKeyEvent::receiver();
             while let Ok(event) = hk_rx.try_recv() {
                 if event.state == HotKeyState::Pressed {
-                    if app.window.is_none() {
-                        let (id, task) = window::open(open_window_settings());
-                        app.window = Some(id);
-                        return Task::batch([
-                            task.map(Message::WindowOpened),
-                            window::gain_focus(id),
-                        ]);
-                    } else if let Some(id) = app.window {
-                        return window::gain_focus(id);
-                    }
+                    return surface_window(app);
                 }
             }
             Task::none()
@@ -4250,6 +4221,20 @@ fn register_hotkey() -> Option<GlobalHotKeyManager> {
         Err(e) => tracing::warn!(error = %e, "failed to register global hotkey"),
     }
     Some(manager)
+}
+
+/// Bring the window to the front, creating it if it isn't open. On macOS this
+/// also activates the app: sshoal is an accessory (no Dock icon), so focusing a
+/// window alone leaves it stacked behind whichever app is frontmost.
+fn surface_window(app: &mut App) -> Task<Message> {
+    #[cfg(target_os = "macos")]
+    menubar::activate();
+    if let Some(id) = app.window {
+        return window::gain_focus(id);
+    }
+    let (id, task) = window::open(open_window_settings());
+    app.window = Some(id);
+    Task::batch([task.map(Message::WindowOpened), window::gain_focus(id)])
 }
 
 fn open_window_settings() -> window::Settings {
