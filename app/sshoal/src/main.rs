@@ -4317,7 +4317,8 @@ fn render_icon_pixmap(svg: &str, opt: &resvg::usvg::Options) -> resvg::tiny_skia
 fn pixmap_to_icon(pixmap: resvg::tiny_skia::Pixmap) -> Icon {
     let (w, h) = (pixmap.width(), pixmap.height());
     let mut rgba = pixmap.take();
-    for px in rgba.chunks_exact_mut(4) {
+    let (pixels, _) = rgba.as_chunks_mut::<4>();
+    for px in pixels {
         let a = px[3] as u32;
         if a > 0 && a < 255 {
             px[0] = (px[0] as u32 * 255 / a) as u8;
