@@ -95,3 +95,22 @@ pub fn set_count(count: usize) -> bool {
     }
     true
 }
+
+/// Bring sshoal to the front. It runs as an *accessory* app (no Dock icon), so
+/// focusing a window doesn't make sshoal the frontmost **application** — the
+/// window would open behind whatever the user was in. Activating the app first
+/// is what puts it on top.
+pub fn activate() {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    // `activate()` alone isn't enough: on macOS 14+ it follows the *cooperative*
+    // activation model and gets ignored while another app holds the foreground —
+    // exactly our case, since the user summons sshoal from the tray or the global
+    // hotkey while working elsewhere. The window would rise but the other app
+    // kept the menu bar and key focus. The ignore-other-apps form still activates
+    // unconditionally, which is what a menu-bar app summoned by an explicit user
+    // action should do.
+    #[allow(deprecated)]
+    NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
+}
