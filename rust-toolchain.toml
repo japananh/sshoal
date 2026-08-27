@@ -1,0 +1,7 @@
+# Pin the toolchain so a local check matches CI exactly. CI installs the latest
+# stable and runs `cargo clippy -- -D warnings`, so a clippy newer than the one
+# on the developer's machine turns a clean local run into a red build — that is
+# how 1.98's `chunks_exact_mut` lint got through. Bump this deliberately.
+[toolchain]
+channel = "1.98.0"
+components = ["rustfmt", "clippy"]
